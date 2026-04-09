@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import type { AppEnv } from "../config/env";
 import { assessComplexity, routeTier } from "../assessment/tier";
-import { taskSubject, type AutoforgeMessage } from "../nats/messages";
+import { type AutoforgeMessage } from "../nats/messages";
 import type { AgentExecutor } from "../executors/interface";
 import type { DbClient } from "../db/client";
+import type { NatsClient } from "../nats/client";
 import type { PipelineTask, PlanSubtask, ReviewFinding, SubtaskReportStatus, TaskStage } from "../types/core";
 import { assertTransition } from "./state-machine";
 import { WorktreeManager } from "../git/worktrees";
+import { SkillRegistry } from "../skills/registry";
 import { createPullRequest, evaluatePrGate } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
 
@@ -15,10 +18,15 @@ interface ServiceDeps {
   db: DbClient;
   executor: AgentExecutor;
   worktrees: WorktreeManager;
+  nats?: NatsClient;
 }
 
 export class OrchestratorService {
-  constructor(private readonly deps: ServiceDeps) {}
+  private readonly skills: SkillRegistry;
+
+  constructor(private readonly deps: ServiceDeps) {
+    this.skills = new SkillRegistry(resolve(process.cwd(), deps.env.SKILLS_DIR));
+  }
 
   listTasks(): PipelineTask[] {
     return this.deps.db.listTasks();
@@ -62,7 +70,7 @@ export class OrchestratorService {
       workingDirectory: worktree.path,
       budgetSeconds: this.budgetForTier(tier, "planner"),
       environment: {},
-      skillFiles: [],
+      skillFiles: this.skills.skillsForAgent("planner"),
       metadata: { description, tier }
     });
 
@@ -144,16 +152,12 @@ export class OrchestratorService {
         const coderResult = await this.deps.executor.execute({
           id: subtask.id,
           type: "coder",
-          prompt: `Implement subtask: ${subtask.description}. Tests first.`,
+          prompt: buildCoderPrompt(description, subtask, iteration),
           workingDirectory: worktreePath,
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: {},
-          skillFiles: [],
-          metadata: {
-            taskId,
-            subtask,
-            description
-          }
+          skillFiles: this.skills.skillsForAgent("coder"),
+          metadata: { taskId, subtask, description }
         });
 
         if (!isSuccess(coderResult.status)) {
@@ -163,6 +167,9 @@ export class OrchestratorService {
           });
           throw new Error(`Coder failed with status ${coderResult.status}`);
         }
+
+        // Orchestrator commits agent output — agents never push directly.
+        this.deps.worktrees.commit({ branch, path: worktreePath }, `autoforge: ${subtask.description}`);
       }
 
       this.transition(taskId, projectId, "executing", "reviewing", { iteration });
@@ -170,11 +177,11 @@ export class OrchestratorService {
       const reviewResult = await this.deps.executor.execute({
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
-        prompt: "Review code against spec and quality standards.",
+        prompt: buildReviewerPrompt(description, planSubtasks),
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: {},
-        skillFiles: [],
+        skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description }
       });
 
@@ -278,6 +285,8 @@ export class OrchestratorService {
     payload: Record<string, unknown>;
     budgetSeconds: number;
     elapsedSeconds?: number;
+    executorUsed?: string;
+    resumable?: boolean;
   }): void {
     const message: AutoforgeMessage = {
       id: randomUUID(),
@@ -295,6 +304,11 @@ export class OrchestratorService {
     this.deps.db.transaction(() => {
       this.deps.db.appendEvent(message);
       this.deps.db.applyEvent(message);
+    });
+
+    // Publish to NATS JetStream asynchronously (fire-and-forget; SQLite is the source of truth).
+    this.deps.nats?.publishTaskEvent(message).catch((err) => {
+      console.warn(`[orchestrator] NATS publish failed for ${message.type}: ${err}`);
     });
   }
 
@@ -314,6 +328,28 @@ export class OrchestratorService {
     }
     return task;
   }
+}
+
+function buildCoderPrompt(description: string, subtask: PlanSubtask, iteration: number): string {
+  const lines = [
+    `## Feature\n${description}`,
+    `## Subtask (${subtask.sequence})\n${subtask.description}`,
+    `## Files in scope\n${subtask.filesInScope.join(", ")}`,
+    `## Test criteria\n${subtask.testCriteria.map((c) => `- ${c}`).join("\n")}`
+  ];
+  if (iteration > 0) {
+    lines.push(`## Note\nThis is rework iteration ${iteration}. Fix issues identified in the review, nothing else.`);
+  }
+  return lines.join("\n\n");
+}
+
+function buildReviewerPrompt(description: string, subtasks: PlanSubtask[]): string {
+  const criteria = subtasks.flatMap((s) => s.testCriteria).map((c) => `- ${c}`).join("\n");
+  return [
+    `## Feature\n${description}`,
+    `## Test criteria to verify\n${criteria}`,
+    "## Instructions\nReview the code in this working directory. Conduct spec compliance review first, then code quality review. Output findings to .autoforge-status.json."
+  ].join("\n\n");
 }
 
 function parsePlanSubtasks(taskId: string, output: unknown): PlanSubtask[] {

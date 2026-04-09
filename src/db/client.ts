@@ -19,14 +19,16 @@ export class DbClient {
     this.sqlite.exec(schema);
   }
 
-  appendEvent(message: AutoforgeMessage): void {
+  appendEvent(message: AutoforgeMessage, opts?: { resumable?: boolean; executorUsed?: string; contextEnvelopeHash?: string }): void {
     const statement = this.sqlite.query(`
       INSERT INTO events (
         id, task_id, subtask_id, timestamp, project_id, agent, event_type, status, payload,
-        budget_seconds, elapsed_seconds, token_input, token_output, estimated_cost
+        budget_seconds, elapsed_seconds, token_input, token_output, estimated_cost,
+        resumable, executor_used, context_envelope_hash
       ) VALUES (
         $id, $task_id, $subtask_id, $timestamp, $project_id, $agent, $event_type, $status, $payload,
-        $budget_seconds, $elapsed_seconds, $token_input, $token_output, $estimated_cost
+        $budget_seconds, $elapsed_seconds, $token_input, $token_output, $estimated_cost,
+        $resumable, $executor_used, $context_envelope_hash
       )
     `);
 
@@ -44,7 +46,10 @@ export class DbClient {
       $elapsed_seconds: message.elapsedSeconds ?? null,
       $token_input: message.tokenUsage?.input ?? null,
       $token_output: message.tokenUsage?.output ?? null,
-      $estimated_cost: message.tokenUsage?.estimatedCost ?? null
+      $estimated_cost: message.tokenUsage?.estimatedCost ?? null,
+      $resumable: opts?.resumable !== false ? 1 : 0,
+      $executor_used: opts?.executorUsed ?? null,
+      $context_envelope_hash: opts?.contextEnvelopeHash ?? null
     });
   }
 

@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { execSync, spawnSync } from "node:child_process";
 
 export interface WorktreeRef {
   branch: string;
@@ -12,14 +13,77 @@ export class WorktreeManager {
     mkdirSync(rootDir, { recursive: true });
   }
 
+  /**
+   * Create a git branch and worktree for a task.
+   * Falls back to a plain directory if not inside a git repo.
+   */
   create(taskId: string): WorktreeRef {
     const branch = `autoforge/${taskId}`;
     const path = join(this.rootDir, `${taskId}-${randomUUID().slice(0, 8)}`);
-    mkdirSync(path, { recursive: true });
+
+    if (this.isGitRepo()) {
+      // Ensure branch exists from current HEAD.
+      run("git", ["branch", branch], { ignore: true });
+      // Add a worktree pointing at that branch.
+      const result = spawnSync("git", ["worktree", "add", path, branch], { encoding: "utf8" });
+      if (result.status !== 0) {
+        // Fallback: plain directory (e.g. branch already has a worktree).
+        console.warn(`[git] git worktree add failed (${result.stderr?.trim()}), using plain directory.`);
+        mkdirSync(path, { recursive: true });
+      }
+    } else {
+      mkdirSync(path, { recursive: true });
+    }
+
     return { branch, path };
   }
 
-  remove(_worktree: WorktreeRef): void {
-    // Placeholder for full git worktree lifecycle; local milestone keeps this explicit.
+  /**
+   * Stage all changes in the worktree and create a commit.
+   * No-op if there is nothing to commit.
+   */
+  commit(worktree: WorktreeRef, message: string): void {
+    if (!this.isGitRepo()) return;
+    // Stage everything in the worktree.
+    run("git", ["add", "-A"], { cwd: worktree.path, ignore: false });
+    // Commit (exit 1 with "nothing to commit" is not an error).
+    run("git", ["commit", "--allow-empty-message", "-m", message || "autoforge: agent output"], {
+      cwd: worktree.path,
+      ignore: true
+    });
+  }
+
+  /**
+   * Remove the worktree and delete the branch.
+   */
+  remove(worktree: WorktreeRef): void {
+    if (!this.isGitRepo()) return;
+    run("git", ["worktree", "remove", "--force", worktree.path], { ignore: true });
+    run("git", ["branch", "-D", worktree.branch], { ignore: true });
+  }
+
+  private isGitRepo(): boolean {
+    try {
+      execSync("git rev-parse --git-dir", { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function run(
+  cmd: string,
+  args: string[],
+  opts: { cwd?: string; ignore?: boolean } = {}
+): void {
+  const result = spawnSync(cmd, args, {
+    cwd: opts.cwd ?? process.cwd(),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  if (!opts.ignore && result.status !== 0) {
+    throw new Error(`${cmd} ${args.join(" ")} failed (exit ${result.status}): ${result.stderr?.trim()}`);
   }
 }

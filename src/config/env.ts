@@ -9,7 +9,13 @@ const EnvSchema = z.object({
   EXECUTOR_DEFAULT: z.string().default("claude-code"),
   EXECUTOR_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
   TEST_PASS_THRESHOLD: z.coerce.number().min(0).max(1).default(1),
-  REVIEW_SCORE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.7)
+  REVIEW_SCORE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.7),
+  // Optional: required only for real PR creation. Agents do NOT receive this.
+  GITHUB_TOKEN: z.string().optional(),
+  // Override the claude binary path if needed.
+  CLAUDE_COMMAND: z.string().default("claude"),
+  // Path to skills directory (injected into agent prompts).
+  SKILLS_DIR: z.string().default("./skills")
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;
