@@ -286,10 +286,12 @@ interface AgentResult {
 
 ```typescript
 class ClaudeCodeExecutor implements AgentExecutor {
-  // Spawns `claude` CLI as subprocess
-  // Passes prompt via --prompt flag or stdin
-  // Collects artifacts from worktree
-  // Reads status from convention file written by agent
+  // Spawns `claude --print --dangerously-skip-permissions <prompt>` as subprocess
+  // prompt is passed as a positional CLI argument (avoids stdin complexity)
+  // --dangerously-skip-permissions required so agent can write files non-interactively
+  // After process exits, reads .autoforge-status.json from workingDirectory for status + artifacts
+  // Budget enforced: SIGTERM at deadline, SIGKILL after 10-second grace period
+  // If agent exits 0 but did not write the status file → DONE_WITH_CONCERNS
 }
 
 class CodexExecutor implements AgentExecutor {
@@ -358,6 +360,8 @@ If an agent is compromised via prompt injection, it cannot exfiltrate secrets be
 ---
 
 ## 4. NATS SUBJECT HIERARCHY & MESSAGE CONTRACTS
+
+> **Implementation note:** NATS is optional in local development. The orchestrator connects with a 3-second timeout; if NATS is unavailable it logs a warning and runs in SQLite-only mode. All event publishing is fire-and-forget — a NATS failure never blocks the pipeline. Set `NATS_URL` in `.env` to enable (defaults to `nats://127.0.0.1:4222`).
 
 ### Subject Hierarchy
 
@@ -533,7 +537,15 @@ When a PR is rejected (by automated checks or human review):
   2. GREEN: Minimal code to pass
   3. REFACTOR: Clean up
   4. Verify: Re-read spec criteria, confirm coverage
-- Status reporting: DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+- Status reporting via `.autoforge-status.json` written by the agent before exit:
+  ```json
+  {
+    "status": "DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT",
+    "artifacts": ["relative/path/to/changed/file"],
+    "concerns": "(if DONE_WITH_CONCERNS)",
+    "blockReason": "(if BLOCKED or NEEDS_CONTEXT)"
+  }
+  ```
 - On test failure: Invoke systematic-debugging skill (reproduce → isolate → root cause → fix)
 - Sequential by default. Orchestrator may parallelize independent subtasks if configured.
 - Budget: 5 min per subtask (EXPRESS) / 8 min (STANDARD) / 12 min (THOROUGH)
@@ -799,33 +811,44 @@ The Orchestrator is the BRAIN of the system. It is a **stateless event processor
 
 ### Stateless Recovery (Event Sourcing)
 
-The orchestrator can crash at any time and fully recover:
+The orchestrator can crash at any time and fully recover.
+
+**Source of truth hierarchy (as implemented):**
+- **SQLite** is the primary source of truth. Every event is written to SQLite atomically before anything else happens.
+- **NATS JetStream** is a secondary durable log. The orchestrator fire-and-forgets a JetStream publish after every SQLite write. NATS is optional — if unavailable, the system runs in SQLite-only mode with a startup warning.
+- On recovery, JetStream replay is attempted first. If NATS is unavailable or the stream is empty, SQLite event replay is used.
+
+**Implementation notes:**
+- Use `consumer.fetch()` (not `consume()`) for JetStream replay. `consume()` blocks indefinitely on an empty stream. Always pre-check `stream.state.messages > 0` before fetching to avoid startup hangs.
+- NATS connection uses a 3-second timeout. Failure is non-fatal; the system continues in SQLite-only mode.
 
 ```typescript
 async function recoverState(): Promise<void> {
-  // 1. Connect to NATS JetStream
-  const js = nats.jetstream();
-  
-  // 2. Replay all events from the TASKS stream
-  const consumer = await js.consumers.get('TASKS', 'orchestrator-recovery');
-  for await (const msg of consumer) {
-    const event = JSON.parse(msg.data) as TaskEvent;
-    await applyEventToDatabase(event);  // Rebuild SQLite state
-    msg.ack();
+  // 1. Try JetStream replay first (if NATS available and stream non-empty)
+  if (nats.isConnected) {
+    const info = await jsm.streams.info('TASKS');
+    if (info.state.messages > 0) {
+      const consumer = await js.consumers.get('TASKS');
+      const messages = await consumer.fetch({ max_messages: info.state.messages, expires: 5_000 });
+      for await (const msg of messages) {
+        await applyEventToDatabase(JSON.parse(msg.data));
+        msg.ack();
+      }
+      return;
+    }
   }
-  
-  // 3. Database now reflects current state
-  // 4. Check for in-flight tasks that need retry
+
+  // 2. Fall back to SQLite event log replay
+  db.rebuildProjectionsFromEvents();
+
+  // 3. Check for in-flight tasks that timed out while orchestrator was down
   const stuckTasks = await db.query(
     `SELECT * FROM subtasks WHERE state = 'in_progress' 
      AND started_at < datetime('now', '-' || budget_seconds || ' seconds')`
   );
   for (const task of stuckTasks) {
-    await markAsTimeout(task);  // Budget exceeded while orchestrator was down
+    await markAsTimeout(task);
   }
-  
-  // 5. Resume normal event processing
-  await subscribeToEvents();
 }
 ```
 
