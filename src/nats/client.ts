@@ -62,12 +62,19 @@ export class NatsClient {
     if (!this.js) return 0;
 
     try {
-      // Create an ephemeral ordered consumer that starts from the very first message.
+      // Check stream message count first — avoid hanging on an empty stream.
+      const jsm = await this.connection!.jetstreamManager();
+      const info = await jsm.streams.info("TASKS");
+      if (info.state.messages === 0) return 0;
+
+      // Use fetch (not consume) so the call completes once all buffered messages are read.
       const consumer = await this.js.consumers.get("TASKS");
-      const messages = await consumer.consume({ max_messages: 10_000 });
+      const messages = await consumer.fetch({
+        max_messages: Math.min(info.state.messages, 10_000),
+        expires: 5_000  // 5-second ceiling in case of slow delivery
+      });
 
       let count = 0;
-      // Consume with a short idle-heartbeat so we know when the stream is drained.
       for await (const msg of messages) {
         try {
           const parsed = JSON.parse(codec.decode(msg.data)) as AutoforgeMessage;
@@ -76,11 +83,6 @@ export class NatsClient {
           msg.ack();
         } catch {
           msg.nak();
-        }
-
-        // Stop once we've processed all pending messages (no more waiting).
-        if (msg.info.pending === 0) {
-          break;
         }
       }
 
