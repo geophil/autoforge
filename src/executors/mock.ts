@@ -33,6 +33,10 @@ export class MockExecutor implements AgentExecutor {
       return this.result("DONE", { findings: [] as ReviewFinding[] });
     }
 
+    if (task.type === "doc") {
+      return this.result("DONE", { artifacts: ["README.md"] });
+    }
+
     return this.result("DONE");
   }
 

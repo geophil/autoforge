@@ -103,6 +103,36 @@ function buildPrBody(payload: PrPayload): string {
   return lines.join("\n");
 }
 
+/**
+ * Merge a PR via `gh pr merge`. No-op if gh is unavailable.
+ */
+export async function mergePullRequest(prUrl: string): Promise<void> {
+  if (!isCommandAvailable("gh") || !process.env.GITHUB_TOKEN) return;
+  const result = spawnSync("gh", ["pr", "merge", prUrl, "--squash", "--auto", "--delete-branch"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, GH_TOKEN: process.env.GITHUB_TOKEN }
+  });
+  if (result.status !== 0) {
+    console.warn(`[pr] gh pr merge failed: ${result.stderr?.trim()}`);
+  }
+}
+
+/**
+ * Close a PR without merging. No-op if gh is unavailable.
+ */
+export async function closePullRequest(prUrl: string): Promise<void> {
+  if (!isCommandAvailable("gh") || !process.env.GITHUB_TOKEN) return;
+  const result = spawnSync("gh", ["pr", "close", prUrl, "--comment", "Rejected by autoforge reviewer."], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, GH_TOKEN: process.env.GITHUB_TOKEN }
+  });
+  if (result.status !== 0) {
+    console.warn(`[pr] gh pr close failed: ${result.stderr?.trim()}`);
+  }
+}
+
 function isCommandAvailable(cmd: string): boolean {
   const result = spawnSync(process.platform === "win32" ? "where" : "which", [cmd], {
     stdio: "ignore"

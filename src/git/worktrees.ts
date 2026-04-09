@@ -54,6 +54,21 @@ export class WorktreeManager {
   }
 
   /**
+   * Find the worktree path for a given taskId by scanning the root directory.
+   * Returns null if no matching worktree is found.
+   */
+  findWorktreePath(taskId: string): string | null {
+    try {
+      const { readdirSync } = require("node:fs") as typeof import("node:fs");
+      const entries = readdirSync(this.rootDir);
+      const match = entries.find((e) => e.startsWith(taskId));
+      return match ? join(this.rootDir, match) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Remove the worktree and delete the branch.
    */
   remove(worktree: WorktreeRef): void {

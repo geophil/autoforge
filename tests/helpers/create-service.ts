@@ -27,7 +27,13 @@ export function createTestService(handlers: Handlers = {}) {
 
   const executor = new MockExecutor(handlers);
   const worktrees = new WorktreeManager(join(baseDir, "worktrees"));
-  const service = new OrchestratorService({ env, db, executor, worktrees });
+  const service = new OrchestratorService({
+    env,
+    db,
+    executor,
+    worktrees,
+    testRunner: async () => ({ passRate: 1, output: "mock test runner" })
+  });
 
   return { service, db, dbPath };
 }

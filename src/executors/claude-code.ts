@@ -145,13 +145,23 @@ async function spawnClaude(
   onTimeout: () => void
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    // --print: non-interactive mode (outputs to stdout instead of TUI)
+    // --print: non-interactive mode
     // --dangerously-skip-permissions: allows file writes without confirmation prompts
-    const child = spawn(command, ["--print", "--dangerously-skip-permissions", prompt], {
-      cwd,
-      env: { ...process.env, ...env },
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+    // --output-format text: plain text output (no ANSI/JSON wrapping)
+    // --input-format text: read prompt from stdin to avoid OS arg length limits for large prompts
+    const child = spawn(
+      command,
+      ["--print", "--dangerously-skip-permissions", "--output-format", "text", "--input-format", "text"],
+      {
+        cwd,
+        env: { ...process.env, ...env },
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    );
+
+    // Deliver prompt via stdin then close to signal EOF.
+    child.stdin.write(prompt, "utf8");
+    child.stdin.end();
 
     let stderr = "";
     let sigkillTimer: ReturnType<typeof setTimeout> | undefined;

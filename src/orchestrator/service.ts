@@ -10,7 +10,7 @@ import type { PipelineTask, PlanSubtask, ReviewFinding, SubtaskReportStatus, Tas
 import { assertTransition } from "./state-machine";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
-import { createPullRequest, evaluatePrGate } from "../privileged/pr";
+import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
 
 interface ServiceDeps {
@@ -19,6 +19,7 @@ interface ServiceDeps {
   executor: AgentExecutor;
   worktrees: WorktreeManager;
   nats?: NatsClient;
+  testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
 }
 
 export class OrchestratorService {
@@ -106,6 +107,41 @@ export class OrchestratorService {
       throw new Error("Task is not awaiting approval.");
     }
     this.transition(taskId, task.projectId, "awaiting_approval", "documenting", {});
+
+    // Run doc agent in the task's worktree (if it still exists).
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (worktreePath) {
+      const docResult = await this.deps.executor.execute({
+        id: `${taskId}-doc`,
+        type: "doc",
+        prompt: buildDocPrompt(task.description, task.planSubtasks),
+        workingDirectory: worktreePath,
+        budgetSeconds: this.budgetForTier(task.tier, "doc"),
+        environment: {},
+        skillFiles: this.skills.skillsForAgent("doc"),
+        metadata: { taskId, description: task.description }
+      });
+
+      this.recordEvent({
+        taskId,
+        projectId: task.projectId,
+        agent: "doc",
+        type: "doc_done",
+        status: docResult.status === "DONE" ? "done" : "done_with_concerns",
+        payload: { artifacts: docResult.artifacts },
+        budgetSeconds: this.budgetForTier(task.tier, "doc"),
+        elapsedSeconds: docResult.metrics.elapsedSeconds
+      });
+
+      const worktreeBranch = `autoforge/${taskId}`;
+      this.deps.worktrees.commit({ branch: worktreeBranch, path: worktreePath }, "autoforge: documentation");
+    }
+
+    // Merge the PR now that the task is approved.
+    if (task.prUrl) {
+      await mergePullRequest(task.prUrl);
+    }
+
     this.transition(taskId, task.projectId, "documenting", "completed", {});
     return this.requireTask(taskId);
   }
@@ -114,6 +150,11 @@ export class OrchestratorService {
     const task = this.requireTask(taskId);
     if (task.state !== "awaiting_approval") {
       throw new Error("Task is not awaiting approval.");
+    }
+
+    // Close the PR if one was created.
+    if (task.prUrl) {
+      await closePullRequest(task.prUrl);
     }
 
     const nextIteration = task.iteration + 1;
@@ -174,6 +215,11 @@ export class OrchestratorService {
 
       this.transition(taskId, projectId, "executing", "reviewing", { iteration });
 
+      // EXPRESS tier skips the reviewer — faster turnaround, lower risk tolerance.
+      if (tier === "EXPRESS") {
+        break;
+      }
+
       const reviewResult = await this.deps.executor.execute({
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
@@ -229,7 +275,8 @@ export class OrchestratorService {
       });
     }
 
-    const testResult = await runAuthenticatedTests(worktreePath, projectId);
+    const runTests = this.deps.testRunner ?? runAuthenticatedTests;
+    const testResult = await runTests(worktreePath, projectId);
     const reviewScore = unresolvedFindings.length === 0 ? 1 : 0.5;
     const gate = evaluatePrGate({
       passRate: testResult.passRate,
@@ -312,11 +359,11 @@ export class OrchestratorService {
     });
   }
 
-  private budgetForTier(tier: PipelineTask["tier"], step: "planner" | "coder" | "reviewer"): number {
+  private budgetForTier(tier: PipelineTask["tier"], step: "planner" | "coder" | "reviewer" | "doc"): number {
     const budgets = {
-      EXPRESS: { planner: 180, coder: 300, reviewer: 0 },
-      STANDARD: { planner: 480, coder: 480, reviewer: 180 },
-      THOROUGH: { planner: 900, coder: 720, reviewer: 480 }
+      EXPRESS: { planner: 180, coder: 300, reviewer: 0, doc: 120 },
+      STANDARD: { planner: 480, coder: 480, reviewer: 180, doc: 180 },
+      THOROUGH: { planner: 900, coder: 720, reviewer: 480, doc: 300 }
     };
     return budgets[tier][step];
   }
@@ -402,6 +449,15 @@ function parseFindings(taskId: string, output: unknown): ReviewFinding[] {
     }));
   }
   return [];
+}
+
+function buildDocPrompt(description: string, subtasks: PlanSubtask[]): string {
+  const subtaskList = subtasks.map((s, i) => `${i + 1}. ${s.description}`).join("\n");
+  return [
+    `## Feature\n${description}`,
+    `## Subtasks completed\n${subtaskList}`,
+    "## Instructions\nUpdate or create documentation for the changes made. Update README.md if it exists. Create or update relevant docs/ files. Focus on usage examples and public API changes. Keep docs concise and accurate."
+  ].join("\n\n");
 }
 
 function isSuccess(status: SubtaskReportStatus | "FAILED" | "TIMEOUT"): boolean {
