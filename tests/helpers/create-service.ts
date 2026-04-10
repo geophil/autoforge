@@ -32,7 +32,8 @@ export function createTestService(handlers: Handlers = {}) {
     db,
     executor,
     worktrees,
-    testRunner: async () => ({ passRate: 1, output: "mock test runner" })
+    testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
+    prCreator: async (payload) => `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`
   });
 
   return { service, db, dbPath };

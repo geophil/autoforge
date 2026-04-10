@@ -20,6 +20,7 @@ interface ServiceDeps {
   worktrees: WorktreeManager;
   nats?: NatsClient;
   testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
+  prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
 }
 
 export class OrchestratorService {
@@ -290,7 +291,8 @@ export class OrchestratorService {
       throw new Error(gate.reason ?? "PR gate rejected task");
     }
 
-    const prUrl = await createPullRequest({
+    const createPr = this.deps.prCreator ?? createPullRequest;
+    const prUrl = await createPr({
       title: `Autoforge task ${taskId}`,
       description,
       branch,

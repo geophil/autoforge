@@ -15,7 +15,10 @@ const EnvSchema = z.object({
   // Override the claude binary path if needed.
   CLAUDE_COMMAND: z.string().default("claude"),
   // Path to skills directory (injected into agent prompts).
-  SKILLS_DIR: z.string().default("./skills")
+  SKILLS_DIR: z.string().default("./skills"),
+  // Anthropic SDK executor settings (used when EXECUTOR_DEFAULT=anthropic-sdk).
+  ANTHROPIC_API_KEY: z.string().optional(),
+  ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6")
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;
