@@ -63,7 +63,7 @@ const TOOLS: Anthropic.Tool[] = [
 // Tool execution
 // ---------------------------------------------------------------------------
 
-function executeTool(name: string, input: Record<string, string>, cwd: string): string {
+function executeTool(name: string, input: Record<string, string>, cwd: string, env: Record<string, string>): string {
   try {
     switch (name) {
       case "read_file": {
@@ -87,6 +87,7 @@ function executeTool(name: string, input: Record<string, string>, cwd: string): 
       case "bash": {
         const result = spawnSync("bash", ["-c", input.command], {
           cwd,
+          env: { ...process.env, ...env },
           encoding: "utf8",
           timeout: 60_000,
           stdio: ["ignore", "pipe", "pipe"]
@@ -161,7 +162,8 @@ export class AnthropicSdkExecutor implements AgentExecutor {
             const result = executeTool(
               block.name,
               block.input as Record<string, string>,
-              task.workingDirectory
+              task.workingDirectory,
+              task.environment
             );
             toolResults.push({
               type: "tool_result",

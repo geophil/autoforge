@@ -10,12 +10,32 @@ services:
     volumes:
       - nats-data:/data
 
+  qmd:
+    build: ./docker/qmd
+    volumes:
+      - ./docs:/data/docs:ro
+      - qmd-index:/data/.qmd
+    ports:
+      - "8181:8181"
+    environment:
+      - QMD_DOCS_DIR=/data/docs/qmd
+      - QMD_REINDEX_HOURS=3
+    healthcheck:
+      test: ["CMD", "qmd", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
   autoforge:
     image: oven/bun:latest
     working_dir: /app
     command: ["bun", "run", "src/index.ts"]
     depends_on:
-      - nats
+      nats:
+        condition: service_started
+      qmd:
+        condition: service_healthy
     ports:
       - "3000:3000"
     environment:
@@ -24,8 +44,10 @@ services:
       - HOST=0.0.0.0
       - PORT=3000
       - EXECUTOR_DEFAULT=claude-code
+      - QMD_MCP_URL=http://qmd:8181/mcp
     volumes:
       - ./:/app
 
 volumes:
   nats-data:
+  qmd-index:

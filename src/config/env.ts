@@ -18,7 +18,9 @@ const EnvSchema = z.object({
   SKILLS_DIR: z.string().default("./skills"),
   // Anthropic SDK executor settings (used when EXECUTOR_DEFAULT=anthropic-sdk).
   ANTHROPIC_API_KEY: z.string().optional(),
-  ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6")
+  ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6"),
+  // QMD MCP endpoint — passed to agent environments so agents can query the knowledge base.
+  QMD_MCP_URL: z.string().optional()
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;

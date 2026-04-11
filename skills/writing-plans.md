@@ -1,10 +1,33 @@
 # skill: writing-plans
 
 ## Version
-v1.0 — 2026-04-09
+v1.1 — 2026-04-11
 
 ## When to Activate
 Always active for planner agents.
+
+## Context Gathering (do this first)
+
+Before producing the plan, query QMD for relevant architecture documentation using
+the QMD MCP tools available in this session (`query`, `get`, `multi_get`, `status`).
+
+1. Search for docs relevant to the task:
+   - Call the `query` tool with key terms from the task description
+   - Example: `query("rate limiting API middleware patterns")`
+
+2. Pull conventions and architecture overview:
+   - Call `query("patterns conventions architecture overview")`
+
+3. If a specific domain doc seems relevant, retrieve it in full:
+   - Call `get` with the document path, e.g. `get("docs/qmd/domain-web-api.md")`
+
+Use the retrieved context to:
+- Produce accurate `filesInScope` paths that match the actual codebase layout
+- Respect existing patterns (dependency injection, error handling, event sourcing conventions)
+- Identify which domain modules are involved
+
+If QMD tools are unavailable, fall back to `list_directory` and `read_file` to explore
+the codebase directly before planning.
 
 ## Instructions
 

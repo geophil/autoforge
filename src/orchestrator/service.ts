@@ -71,7 +71,7 @@ export class OrchestratorService {
       prompt: `Create implementation subtasks for: ${description}`,
       workingDirectory: worktree.path,
       budgetSeconds: this.budgetForTier(tier, "planner"),
-      environment: {},
+      environment: this.deps.env.QMD_MCP_URL ? { QMD_MCP_URL: this.deps.env.QMD_MCP_URL } : {},
       skillFiles: this.skills.skillsForAgent("planner"),
       metadata: { description, tier }
     });

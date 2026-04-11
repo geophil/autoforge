@@ -1,0 +1,24 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "autoforge dev server",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--env-file", ".env", "src/index.ts"],
+      "port": 3000,
+      "autoPort": true
+    },
+    {
+      "name": "nats (jetstream)",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "up", "nats"],
+      "port": 4222
+    },
+    {
+      "name": "nats monitoring",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "up", "nats"],
+      "port": 8222
+    }
+  ]
+}

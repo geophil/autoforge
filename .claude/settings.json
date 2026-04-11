@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git push*)",
+            "statusMessage": "Cleaning up worktrees...",
+            "command": "input=$(cat); cmd=$(echo \"$input\" | jq -r '.tool_input.command'); exit_code=$(echo \"$input\" | jq -r '.tool_response.exitCode // 0'); if echo \"$cmd\" | grep -q 'git push' && [ \"$exit_code\" = '0' ]; then cd /Users/jophie/Dev/autoforge && git worktree list --porcelain | grep '^worktree ' | grep -v '^worktree /Users/jophie/Dev/autoforge$' | sed 's/^worktree //' | xargs -I{} git worktree remove --force \"{}\" 2>/dev/null || true; git branch | grep 'autoforge/' | xargs -r git branch -D 2>/dev/null || true; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

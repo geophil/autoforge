@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
 
 /** Convention file written by the agent to report status and artifacts. */
@@ -21,10 +23,16 @@ export class ClaudeCodeExecutor implements AgentExecutor {
     const command = process.env.CLAUDE_COMMAND ?? "claude";
     const prompt = buildPrompt(task);
 
+    // Write a temporary MCP config if QMD is configured, so the claude session
+    // has access to the QMD query/get/multi_get/status tools via HTTP MCP.
+    const mcpConfigPath = task.environment.QMD_MCP_URL
+      ? writeMcpConfig(task.environment.QMD_MCP_URL)
+      : null;
+
     let timedOut = false;
 
     try {
-      await spawnClaude(command, prompt, task.workingDirectory, task.environment, task.budgetSeconds, () => {
+      await spawnClaude(command, prompt, task.workingDirectory, task.environment, task.budgetSeconds, mcpConfigPath, () => {
         timedOut = true;
       });
     } catch (err) {
@@ -38,6 +46,10 @@ export class ClaudeCodeExecutor implements AgentExecutor {
         blockReason: err instanceof Error ? err.message : String(err),
         metrics: { elapsedSeconds }
       };
+    } finally {
+      if (mcpConfigPath) {
+        try { unlinkSync(mcpConfigPath); } catch { /* already gone */ }
+      }
     }
 
     const elapsedSeconds = (Date.now() - start) / 1000;
@@ -66,6 +78,26 @@ export class ClaudeCodeExecutor implements AgentExecutor {
   async healthCheck(): Promise<boolean> {
     return true;
   }
+}
+
+// ---------------------------------------------------------------------------
+// MCP config
+// ---------------------------------------------------------------------------
+
+/**
+ * Writes a temporary MCP config JSON file pointing at the QMD HTTP MCP server.
+ * Returns the path so the caller can pass it to claude via --mcp-config and
+ * clean it up afterwards.
+ */
+function writeMcpConfig(qmdMcpUrl: string): string {
+  const config = {
+    mcpServers: {
+      qmd: { url: qmdMcpUrl }
+    }
+  };
+  const path = join(tmpdir(), `autoforge-mcp-${randomUUID()}.json`);
+  writeFileSync(path, JSON.stringify(config));
+  return path;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +174,7 @@ async function spawnClaude(
   cwd: string,
   env: Record<string, string>,
   timeoutSeconds: number,
+  mcpConfigPath: string | null,
   onTimeout: () => void
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -149,15 +182,20 @@ async function spawnClaude(
     // --dangerously-skip-permissions: allows file writes without confirmation prompts
     // --output-format text: plain text output (no ANSI/JSON wrapping)
     // --input-format text: read prompt from stdin to avoid OS arg length limits for large prompts
-    const child = spawn(
-      command,
-      ["--print", "--dangerously-skip-permissions", "--output-format", "text", "--input-format", "text"],
-      {
-        cwd,
-        env: { ...process.env, ...env },
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
+    // --mcp-config: optional path to MCP server config (added when QMD is configured)
+    const args = [
+      "--print",
+      "--dangerously-skip-permissions",
+      "--output-format", "text",
+      "--input-format", "text",
+      ...(mcpConfigPath ? ["--mcp-config", mcpConfigPath] : [])
+    ];
+
+    const child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, ...env },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
 
     // Deliver prompt via stdin then close to signal EOF.
     child.stdin.write(prompt, "utf8");
