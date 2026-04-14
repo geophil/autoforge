@@ -40,6 +40,7 @@ serve(
   },
   (info) => {
     console.log(`Autoforge listening on http://${info.address}:${info.port}`);
+    console.log(`Executor: ${executor.name}`);
     console.log(`NATS: ${nats.isConnected ? env.NATS_URL : "not connected (SQLite-only mode)"}`);
   }
 );
