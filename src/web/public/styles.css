@@ -347,6 +347,34 @@ h2 {
   color: var(--text-dim);
 }
 
+/* Cost Summary */
+.cost-summary {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.cost-stat {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.cost-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
 /* Timeline */
 .tl-item {
   display: flex;
