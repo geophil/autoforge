@@ -18,6 +18,10 @@ export function createWebServer(service: OrchestratorService, db: DbClient): Hon
   app.route("/api/metrics", createMetricsRoutes(db));
   app.route("/api/meta", createMetaRoutes(service));
 
+  app.get("/api/health", (ctx) => {
+    return ctx.json({ status: "ok", uptime: process.uptime() });
+  });
+
   app.get("/api/events", (ctx) => {
     return streamSSE(ctx, async (stream) => {
       const unsubscribe = events.subscribe((payload) => {
