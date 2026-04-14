@@ -2,13 +2,14 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { OrchestratorService } from "../../orchestrator/service";
 import type { LiveEventHub } from "../events";
+import type { DbClient } from "../../db/client";
 
 const CreateTaskSchema = z.object({
   projectId: z.string().min(1),
   description: z.string().min(1)
 });
 
-export function createTaskRoutes(service: OrchestratorService, events: LiveEventHub): Hono {
+export function createTaskRoutes(service: OrchestratorService, events: LiveEventHub, db: DbClient): Hono {
   const app = new Hono();
 
   app.post("/", async (ctx) => {
@@ -28,6 +29,10 @@ export function createTaskRoutes(service: OrchestratorService, events: LiveEvent
       return ctx.json({ error: "not_found" }, 404);
     }
     return ctx.json(task);
+  });
+
+  app.get("/:id/events", (ctx) => {
+    return ctx.json(db.listEvents(ctx.req.param("id")));
   });
 
   return app;

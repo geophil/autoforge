@@ -130,6 +130,34 @@ export class DbClient {
     };
   }
 
+  listEvents(taskId: string): Array<{
+    id: string;
+    type: string;
+    agent: string;
+    status: string;
+    timestamp: string;
+    elapsedSeconds: number | null;
+    tokenUsage: { input: number; output: number } | null;
+  }> {
+    const rows = this.sqlite
+      .query(
+        "SELECT id, event_type, agent, status, timestamp, elapsed_seconds, token_input, token_output FROM events WHERE task_id = ? ORDER BY timestamp ASC"
+      )
+      .all(taskId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      type: String(row.event_type),
+      agent: String(row.agent),
+      status: String(row.status),
+      timestamp: String(row.timestamp),
+      elapsedSeconds: row.elapsed_seconds !== null ? Number(row.elapsed_seconds) : null,
+      tokenUsage:
+        row.token_input !== null && row.token_output !== null
+          ? { input: Number(row.token_input), output: Number(row.token_output) }
+          : null,
+    }));
+  }
+
   listFindings(taskId: string): ReviewFinding[] {
     const rows = this.sqlite.query("SELECT * FROM review_findings WHERE task_id = ? ORDER BY id").all(taskId) as Array<Record<string, unknown>>;
     return rows.map((row) => ({

@@ -13,7 +13,7 @@ export function createWebServer(service: OrchestratorService, db: DbClient): Hon
   const app = new Hono();
   const events = new LiveEventHub();
 
-  app.route("/api/tasks", createTaskRoutes(service, events));
+  app.route("/api/tasks", createTaskRoutes(service, events, db));
   app.route("/api/tasks", createApprovalRoutes(service, events));
   app.route("/api/metrics", createMetricsRoutes(db));
   app.route("/api/meta", createMetaRoutes(service));
