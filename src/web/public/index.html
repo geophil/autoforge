@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Autoforge</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <h1>Autoforge</h1>
+      <span class="connection-badge" id="connection-badge">connecting</span>
+    </div>
+    <nav>
+      <button class="nav-btn active" data-view="tasks">Tasks</button>
+      <button class="nav-btn" data-view="metrics">Metrics</button>
+      <button class="nav-btn" data-view="experiments">Experiments</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Tasks View -->
+    <section id="view-tasks" class="view active">
+      <div class="view-header">
+        <h2>Task Queue</h2>
+        <button class="btn btn-primary" id="btn-new-task">New Task</button>
+      </div>
+
+      <dialog id="dialog-new-task">
+        <form id="form-new-task" method="dialog">
+          <h3>Submit Task</h3>
+          <label>
+            Project ID
+            <input type="text" name="projectId" value="autoforge" required />
+          </label>
+          <label>
+            Description
+            <textarea name="description" rows="4" placeholder="Describe the feature or change..." required></textarea>
+          </label>
+          <div class="dialog-actions">
+            <button type="button" class="btn btn-ghost" id="btn-cancel-task">Cancel</button>
+            <button type="submit" class="btn btn-primary">Submit</button>
+          </div>
+        </form>
+      </dialog>
+
+      <div class="task-list" id="task-list">
+        <div class="empty-state">Loading tasks...</div>
+      </div>
+    </section>
+
+    <!-- Task Detail View -->
+    <section id="view-task-detail" class="view">
+      <button class="btn btn-ghost back-btn" id="btn-back-to-tasks">&larr; Back to tasks</button>
+      <div id="task-detail-content"></div>
+    </section>
+
+    <!-- Metrics View -->
+    <section id="view-metrics" class="view">
+      <h2>Pipeline Metrics</h2>
+      <div class="metrics-input">
+        <label>
+          Project ID
+          <input type="text" id="metrics-project-id" value="autoforge" />
+        </label>
+        <button class="btn btn-primary" id="btn-load-metrics">Load</button>
+      </div>
+      <div class="metrics-grid" id="metrics-grid">
+        <div class="empty-state">Select a project to view metrics.</div>
+      </div>
+    </section>
+
+    <!-- Experiments View -->
+    <section id="view-experiments" class="view">
+      <div class="view-header">
+        <h2>Meta Agent &amp; Experiments</h2>
+        <button class="btn btn-primary" id="btn-trigger-meta">Run Meta Agent</button>
+      </div>
+
+      <dialog id="dialog-meta">
+        <form id="form-meta" method="dialog">
+          <h3>Trigger Meta Agent</h3>
+          <label>
+            Project ID
+            <input type="text" name="projectId" value="autoforge" required />
+          </label>
+          <label>
+            Focus (optional)
+            <input type="text" name="focus" placeholder="e.g. persona:coder" />
+          </label>
+          <div class="dialog-actions">
+            <button type="button" class="btn btn-ghost" id="btn-cancel-meta">Cancel</button>
+            <button type="submit" class="btn btn-primary">Submit</button>
+          </div>
+        </form>
+      </dialog>
+
+      <div id="experiments-content">
+        <div class="empty-state">Meta agent experiments will appear here.</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

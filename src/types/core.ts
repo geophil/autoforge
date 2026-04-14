@@ -52,6 +52,7 @@ export interface PlanSubtask {
   filesInScope: string[];
   dependencies: string[];
   testCriteria: string[];
+  agentType?: AgentType;
 }
 
 export interface PipelineTask {

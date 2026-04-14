@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Autoforge is a self-improving agentic software development system. It receives natural-language feature requests, routes them through a multi-agent pipeline, and produces human-reviewable pull requests. Over time it accumulates institutional knowledge and — via a planned meta-loop — improves its own processes through measured experimentation. The system runs as a single Bun process backed by SQLite, with NATS JetStream as an optional event bus.
+Autoforge is a self-improving agentic software development system. It receives natural-language feature requests, routes them through a multi-agent pipeline, and produces human-reviewable pull requests. A meta agent analyzes pipeline outcomes and improves specialist personas and skills through measured experimentation. The system runs as a single Bun process backed by SQLite, with NATS JetStream as an optional event bus and a QMD knowledge base for architecture context.
 
 ## System Topology
 
@@ -13,10 +13,12 @@ Human → HTTP POST /api/tasks
           ↓
     Complexity Assessment → Tier Routing
           ↓
-    AgentExecutor (pluggable)
-      ├── ClaudeCodeExecutor (subprocess)
-      ├── AnthropicSdkExecutor (API)
-      └── MockExecutor (tests)
+    Lead Agent (planner) ←→ QMD MCP (architecture knowledge base)
+          ↓ PlanSubtask[]
+    Specialist Agents (persona + skills per type)
+      ├── coder    — implements subtasks
+      ├── reviewer — inspects output, produces findings
+      └── doc      — updates documentation after approval
           ↓
     Git Worktree (isolated branch per task)
           ↓
@@ -25,23 +27,35 @@ Human → HTTP POST /api/tasks
     GitHub PR (via gh CLI)
           ↓
     Human Approval → PR Merge
+
+Human → HTTP POST /api/meta
+          ↓
+    Meta Agent — queries agent_performance, proposes persona/skill edit
+          ↓
+    Experiment activated in skill_versions (PersonaRegistry DB-first)
+          ↓
+    Canary: next N tasks use new version → compare outcomes → keep or revert
 ```
 
+**Composition**: Every agent — planner, coder, reviewer, doc, meta — is composed the same way: `persona(type) + skills(type) + task_context`, resolved through `PersonaRegistry` and `SkillRegistry`, dispatched through `AgentExecutor`. No special paths per agent type.
+
 **Storage**:
-- `SQLite` — append-only event log + materialized task/finding views (source of truth)
+- `SQLite` — append-only event log + materialized projections (source of truth); includes `skill_versions` for persona/skill versioning and `experiments` for improvement history
 - `NATS JetStream` — event streaming, optional (system runs without it)
 - `Git worktrees` — per-task isolated working directories under `.runtime-worktrees/`
+- `QMD index` — vector + BM25 index of `docs/qmd/` served via HTTP MCP on port 8181
 
 ## Domain Boundaries
 
 | Domain | Responsibility | Key Entry Points |
 |--------|---------------|-----------------|
-| Task Orchestration | Pipeline coordination, state machine, agent dispatch | `OrchestratorService.submitTask`, `approveTask`, `rejectTask` |
+| Task Orchestration | Pipeline coordination, state machine, agent dispatch | `OrchestratorService.submitTask`, `approveTask`, `rejectTask`, `submitMetaTask` |
 | Complexity & Tier Routing | Classify task description, select tier | `assessComplexity()`, `routeTier()` |
-| Agent Execution | Dispatch work to AI runtimes, enforce budgets | `AgentExecutor.execute()`, `SkillRegistry.skillsForAgent()` |
+| Agent Execution | Dispatch work to AI runtimes, enforce budgets, inject personas + skills | `AgentExecutor.execute()`, `PersonaRegistry.resolve()`, `SkillRegistry.skillsForAgent()` |
+| Persona & Skill Versioning | Version and activate prompt assets; track experiments | `PersonaRegistry.snapshotId()`, `DbClient.upsertPromptAsset()`, `experiments` table |
 | PR Gate & Version Control | Quality gate, GitHub operations, git isolation | `evaluatePrGate()`, `createPullRequest()`, `WorktreeManager` |
 | Event Sourcing & Recovery | Durable event log, projections, crash recovery | `DbClient.appendEvent()`, `RecoveryService.recover()` |
-| Web API & Dashboard | HTTP routes, SSE live updates | `createWebServer()`, `/api/tasks`, `/api/events` |
+| Web API & Dashboard | HTTP routes, SSE live updates | `createWebServer()`, `/api/tasks`, `/api/meta`, `/api/events` |
 
 ## Data Flow: Task Submission to PR
 
@@ -52,20 +66,31 @@ Human → HTTP POST /api/tasks
    b. routeTier(assessment)          → Tier (EXPRESS|STANDARD|THOROUGH)
    c. WorktreeManager.create(taskId) → branch + isolated directory
    d. recordEvent("created")
-   e. executor.execute({ type: "planner", ... })  → PlanSubtask[]
+   e. executor.execute({
+        type: "planner",
+        systemPrompt: personas.resolve("planner"),  ← persona injected
+        skillFiles: skills.skillsForAgent("planner"),
+        environment: { QMD_MCP_URL }               ← knowledge base access
+      }) → PlanSubtask[] (each with optional agentType)
    f. for each subtask:
-        executor.execute({ type: "coder", ... })
+        executor.execute({
+          type: subtask.agentType ?? "coder",
+          systemPrompt: personas.resolve(agentType),  ← specialist persona
+          skillFiles: skills.skillsForAgent(agentType)
+        })
         worktrees.commit(branch, message)
+        recordEvent("subtask_done", { persona_version_id, skill_version_ids, token_usage })
       (loop up to 3x if reviewer finds CRITICAL/MAJOR; EXPRESS skips reviewer)
    g. runAuthenticatedTests(worktreePath)
-   h. evaluatePrGate(passRate, reviewScore, findings)
-   i. createPullRequest(branch, description, findings)
-   j. recordEvent("state.awaiting_approval")
+   h. recordEvent("test_results", { passRate })
+   i. evaluatePrGate(passRate, reviewScore, findings)
+   j. createPullRequest(branch, description, findings)
+   k. recordEvent("state.awaiting_approval")
 3. Return task { state: "awaiting_approval", prUrl }
 
 4. Human reviews PR on GitHub
 5. POST /api/tasks/:id/approve
-   a. executor.execute({ type: "doc", ... })
+   a. executor.execute({ type: "doc", systemPrompt: personas.resolve("doc"), ... })
    b. mergePullRequest(prUrl)
    c. recordEvent("state.completed")
 ```
@@ -82,13 +107,18 @@ Human → HTTP POST /api/tasks
 | AI Agent (default) | Claude Code CLI | Spawned as subprocess |
 | AI Agent (alt) | Anthropic SDK (`@anthropic-ai/sdk`) | Tool-use agentic loop |
 | GitHub Integration | `gh` CLI | PR create/merge/close |
-| Containerization | Docker Compose | NATS + Autoforge services |
+| Containerization | Docker Compose | NATS + QMD + Autoforge services |
+| Knowledge Base | QMD (`@tobilu/qmd`) | BM25 + vector search over `docs/qmd/`, served via HTTP MCP |
 
 ## Key Architectural Decisions
 
 **Brain / Hands / Session separation**: The orchestrator (brain) is stateless — it can crash and recover by replaying events. Agent runtimes (hands) are disposable subprocesses with no persistent state. The event log (session) is the single source of truth.
 
-**Agents never hold credentials**: `GITHUB_TOKEN` and `ANTHROPIC_API_KEY` live only in the orchestrator process. Git push and PR operations happen after the agent completes, in the orchestrator.
+**Composition over configuration**: Every agent type — including the meta agent — is composed identically from a persona and skills. There are no special code paths per agent type. Adding a new specialist means adding a persona file and a skills mapping entry.
+
+**Agents never hold credentials**: `GITHUB_TOKEN` and `ANTHROPIC_API_KEY` live only in the orchestrator process. Git push and PR operations happen after the agent completes, in the orchestrator. The exception is `QMD_MCP_URL`, which the planner receives to query the knowledge base.
+
+**Unified prompt asset versioning**: Personas and skills are both stored in `skill_versions` under a naming convention (`persona:coder`, `skill:tdd`). `PersonaRegistry` resolves the DB-active version first, enabling the meta-loop to activate improvements without file changes. Each agent execution records its `persona_version_id` and `skill_version_ids` in the event payload for outcome attribution.
 
 **Sequential agent pipeline by default**: Each stage waits for the previous to complete. This lets the output of planning inform coding, and the output of coding inform review. Parallelism is a future opt-in.
 
@@ -96,13 +126,26 @@ Human → HTTP POST /api/tasks
 
 ## Deployment
 
-**Local development**: `bun run src/index.ts` with optional `docker-compose up` for NATS.
+**Local development**: `bun run src/index.ts` without NATS or QMD (SQLite-only, planner falls back to filesystem exploration).
 
-**Docker Compose**: Two services — `nats` (JetStream enabled) and `autoforge` (Bun, binds port 3000). Project repo and skills are volume-mounted from the host.
+**Docker Compose**: Three services — `nats` (JetStream), `qmd` (knowledge base, port 8181), and `autoforge` (Bun, port 3000). Project repo, skills, and docs are volume-mounted from the host. `autoforge` waits for `qmd` to pass its health check before starting.
 
 ```yaml
-# docker-compose.yml
+# docker-compose.yml (abridged)
 services:
-  nats:      { image: nats:latest, command: ["--jetstream", "--store_dir=/data"] }
-  autoforge: { image: oven/bun:latest, command: ["bun", "run", "src/index.ts"] }
+  nats:
+    image: nats:latest
+    command: ["--jetstream", "--store_dir=/data"]
+  qmd:
+    build: ./docker/qmd          # embeds docs/qmd/ on boot, re-indexes every 3h
+    environment:
+      - QMD_DOCS_DIR=/data/docs/qmd
+    ports: ["8181:8181"]
+  autoforge:
+    image: oven/bun:latest
+    command: ["bun", "run", "src/index.ts"]
+    depends_on:
+      qmd: { condition: service_healthy }
+    environment:
+      - QMD_MCP_URL=http://qmd:8181/mcp
 ```

@@ -3,6 +3,7 @@ import type { AgentType, SubtaskReportStatus } from "../types/core";
 export interface AgentTask {
   id: string;
   type: AgentType;
+  systemPrompt: string;
   prompt: string;
   workingDirectory: string;
   budgetSeconds: number;

@@ -13,6 +13,8 @@ interface AgentStatusFile {
   artifacts: string[];
   concerns?: string;
   blockReason?: string;
+  // Extra fields (e.g. "meta" from the meta agent) pass through as output.
+  [key: string]: unknown;
 }
 
 export class ClaudeCodeExecutor implements AgentExecutor {
@@ -71,6 +73,7 @@ export class ClaudeCodeExecutor implements AgentExecutor {
       artifacts: statusFile.artifacts,
       concerns: statusFile.concerns,
       blockReason: statusFile.blockReason,
+      output: statusFile,
       metrics: { elapsedSeconds }
     };
   }
@@ -106,6 +109,11 @@ function writeMcpConfig(qmdMcpUrl: string): string {
 
 function buildPrompt(task: AgentTask): string {
   const sections: string[] = [];
+
+  // Persona defines who the agent is — prepend first, matching AnthropicSdkExecutor behavior.
+  if (task.systemPrompt) {
+    sections.push(task.systemPrompt);
+  }
 
   const skillContents = loadSkillFiles(task.skillFiles);
   if (skillContents) {
