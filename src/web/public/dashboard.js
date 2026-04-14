@@ -176,24 +176,62 @@ function renderTaskDetail(task) {
     </div>` : ""}
 
     <div class="detail-section" id="findings-section">
-      <h3>Review Findings</h3>
+      <h3>Pipeline Event Log</h3>
       <div id="findings-list"><span style="color: var(--text-dim); font-size: 0.85rem;">Loading...</span></div>
     </div>
   `;
 
-  loadFindings(task.id);
+  loadEvents(task.id);
 }
 
-async function loadFindings(taskId) {
+const AGENT_COLORS = {
+  orchestrator: "var(--accent)",
+  planner: "var(--yellow)",
+  coder: "var(--orange)",
+  reviewer: "var(--green)",
+  doc: "var(--text-muted)",
+  pr: "var(--green)",
+  meta: "var(--accent)",
+};
+
+function agentColor(agent) {
+  return AGENT_COLORS[agent] || "var(--text-muted)";
+}
+
+function formatElapsed(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  return `${Math.floor(seconds / 60)}m ${(seconds % 60).toFixed(0)}s`;
+}
+
+async function loadEvents(taskId) {
   const container = document.getElementById("findings-list");
   try {
-    const res = await fetch(`${API}/api/tasks/${taskId}`);
-    const task = await res.json();
-    // Findings come from the events; we render what we have from the task's plan
-    // For now show a placeholder since findings aren't exposed via a direct endpoint yet
-    container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Findings are recorded in the event log.</span>`;
+    const res = await fetch(`${API}/api/tasks/${taskId}/events`);
+    const events = await res.json();
+    if (events.length === 0) {
+      container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">No events yet.</span>`;
+      return;
+    }
+    container.innerHTML = events
+      .map((ev) => {
+        const color = agentColor(ev.agent);
+        const elapsed = ev.elapsedSeconds !== null ? `<span class="tl-meta">${formatElapsed(ev.elapsedSeconds)}</span>` : "";
+        const tokens = ev.tokenUsage ? `<span class="tl-meta">${ev.tokenUsage.input + ev.tokenUsage.output} tok</span>` : "";
+        return `
+          <div class="tl-item">
+            <span class="tl-dot" style="background:${color}"></span>
+            <div class="tl-body">
+              <span class="tl-agent" style="color:${color}">${esc(ev.agent)}</span>
+              <span class="tl-type">${esc(ev.type)}</span>
+              ${elapsed}${tokens}
+              <span class="tl-time">${timeAgo(ev.timestamp)}</span>
+            </div>
+          </div>`;
+      })
+      .join("");
   } catch {
-    container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Could not load findings.</span>`;
+    container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Could not load events.</span>`;
   }
 }
 
