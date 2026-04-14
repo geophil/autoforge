@@ -1,5 +1,6 @@
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join, basename } from "node:path";
+import type { DbClient } from "../db/client";
 import type { AgentType } from "../types/core";
 
 /**
@@ -17,7 +18,10 @@ const AGENT_SKILLS: Record<AgentType, string[]> = {
 };
 
 export class SkillRegistry {
-  constructor(private readonly skillsDir: string) {}
+  constructor(
+    private readonly skillsDir: string,
+    private readonly db?: DbClient
+  ) {}
 
   /**
    * Returns absolute paths to skill files for the given agent type.
@@ -30,6 +34,25 @@ export class SkillRegistry {
     return filenames
       .map((filename) => join(this.skillsDir, filename))
       .filter((filePath) => existsSync(filePath));
+  }
+
+  /**
+   * Snapshot all skill files for an agent type into skill_versions.
+   * Returns an array of skill_versions.id values for event provenance.
+   * Requires db to be provided at construction time.
+   */
+  snapshotIds(agentType: AgentType): string[] {
+    if (!this.db) return [];
+    const paths = this.skillsForAgent(agentType);
+    return paths.map((filePath) => {
+      try {
+        const content = readFileSync(filePath, "utf8").trim();
+        const skillName = `skill:${basename(filePath, ".md")}`;
+        return this.db!.upsertPromptAsset(skillName, content);
+      } catch {
+        return "";
+      }
+    }).filter(Boolean);
   }
 
   /** List all skill files present in the skills directory. */

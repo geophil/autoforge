@@ -210,6 +210,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
       artifacts: statusFile.artifacts,
       concerns: statusFile.concerns,
       blockReason: statusFile.blockReason,
+      output: statusFile,
       metrics: { elapsedSeconds, tokenInput: totalInputTokens, tokenOutput: totalOutputTokens }
     };
   }
@@ -232,12 +233,12 @@ export class AnthropicSdkExecutor implements AgentExecutor {
 function buildSystemPrompt(task: AgentTask): string {
   const sections: string[] = [];
 
+  sections.push(task.systemPrompt);
+
   const skillContents = loadSkillFiles(task.skillFiles);
   if (skillContents) {
     sections.push(`# Skills\n\n${skillContents}`);
   }
-
-  sections.push(`# Role\n\nYou are an autonomous software agent. You have access to tools to read and write files and run shell commands in your working directory. Work methodically: read existing code before editing, verify your changes compile or pass tests before finishing.`);
 
   sections.push(`# Status Reporting (required)
 
@@ -280,6 +281,8 @@ interface AgentStatusFile {
   artifacts: string[];
   concerns?: string;
   blockReason?: string;
+  // Extra fields (e.g. "meta" from the meta agent) pass through as output.
+  [key: string]: unknown;
 }
 
 function readStatusFile(workingDirectory: string): AgentStatusFile | null {

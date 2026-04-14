@@ -16,6 +16,7 @@ export class WorktreeManager {
   /**
    * Create a git branch and worktree for a task.
    * Falls back to a plain directory if not inside a git repo.
+   * Installs dependencies if a lock file is present in the worktree.
    */
   create(taskId: string): WorktreeRef {
     const branch = `autoforge/${taskId}`;
@@ -35,6 +36,7 @@ export class WorktreeManager {
       mkdirSync(path, { recursive: true });
     }
 
+    this.installDependencies(path);
     return { branch, path };
   }
 
@@ -75,6 +77,37 @@ export class WorktreeManager {
     if (!this.isGitRepo()) return;
     run("git", ["worktree", "remove", "--force", worktree.path], { ignore: true });
     run("git", ["branch", "-D", worktree.branch], { ignore: true });
+  }
+
+  /**
+   * Detect package manager from lock files and install dependencies.
+   * No-op if no lock file is found.
+   */
+  private installDependencies(worktreePath: string): void {
+    const { existsSync } = require("node:fs") as typeof import("node:fs");
+
+    const strategies: Array<{ lockFile: string; cmd: string; args: string[] }> = [
+      { lockFile: "bun.lockb", cmd: "bun", args: ["install", "--frozen-lockfile"] },
+      { lockFile: "bun.lock", cmd: "bun", args: ["install", "--frozen-lockfile"] },
+      { lockFile: "package-lock.json", cmd: "npm", args: ["ci"] },
+      { lockFile: "yarn.lock", cmd: "yarn", args: ["install", "--frozen-lockfile"] },
+      { lockFile: "pnpm-lock.yaml", cmd: "pnpm", args: ["install", "--frozen-lockfile"] },
+    ];
+
+    for (const strategy of strategies) {
+      if (existsSync(join(worktreePath, strategy.lockFile))) {
+        const result = spawnSync(strategy.cmd, strategy.args, {
+          cwd: worktreePath,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 120_000,
+        });
+        if (result.status !== 0) {
+          console.warn(`[worktree] ${strategy.cmd} install failed in ${worktreePath}: ${result.stderr?.trim()}`);
+        }
+        return;
+      }
+    }
   }
 
   private isGitRepo(): boolean {

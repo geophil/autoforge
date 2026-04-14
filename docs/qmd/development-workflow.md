@@ -4,7 +4,7 @@
 
 - **Bun** ≥ 1.0 (runtime, package manager, test runner)
 - **TypeScript** (installed via devDependencies, no global install needed)
-- **Docker + Docker Compose** (optional, for NATS)
+- **Docker + Docker Compose** (optional, for NATS + QMD knowledge base)
 - **Claude CLI** (`claude`) on PATH — required for `EXECUTOR_DEFAULT=claude-code` (default)
 - **`gh` CLI** + `GITHUB_TOKEN` — required for real GitHub PR creation (optional for local dev)
 
@@ -27,9 +27,12 @@ No `.env` file is required for local development — all env vars have sensible 
 bun run dev
 # → Autoforge listening on http://127.0.0.1:3000
 # → NATS: not connected (SQLite-only mode)  ← unless NATS is running
+# → QMD: not available (planner falls back to filesystem exploration)
 
-# Start with NATS via Docker Compose
+# Start with NATS + QMD knowledge base via Docker Compose (recommended)
 docker-compose up
+# → QMD embeds docs/qmd/ on first boot, re-indexes every 3 hours
+# → QMD_MCP_URL=http://qmd:8181/mcp passed to planner automatically
 ```
 
 The dashboard is available at `http://localhost:3000`. Submit tasks via:
@@ -88,6 +91,61 @@ const AGENT_SKILLS: Record<AgentType, string[]> = {
   coder: ["tdd.md", "systematic-debugging.md", "verification-before-completion.md", "your-new-skill.md"],
   // ...
 };
+```
+
+### Editing a Persona
+
+Persona seed files live in `src/personas/<type>.md`. Edit the file and restart — the change takes effect immediately for all new tasks (no DB row exists yet, so the file is used).
+
+Once the meta-loop has activated an improved version via the DB, the file on disk becomes the fallback only. To reset to the file version, deactivate the DB row:
+
+```bash
+sqlite3 data/autoforge.sqlite \
+  "UPDATE skill_versions SET is_active = 0 WHERE skill_name = 'persona:coder' AND is_active = 1;"
+```
+
+### Triggering a Meta Improvement Session
+
+```bash
+# Analyze all agents and propose the highest-impact improvement
+curl -X POST http://localhost:3000/api/meta \
+  -H "Content-Type: application/json" \
+  -d '{"projectId":"autoforge"}'
+
+# Focus on a specific persona or skill
+curl -X POST http://localhost:3000/api/meta \
+  -H "Content-Type: application/json" \
+  -d '{"projectId":"autoforge","focus":"persona:coder"}'
+```
+
+The meta agent returns an `experimentId`. Run a few real tasks, then conclude the experiment:
+
+```bash
+# Keep the improvement (first_pass_rate improved from 0.6 to 0.8)
+curl -X POST http://localhost:3000/api/meta/<EXPERIMENT_ID>/conclude \
+  -H "Content-Type: application/json" \
+  -d '{"metricAfter":0.8,"keep":true}'
+
+# Revert — performance did not improve
+curl -X POST http://localhost:3000/api/meta/<EXPERIMENT_ID>/conclude \
+  -H "Content-Type: application/json" \
+  -d '{"metricAfter":0.55,"keep":false}'
+```
+
+### Querying Outcome Data
+
+```bash
+# Performance by persona version
+sqlite3 data/autoforge.sqlite \
+  "SELECT persona_name, agent_type, task_count, first_pass_rate, avg_step_cost FROM agent_performance ORDER BY first_pass_rate ASC;"
+
+# Per-task outcome summary
+sqlite3 data/autoforge.sqlite \
+  "SELECT task_id, tier, iterations, total_cost, first_pass_success FROM task_outcomes ORDER BY created_at DESC LIMIT 10;"
+
+# Experiment history
+sqlite3 data/autoforge.sqlite \
+  "SELECT skill_modified, metric_before, metric_after, status FROM experiments ORDER BY created_at DESC;"
 ```
 
 ### Inspecting the Event Log

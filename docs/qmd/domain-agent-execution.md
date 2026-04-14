@@ -67,9 +67,12 @@ export function createExecutor(env: AppEnv): AgentExecutor {
 
 **Enforced in**: `src/executors/factory.ts:7`
 
-### Skills Are Injected Per Agent Type
+### Each Agent Is Composed from a Persona and Skills
 
-Each `AgentType` has a fixed list of skill filenames. The `SkillRegistry` resolves them to absolute paths, and both executors prepend their content to the prompt.
+Every agent receives two distinct prompt inputs resolved by the orchestrator before dispatch:
+
+- **Persona** (`PersonaRegistry.resolve(agentType)`) — defines who the agent is and how it approaches work. Loaded from `src/personas/<type>.md` by default; can be overridden by a DB row in `skill_versions` where `skill_name = 'persona:<type>'` and `is_active = 1`. The DB-first resolution is how the meta-loop activates improved versions without touching files.
+- **Skills** (`SkillRegistry.skillsForAgent(agentType)`) — technique reference files injected alongside the persona.
 
 ```typescript
 // src/skills/registry.ts
@@ -84,22 +87,35 @@ const AGENT_SKILLS: Record<AgentType, string[]> = {
 };
 ```
 
-**Enforced in**: `src/skills/registry.ts:9`
-
-### Agents Have No Access to Secrets
-
-Agents run in isolated worktrees with no credentials. The `ClaudeCodeExecutor` passes `process.env` merged with per-task `environment` (which is always `{}` in current usage). `GITHUB_TOKEN` and `ANTHROPIC_API_KEY` live only in the orchestrator process.
+Both inputs are passed to `executor.execute()` as `systemPrompt` (persona) and `skillFiles` (skills). `AgentTask` now carries both fields:
 
 ```typescript
-// src/executors/claude-code.ts — Claude is spawned with:
-{
-  cwd,
-  env: { ...process.env, ...env }, // task.environment is always {} today
-  stdio: ["pipe", "pipe", "pipe"]
+// src/executors/interface.ts
+export interface AgentTask {
+  id: string;
+  type: AgentType;
+  systemPrompt: string;   // persona content resolved by PersonaRegistry
+  prompt: string;         // task-specific user message
+  skillFiles: string[];   // paths resolved by SkillRegistry
+  // ...
 }
 ```
 
-**Enforced in**: `src/executors/claude-code.ts:155`
+**Enforced in**: `src/personas/registry.ts`, `src/skills/registry.ts`, `src/orchestrator/service.ts`
+
+### Agents Have No Access to Secrets
+
+Agents run in isolated worktrees with no credentials. `GITHUB_TOKEN` and `ANTHROPIC_API_KEY` live only in the orchestrator process. The per-task `environment` is empty (`{}`) for all agents except the planner, which receives `QMD_MCP_URL` when configured so it can query the knowledge base via MCP.
+
+```typescript
+// src/orchestrator/service.ts — planner dispatch
+environment: this.deps.env.QMD_MCP_URL ? { QMD_MCP_URL: this.deps.env.QMD_MCP_URL } : {},
+
+// all other agents
+environment: {},
+```
+
+**Enforced in**: `src/orchestrator/service.ts`
 
 ## Core Flows
 
@@ -107,11 +123,12 @@ Agents run in isolated worktrees with no credentials. The `ClaudeCodeExecutor` p
 
 The Claude Code CLI is the default runtime. It runs in non-interactive mode.
 
-1. **Prompt assembly**: Skills content + task prompt + status-reporting instructions are concatenated.
-2. **Spawn**: `claude --print --dangerously-skip-permissions --output-format text --input-format text` is spawned; the full prompt is piped to stdin.
-3. **Budget timer**: SIGTERM sent at deadline, SIGKILL after 10s grace.
-4. **Status read**: `.autoforge-status.json` is read from the worktree; if absent → `DONE_WITH_CONCERNS`.
-5. **Return**: `AgentResult` with status, artifacts, and elapsed time.
+1. **Prompt assembly**: Persona (`systemPrompt`) + skills content + task prompt + status-reporting instructions are concatenated into a single stdin string.
+2. **MCP config** (optional): If `QMD_MCP_URL` is set in `task.environment`, a temporary `--mcp-config` JSON is written pointing at the QMD server so the agent can call `query`/`get`/`multi_get` tools.
+3. **Spawn**: `claude --print --dangerously-skip-permissions --output-format text --input-format text [--mcp-config <path>]` is spawned; the full prompt is piped to stdin.
+4. **Budget timer**: SIGTERM sent at deadline, SIGKILL after 10s grace.
+5. **Status read**: `.autoforge-status.json` is read from the worktree; if absent → `DONE_WITH_CONCERNS`.
+6. **Return**: `AgentResult` with status, artifacts, elapsed time, and the full status file as `output`.
 
 ```typescript
 // claude invocation (src/executors/claude-code.ts)
@@ -119,7 +136,8 @@ spawn(command, [
   "--print",
   "--dangerously-skip-permissions",
   "--output-format", "text",
-  "--input-format", "text"
+  "--input-format", "text",
+  ...(mcpConfigPath ? ["--mcp-config", mcpConfigPath] : [])
 ], { cwd, env, stdio: ["pipe", "pipe", "pipe"] })
 ```
 
@@ -127,11 +145,14 @@ spawn(command, [
 
 Used when `EXECUTOR_DEFAULT=anthropic-sdk`. Runs a tool-use agentic loop against the Anthropic Messages API.
 
-1. **System prompt**: Skills + role description + status-reporting instructions.
-2. **Tool loop** (max 50 iterations): Calls `client.messages.create()` with `TOOLS` (read_file, write_file, list_directory, bash). Executes tool calls locally, appends results.
-3. **Deadline check**: If `Date.now() >= deadlineMs` at loop start → TIMEOUT.
-4. **Status read**: Same `.autoforge-status.json` convention as ClaudeCodeExecutor.
-5. **Token tracking**: `totalInputTokens` and `totalOutputTokens` accumulated across all loop iterations.
+1. **System prompt**: Persona (`task.systemPrompt`) + skills + status-reporting instructions, sent as the API `system` field.
+2. **User message**: `task.prompt` — the task-specific content.
+3. **Tool loop** (max 50 iterations): Calls `client.messages.create()` with `TOOLS` (read_file, write_file, list_directory, bash). Executes tool calls locally, appends results.
+4. **Deadline check**: If `Date.now() >= deadlineMs` at loop start → TIMEOUT.
+5. **Status read**: Same `.autoforge-status.json` convention as ClaudeCodeExecutor.
+6. **Token tracking**: `totalInputTokens` and `totalOutputTokens` accumulated across all loop iterations and returned in `AgentResult.metrics`.
+
+Note: `AnthropicSdkExecutor` does not currently support MCP — it has no HTTP MCP client. Agents needing QMD access (currently only the planner) must use `ClaudeCodeExecutor`.
 
 Available tools for `AnthropicSdkExecutor`:
 - `read_file` — read a file relative to working directory
@@ -146,6 +167,7 @@ Available tools for `AnthropicSdkExecutor`:
 export interface AgentTask {
   id: string;
   type: AgentType;
+  systemPrompt: string;              // persona resolved by PersonaRegistry
   prompt: string;
   workingDirectory: string;
   budgetSeconds: number;
@@ -177,9 +199,10 @@ export interface AgentExecutor {
 
 ## Integration Points
 
-- **Task Orchestration**: `OrchestratorService` calls `executor.execute()` for planner, coder, reviewer, and doc agents. The executor instance is injected as a dependency.
-- **Configuration**: Executor type selected via `EXECUTOR_DEFAULT`; `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` configure the SDK executor; `CLAUDE_COMMAND` overrides the Claude binary path.
+- **Task Orchestration**: `OrchestratorService` calls `executor.execute()` for planner, coder, reviewer, doc, and meta agents. The executor instance is injected as a dependency.
+- **Persona Registry**: `PersonaRegistry.resolve(agentType)` provides `systemPrompt`. DB-first resolution allows the meta-loop to activate improved personas without file changes.
 - **Skills Registry**: `SkillRegistry.skillsForAgent(agentType)` resolves skill file paths; passed as `AgentTask.skillFiles`.
+- **Configuration**: Executor type selected via `EXECUTOR_DEFAULT`; `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` configure the SDK executor; `CLAUDE_COMMAND` overrides the Claude binary path; `QMD_MCP_URL` enables knowledge base access for the planner.
 
 ## File Map
 
@@ -187,8 +210,10 @@ export interface AgentExecutor {
 |------|---------|
 | `src/executors/interface.ts` | `AgentExecutor`, `AgentTask`, `AgentResult` interfaces |
 | `src/executors/factory.ts` | `createExecutor(env)` — selects implementation from env |
-| `src/executors/claude-code.ts` | `ClaudeCodeExecutor` — spawns Claude CLI subprocess |
+| `src/executors/claude-code.ts` | `ClaudeCodeExecutor` — spawns Claude CLI subprocess; supports MCP |
 | `src/executors/anthropic-sdk.ts` | `AnthropicSdkExecutor` — Anthropic Messages API tool-use loop |
 | `src/executors/mock.ts` | `MockExecutor` — deterministic responses for tests |
-| `src/skills/registry.ts` | `SkillRegistry` — maps agent types to skill file paths |
+| `src/personas/registry.ts` | `PersonaRegistry` — resolves persona per agent type (DB-first, then file) |
+| `src/personas/*.md` | Persona seed files (planner, coder, reviewer, doc, meta) |
+| `src/skills/registry.ts` | `SkillRegistry` — maps agent types to skill file paths; snapshots to `skill_versions` |
 | `skills/*.md` | Skill content files (tdd, systematic-debugging, two-stage-review, etc.) |

@@ -91,6 +91,12 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Default**: `"claude-sonnet-4-6"`
 - **Affects**: `domain-agent-execution.md` / `AnthropicSdkExecutor` — model ID used for API calls.
 
+### `QMD_MCP_URL`
+
+- **Type**: string (optional)
+- **Default**: unset
+- **Affects**: `domain-agent-execution.md` — when set, the planner agent receives this URL as an environment variable and `ClaudeCodeExecutor` writes a temporary `--mcp-config` file so the planner can call QMD MCP tools (`query`, `get`, `multi_get`, `status`) to retrieve architecture context before planning. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
+
 ## Configuration File
 
 All variables are parsed by `loadEnv()` in `src/config/env.ts`:
@@ -111,13 +117,14 @@ const EnvSchema = z.object({
   CLAUDE_COMMAND:           z.string().default("claude"),
   SKILLS_DIR:               z.string().default("./skills"),
   ANTHROPIC_API_KEY:        z.string().optional(),
-  ANTHROPIC_MODEL:          z.string().default("claude-sonnet-4-6")
+  ANTHROPIC_MODEL:          z.string().default("claude-sonnet-4-6"),
+  QMD_MCP_URL:              z.string().optional()
 });
 ```
 
 ## Docker Compose Defaults
 
-The `docker-compose.yml` sets the following overrides for the `autoforge` service:
+The `docker-compose.yml` sets the following overrides for the `autoforge` service. Three services run: `nats` (JetStream), `qmd` (knowledge base MCP server on port 8181), and `autoforge`.
 
 ```yaml
 environment:
@@ -126,4 +133,7 @@ environment:
   - HOST=0.0.0.0
   - PORT=3000
   - EXECUTOR_DEFAULT=claude-code
+  - QMD_MCP_URL=http://qmd:8181/mcp
 ```
+
+`autoforge` waits for `qmd` to pass its health check before starting, ensuring the knowledge base is indexed before the first task is planned.

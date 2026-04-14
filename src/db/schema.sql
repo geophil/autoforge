@@ -118,3 +118,44 @@ CREATE TABLE IF NOT EXISTS routing_calibration (
   signals          TEXT,
   created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Outcome summary per completed/failed task.
+-- Aggregates token cost, timing, findings, and first-pass success from events + findings.
+CREATE VIEW IF NOT EXISTS task_outcomes AS
+SELECT
+  t.id                  AS task_id,
+  t.project_id,
+  t.tier,
+  t.state               AS final_state,
+  t.iteration           AS iterations,
+  SUM(e.token_input)    AS total_tokens_in,
+  SUM(e.token_output)   AS total_tokens_out,
+  SUM(e.estimated_cost) AS total_cost,
+  SUM(e.elapsed_seconds) AS total_elapsed,
+  (SELECT COUNT(*) FROM review_findings rf WHERE rf.task_id = t.id) AS finding_count,
+  (SELECT COUNT(*) FROM review_findings rf WHERE rf.task_id = t.id AND rf.severity IN ('CRITICAL','MAJOR')) AS blocking_finding_count,
+  CASE WHEN t.iteration = 0 AND t.state = 'completed' THEN 1 ELSE 0 END AS first_pass_success,
+  t.created_at
+FROM tasks t
+LEFT JOIN events e ON e.task_id = t.id AND e.agent != 'orchestrator'
+WHERE t.state IN ('completed', 'failed')
+GROUP BY t.id;
+
+-- Performance by persona version and agent type.
+-- Answers: which persona version produces the best outcomes for a given agent?
+CREATE VIEW IF NOT EXISTS agent_performance AS
+SELECT
+  json_extract(e.payload, '$.persona_version_id') AS persona_version_id,
+  sv.skill_name                                    AS persona_name,
+  e.agent                                          AS agent_type,
+  COUNT(DISTINCT t.id)                             AS task_count,
+  AVG(CASE WHEN t.iteration = 0 AND t.state = 'completed' THEN 1.0 ELSE 0.0 END) AS first_pass_rate,
+  AVG(t.iteration)                                 AS avg_iterations,
+  AVG(e.estimated_cost)                            AS avg_step_cost
+FROM events e
+JOIN tasks t ON t.id = e.task_id
+LEFT JOIN skill_versions sv ON sv.id = json_extract(e.payload, '$.persona_version_id')
+WHERE e.agent IN ('planner', 'coder', 'reviewer', 'doc')
+  AND t.state IN ('completed', 'failed')
+  AND json_extract(e.payload, '$.persona_version_id') IS NOT NULL
+GROUP BY json_extract(e.payload, '$.persona_version_id'), e.agent;
