@@ -196,11 +196,30 @@ function renderTaskDetail(task) {
 
     <div class="detail-section" id="findings-section">
       <h3>Pipeline Event Log</h3>
+      <div id="cost-summary" class="cost-summary"></div>
       <div id="findings-list"><span style="color: var(--text-dim); font-size: 0.85rem;">Loading...</span></div>
     </div>
   `;
 
   loadEvents(task.id);
+}
+
+// Per-token pricing (Claude Sonnet-class): $3/1M input, $15/1M output
+const INPUT_COST_PER_TOKEN = 3 / 1_000_000;
+const OUTPUT_COST_PER_TOKEN = 15 / 1_000_000;
+
+function summarizeTokenUsage(events) {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for (const ev of events) {
+    if (ev.tokenUsage) {
+      inputTokens += ev.tokenUsage.input;
+      outputTokens += ev.tokenUsage.output;
+    }
+  }
+  const estimatedCostUsd =
+    inputTokens * INPUT_COST_PER_TOKEN + outputTokens * OUTPUT_COST_PER_TOKEN;
+  return { inputTokens, outputTokens, estimatedCostUsd };
 }
 
 const AGENT_COLORS = {
@@ -237,6 +256,7 @@ function statusColor(status) {
 
 async function loadEvents(taskId) {
   const container = document.getElementById("findings-list");
+  const costSummary = document.getElementById("cost-summary");
   try {
     const res = await fetch(`${API}/api/tasks/${taskId}/events`);
     const events = await res.json();
@@ -269,6 +289,14 @@ async function loadEvents(taskId) {
           </div>`;
       })
       .join("");
+
+    const { inputTokens, outputTokens, estimatedCostUsd } = summarizeTokenUsage(events);
+    if (costSummary && (inputTokens > 0 || outputTokens > 0)) {
+      costSummary.innerHTML = `
+        <span class="cost-stat"><span class="cost-label">Input</span> ${inputTokens.toLocaleString()} tok</span>
+        <span class="cost-stat"><span class="cost-label">Output</span> ${outputTokens.toLocaleString()} tok</span>
+        <span class="cost-stat"><span class="cost-label">Est. cost</span> $${estimatedCostUsd.toFixed(4)}</span>`;
+    }
   } catch {
     container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Could not load events.</span>`;
   }
