@@ -91,11 +91,15 @@ export class ClaudeCodeExecutor implements AgentExecutor {
  * Writes a temporary MCP config JSON file pointing at the QMD HTTP MCP server.
  * Returns the path so the caller can pass it to claude via --mcp-config and
  * clean it up afterwards.
+ *
+ * NOTE: claude CLI's MCP config schema requires a `type` discriminator
+ * (one of "stdio" | "http" | "sse"). Omitting it causes claude to exit
+ * with "Does not adhere to MCP server configuration schema".
  */
 function writeMcpConfig(qmdMcpUrl: string): string {
   const config = {
     mcpServers: {
-      qmd: { url: qmdMcpUrl }
+      qmd: { type: "http", url: qmdMcpUrl }
     }
   };
   const path = join(tmpdir(), `autoforge-mcp-${randomUUID()}.json`);

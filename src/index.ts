@@ -2,7 +2,7 @@ import { serve } from "@hono/node-server";
 import { resolve } from "node:path";
 import { loadEnv } from "./config/env";
 import { DbClient } from "./db/client";
-import { createExecutor } from "./executors/factory";
+import { createExecutors } from "./executors/factory";
 import { WorktreeManager } from "./git/worktrees";
 import { NatsClient } from "./nats/client";
 import { RecoveryService } from "./orchestrator/recovery";
@@ -20,15 +20,20 @@ await nats.connect(); // logs a warning and continues if unavailable
 const recovery = new RecoveryService(db, nats);
 await recovery.recover();
 
-const executor = createExecutor(env);
+const executors = createExecutors(env);
 const worktrees = new WorktreeManager(resolve(process.cwd(), ".runtime-worktrees"));
 const service = new OrchestratorService({
   env,
   db,
-  executor,
+  executor: executors.primary,
+  executors,
   worktrees,
   nats
 });
+
+// Mark any tasks that were stuck in non-terminal states (e.g. from a crashed
+// previous run or a timed-out executor) as failed with a failure_analysis event.
+service.sweepStaleTasks();
 
 const app = createWebServer(service, db);
 

@@ -7,18 +7,20 @@ import { type AutoforgeMessage } from "../nats/messages";
 import type { AgentExecutor } from "../executors/interface";
 import type { DbClient } from "../db/client";
 import type { NatsClient } from "../nats/client";
-import type { PipelineTask, PlanSubtask, ReviewFinding, SubtaskReportStatus, TaskStage } from "../types/core";
+import type { AgentType, PipelineTask, PlanSubtask, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
 import { assertTransition } from "./state-machine";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
 import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
+import type { ExecutorSet } from "../executors/factory";
 
 interface ServiceDeps {
   env: AppEnv;
   db: DbClient;
   executor: AgentExecutor;
+  executors?: ExecutorSet;
   worktrees: WorktreeManager;
   nats?: NatsClient;
   testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
@@ -69,30 +71,33 @@ export class OrchestratorService {
     this.transition(taskId, projectId, "received", "assessing", { assessment, tier });
     this.transition(taskId, projectId, "assessing", "planning", {});
 
-    const plannerResult = await this.deps.executor.execute({
+    const plannerExecutor = this.routeExecutor(tier, "planner");
+    const plannerResult = await plannerExecutor.execute({
       id: taskId,
       type: "planner",
       systemPrompt: this.personas.resolve("planner"),
       prompt: `## Task\n${description}\n\n## Complexity signals\nTier: ${tier} | Scope: ${assessment.scope} | Risk: ${assessment.risk} | Coupling: ${assessment.coupling}`,
       workingDirectory: worktree.path,
       budgetSeconds: this.budgetForTier(tier, "planner"),
-      environment: this.deps.env.QMD_MCP_URL ? { QMD_MCP_URL: this.deps.env.QMD_MCP_URL } : {},
+      environment: this.agentEnvironment(),
       skillFiles: this.skills.skillsForAgent("planner"),
       metadata: { description, tier }
     });
 
     const plannerPersonaId = this.personas.snapshotId("planner");
     const plannerSkillIds = this.skills.snapshotIds("planner");
-    const planSubtasks = parsePlanSubtasks(taskId, plannerResult.output);
+    const planSubtasks = parsePlanSubtasks(taskId, plannerResult.output, worktree.path);
+    const plannerFallback = planSubtasks.length === 1 && planSubtasks[0].description === "Implement requested behavior with tests-first workflow.";
     this.recordEvent({
       taskId,
       projectId,
       agent: "planner",
       type: "planned",
-      status: "done",
+      status: plannerFallback ? "done_with_concerns" : "done",
       payload: {
         state: "executing",
-        planSubtasks
+        planSubtasks,
+        planner_fallback: plannerFallback
       },
       budgetSeconds: this.budgetForTier(tier, "planner"),
       elapsedSeconds: plannerResult.metrics.elapsedSeconds,
@@ -101,7 +106,7 @@ export class OrchestratorService {
         output: plannerResult.metrics.tokenOutput ?? 0,
         estimatedCost: plannerResult.metrics.estimatedCost
       } : undefined,
-      executorUsed: this.deps.executor.name,
+      executorUsed: plannerExecutor.name,
       personaVersionId: plannerPersonaId,
       skillVersionIds: plannerSkillIds
     });
@@ -135,14 +140,15 @@ export class OrchestratorService {
       const docPersonaId = this.personas.snapshotId("doc");
       const docSkillIds = this.skills.snapshotIds("doc");
 
-      const docResult = await this.deps.executor.execute({
+      const docExecutor = this.routeExecutor(task.tier, "doc");
+      const docResult = await docExecutor.execute({
         id: `${taskId}-doc`,
         type: "doc",
         systemPrompt: this.personas.resolve("doc"),
         prompt: buildDocPrompt(task.description, task.planSubtasks),
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
-        environment: {},
+        environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("doc"),
         metadata: { taskId, description: task.description }
       });
@@ -161,7 +167,7 @@ export class OrchestratorService {
           output: docResult.metrics.tokenOutput ?? 0,
           estimatedCost: docResult.metrics.estimatedCost
         } : undefined,
-        executorUsed: this.deps.executor.name,
+        executorUsed: docExecutor.name,
         personaVersionId: docPersonaId,
         skillVersionIds: docSkillIds
       });
@@ -205,6 +211,101 @@ export class OrchestratorService {
   }
 
   /**
+   * Cancel any non-terminal task, emit a failure_analysis event, and clean up.
+   */
+  async cancelTask(taskId: string, reason = "Cancelled by operator."): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    const terminalStates: TaskStage[] = ["completed", "failed"];
+    if (terminalStates.includes(task.state)) {
+      throw new Error(`Task ${taskId} is already in terminal state: ${task.state}`);
+    }
+
+    if (task.prUrl) {
+      await closePullRequest(task.prUrl).catch(() => { /* best-effort */ });
+    }
+
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "failure_analysis",
+      status: "failed",
+      payload: {
+        stage_failed: task.state,
+        failure_reason: reason,
+        failure_category: "cancelled",
+        planner_fallback: task.planSubtasks.length === 1 &&
+          task.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
+        budget_seconds: this.budgetForTier(task.tier, "coder"),
+        iteration: task.iteration
+      },
+      budgetSeconds: 60
+    });
+
+    this.transition(taskId, task.projectId, task.state, "failed", { reason: `cancelled: ${reason}`, iteration: task.iteration });
+    this.cleanupWorktree(taskId);
+    return this.requireTask(taskId);
+  }
+
+  /**
+   * On startup, find tasks stuck in non-terminal states beyond their staleness
+   * threshold and auto-fail them with a failure_analysis event.
+   */
+  sweepStaleTasks(): void {
+    const nonTerminalStates = ["received", "assessing", "planning", "executing", "reviewing", "reworking", "pr_created", "documenting"];
+    const thresholdsByTier: Record<string, number> = {
+      EXPRESS: 20 * 60 * 1000,
+      STANDARD: 40 * 60 * 1000,
+      THOROUGH: 60 * 60 * 1000
+    };
+
+    const tasks = this.deps.db.listTasks().filter((t) => nonTerminalStates.includes(t.state));
+    const now = Date.now();
+
+    for (const task of tasks) {
+      const threshold = thresholdsByTier[task.tier] ?? 40 * 60 * 1000;
+      const updatedAt = new Date(task.updatedAt).getTime();
+      if (now - updatedAt > threshold) {
+        console.warn(`[sweeper] Task ${task.id} stuck in '${task.state}' for >${Math.round((now - updatedAt) / 60000)}min — marking as failed`);
+
+        this.recordEvent({
+          taskId: task.id,
+          projectId: task.projectId,
+          agent: "orchestrator",
+          type: "failure_analysis",
+          status: "failed",
+          payload: {
+            stage_failed: task.state,
+            failure_reason: `Task stuck in '${task.state}' for more than ${Math.round((now - updatedAt) / 60000)} minutes`,
+            failure_category: "stalled",
+            planner_fallback: task.planSubtasks.length === 1 &&
+              task.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
+            budget_seconds: this.budgetForTier(task.tier, "coder"),
+            elapsed_ms: now - updatedAt,
+            iteration: task.iteration
+          },
+          budgetSeconds: 60
+        });
+
+        // Force through valid state transitions to reach failed.
+        try {
+          this.transition(task.id, task.projectId, task.state, "failed", {
+            reason: `stalled: task stuck in '${task.state}' beyond staleness threshold`,
+            iteration: task.iteration
+          });
+        } catch {
+          // State machine may reject some transitions — update projection directly.
+          this.deps.db.sqlite.query(
+            "UPDATE tasks SET state = 'failed', updated_at = ? WHERE id = ?"
+          ).run(new Date().toISOString(), task.id);
+        }
+
+        this.cleanupWorktree(task.id);
+      }
+    }
+  }
+
+  /**
    * Run a meta agent session to analyze performance and propose an improvement
    * to a persona or skill. Returns an experiment id that can be used to track
    * and conclude the experiment after observing canary task outcomes.
@@ -236,8 +337,9 @@ export class OrchestratorService {
 
     const metaPersonaId = this.personas.snapshotId("meta");
     const metaSkillIds = this.skills.snapshotIds("meta");
+    const metaExecutor = this.routeExecutor("STANDARD", "meta");
 
-    const metaResult = await this.deps.executor.execute({
+    const metaResult = await metaExecutor.execute({
       id: metaTaskId,
       type: "meta",
       systemPrompt: this.personas.resolve("meta"),
@@ -263,7 +365,7 @@ export class OrchestratorService {
         output: metaResult.metrics.tokenOutput ?? 0,
         estimatedCost: metaResult.metrics.estimatedCost
       } : undefined,
-      executorUsed: this.deps.executor.name,
+      executorUsed: metaExecutor.name,
       personaVersionId: metaPersonaId,
       skillVersionIds: metaSkillIds
     });
@@ -361,20 +463,44 @@ export class OrchestratorService {
         const subtaskAgentType = subtask.agentType ?? "coder";
         const subtaskPersonaId = this.personas.snapshotId(subtaskAgentType);
         const subtaskSkillIds = this.skills.snapshotIds(subtaskAgentType);
+        const coderExecutor = this.routeExecutor(tier, subtaskAgentType);
 
-        const coderResult = await this.deps.executor.execute({
+        const coderResult = await coderExecutor.execute({
           id: subtask.id,
           type: subtaskAgentType,
           systemPrompt: this.personas.resolve(subtaskAgentType),
           prompt: buildCoderPrompt(description, subtask, iteration),
           workingDirectory: worktreePath,
           budgetSeconds: this.budgetForTier(tier, "coder"),
-          environment: {},
+          environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
           metadata: { taskId, subtask, description }
         });
 
         if (!isSuccess(coderResult.status)) {
+          const failureCategory = coderResult.status === "TIMEOUT" ? "executor_timeout" : "coder_failed";
+          this.recordEvent({
+            taskId,
+            projectId,
+            agent: "orchestrator",
+            type: "failure_analysis",
+            status: "failed",
+            payload: {
+              stage_failed: "executing",
+              failure_reason: coderResult.blockReason ?? `coder returned ${coderResult.status}`,
+              failure_category: failureCategory,
+              executor_used: coderExecutor.name,
+              persona_version_id: subtaskPersonaId,
+              skill_version_ids: subtaskSkillIds,
+              tool_stats: coderResult.metrics.toolStats ?? null,
+              planner_fallback: planSubtasks.length === 1 &&
+                planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
+              budget_seconds: this.budgetForTier(tier, "coder"),
+              elapsed_seconds: coderResult.metrics.elapsedSeconds,
+              iteration
+            },
+            budgetSeconds: 60
+          });
           this.transition(taskId, projectId, "executing", "failed", {
             reason: coderResult.blockReason ?? "coder failed",
             iteration
@@ -396,7 +522,7 @@ export class OrchestratorService {
             output: coderResult.metrics.tokenOutput ?? 0,
             estimatedCost: coderResult.metrics.estimatedCost
           } : undefined,
-          executorUsed: this.deps.executor.name,
+          executorUsed: coderExecutor.name,
           personaVersionId: subtaskPersonaId,
           skillVersionIds: subtaskSkillIds
         });
@@ -414,15 +540,16 @@ export class OrchestratorService {
 
       const reviewerPersonaId = this.personas.snapshotId("reviewer");
       const reviewerSkillIds = this.skills.snapshotIds("reviewer");
+      const reviewerExecutor = this.routeExecutor(tier, "reviewer");
 
-      const reviewResult = await this.deps.executor.execute({
+      const reviewResult = await reviewerExecutor.execute({
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
         systemPrompt: this.personas.resolve("reviewer"),
         prompt: buildReviewerPrompt(description, planSubtasks),
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
-        environment: {},
+        environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description }
       });
@@ -443,7 +570,7 @@ export class OrchestratorService {
           output: reviewResult.metrics.tokenOutput ?? 0,
           estimatedCost: reviewResult.metrics.estimatedCost
         } : undefined,
-        executorUsed: this.deps.executor.name,
+        executorUsed: reviewerExecutor.name,
         personaVersionId: reviewerPersonaId,
         skillVersionIds: reviewerSkillIds
       });
@@ -467,6 +594,23 @@ export class OrchestratorService {
 
       iteration += 1;
       if (iteration > 3) {
+        this.recordEvent({
+          taskId,
+          projectId,
+          agent: "orchestrator",
+          type: "failure_analysis",
+          status: "failed",
+          payload: {
+            stage_failed: "reviewing",
+            failure_reason: "Exceeded rework iteration limit (3 rounds of CRITICAL/MAJOR findings)",
+            failure_category: "rework_limit",
+            planner_fallback: planSubtasks.length === 1 &&
+              planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
+            budget_seconds: this.budgetForTier(tier, "coder"),
+            iteration
+          },
+          budgetSeconds: 60
+        });
         this.transition(taskId, projectId, "reviewing", "failed", {
           reason: "Exceeded rework iteration limit",
           iteration
@@ -511,6 +655,23 @@ export class OrchestratorService {
     });
 
     if (!gate.accepted) {
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "failure_analysis",
+        status: "failed",
+        payload: {
+          stage_failed: "reviewing",
+          failure_reason: gate.reason ?? "PR gate rejected task",
+          failure_category: "pr_gate",
+          planner_fallback: planSubtasks.length === 1 &&
+            planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
+          budget_seconds: this.budgetForTier(tier, "coder"),
+          iteration
+        },
+        budgetSeconds: 60
+      });
       this.transition(taskId, projectId, "reviewing", "failed", { reason: gate.reason, iteration });
       throw new Error(gate.reason ?? "PR gate rejected task");
     }
@@ -595,6 +756,22 @@ export class OrchestratorService {
     });
   }
 
+  /**
+   * Build the environment passed to agent executors. Currently exposes
+   * QMD_MCP_URL when configured so agents can query the knowledge base
+   * (planner for scoping, coder/reviewer/doc/doc-review for grounding
+   * implementation and documentation against indexed architecture docs).
+   * Secrets like GITHUB_TOKEN are deliberately never forwarded — privileged
+   * operations run through dedicated helpers in src/privileged/.
+   */
+  private agentEnvironment(): Record<string, string> {
+    const env: Record<string, string> = {};
+    if (this.deps.env.QMD_MCP_URL) {
+      env.QMD_MCP_URL = this.deps.env.QMD_MCP_URL;
+    }
+    return env;
+  }
+
   private budgetForTier(tier: PipelineTask["tier"], step: "planner" | "coder" | "reviewer" | "doc"): number {
     const budgets = {
       EXPRESS: { planner: 180, coder: 300, reviewer: 0, doc: 120 },
@@ -602,6 +779,26 @@ export class OrchestratorService {
       THOROUGH: { planner: 900, coder: 720, reviewer: 480, doc: 300 }
     };
     return budgets[tier][step];
+  }
+
+  /**
+   * Route to the most appropriate executor for a given tier and agent type.
+   * SDK executor is used for EXPRESS tier simple tasks (cheaper, sufficient).
+   * Claude Code is used for STANDARD/THOROUGH and for agents that need full filesystem access.
+   * Falls back to the configured primary executor when routing is not available.
+   */
+  private routeExecutor(tier: Tier, agentType: AgentType): AgentExecutor {
+    const set = this.deps.executors;
+    if (!set) return this.deps.executor;
+
+    // Meta agent always gets Claude Code — needs broad exploration.
+    if (agentType === "meta") return set.claudeCode;
+
+    // SDK executor for EXPRESS tier (simple, focused tasks where token cost matters).
+    if (tier === "EXPRESS" && set.sdk) return set.sdk;
+
+    // Claude Code for everything else.
+    return set.claudeCode;
   }
 
   private cleanupWorktree(taskId: string): void {
@@ -643,7 +840,8 @@ function buildReviewerPrompt(description: string, subtasks: PlanSubtask[]): stri
   ].join("\n\n");
 }
 
-function parsePlanSubtasks(taskId: string, output: unknown): PlanSubtask[] {
+function parsePlanSubtasks(taskId: string, output: unknown, worktreePath?: string): PlanSubtask[] {
+  // Primary: planner writes subtasks directly into the status file output.
   if (
     output &&
     typeof output === "object" &&
@@ -658,10 +856,36 @@ function parsePlanSubtasks(taskId: string, output: unknown): PlanSubtask[] {
       description: subtask.description ?? `Subtask ${index + 1}`,
       filesInScope: subtask.filesInScope ?? ["src/"],
       dependencies: subtask.dependencies ?? [],
-      testCriteria: subtask.testCriteria ?? ["Tests pass."]
+      testCriteria: subtask.testCriteria ?? ["Tests pass."],
+      agentType: subtask.agentType
     }));
   }
 
+  // Fallback: look for a subtasks.json file the planner may have written separately.
+  if (worktreePath) {
+    try {
+      const subtasksPath = pathJoin(worktreePath, "subtasks.json");
+      if (existsSync(subtasksPath)) {
+        const parsed = JSON.parse(readFileSync(subtasksPath, "utf8"));
+        const list = Array.isArray(parsed) ? parsed : parsed?.subtasks;
+        if (Array.isArray(list) && list.length > 0) {
+          return (list as Array<Partial<PlanSubtask>>).map((subtask, index) => ({
+            id: subtask.id ?? `${taskId}-subtask-${index + 1}`,
+            sequence: subtask.sequence ?? index + 1,
+            description: subtask.description ?? `Subtask ${index + 1}`,
+            filesInScope: subtask.filesInScope ?? ["src/"],
+            dependencies: subtask.dependencies ?? [],
+            testCriteria: subtask.testCriteria ?? ["Tests pass."],
+            agentType: subtask.agentType
+          }));
+        }
+      }
+    } catch {
+      // subtasks.json unreadable or malformed — fall through to default
+    }
+  }
+
+  // Last resort: generic single subtask. Signals planner output was unparseable.
   return [
     {
       id: `${taskId}-subtask-1`,

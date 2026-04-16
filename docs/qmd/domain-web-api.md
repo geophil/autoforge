@@ -1,6 +1,6 @@
 # Web API and Dashboard
 
-The Web API domain exposes Autoforge's functionality over HTTP using the Hono framework. It provides REST endpoints for task submission, approval/rejection, and metrics, plus a Server-Sent Events (SSE) stream for real-time dashboard updates. The dashboard is a server-rendered HTML page with a live-updating task table.
+The Web API domain exposes Autoforge's functionality over HTTP using the Hono framework. It provides REST endpoints for task submission, approval/rejection, meta-loop control, and metrics, plus a Server-Sent Events (SSE) stream for real-time dashboard updates. The dashboard is a static HTML page (`src/web/public/index.html`) with client-side JavaScript (`src/web/public/dashboard.js`) served as static assets under `/static/`.
 
 ## Business Rules and Invariants
 
@@ -65,12 +65,17 @@ publish(event: { type: string; data: unknown }): void {
 
 | Method | Path | Handler | Description |
 |--------|------|---------|-------------|
-| `GET`  | `/` | `server.ts` | HTML dashboard |
+| `GET`  | `/` | `server.ts` | Static HTML dashboard (`src/web/public/index.html`) |
+| `GET`  | `/api/health` | `server.ts` | Health check — returns `{ status, uptime }` |
 | `POST` | `/api/tasks` | `tasks.ts` | Submit a new task |
 | `GET`  | `/api/tasks` | `tasks.ts` | List all tasks |
 | `GET`  | `/api/tasks/:id` | `tasks.ts` | Get single task |
+| `GET`  | `/api/tasks/:id/events` | `tasks.ts` | Task event log (ordered by timestamp) |
 | `POST` | `/api/tasks/:id/approve` | `approvals.ts` | Approve awaiting task |
 | `POST` | `/api/tasks/:id/reject` | `approvals.ts` | Reject awaiting task with reason |
+| `POST` | `/api/tasks/:id/cancel` | `approvals.ts` | Cancel a task (operator action) |
+| `POST` | `/api/meta` | `meta.ts` | Trigger meta-loop analysis; returns `experimentId` |
+| `POST` | `/api/meta/:experimentId/conclude` | `meta.ts` | Conclude experiment (keep or revert) |
 | `GET`  | `/api/metrics/:projectId` | `metrics.ts` | Project metrics (total/completed tasks, unresolved findings) |
 | `GET`  | `/api/metrics/:projectId/trends` | `metrics.ts` | Trend data (stub, returns empty points) |
 | `GET`  | `/api/events` | `server.ts` | SSE stream for live updates |
@@ -100,10 +105,10 @@ POST /api/tasks/:id/approve
 
 ### SSE Dashboard Flow
 
-The dashboard HTML at `GET /` polls `/api/tasks` on load, then subscribes to `/api/events` via `EventSource`. On receiving a `task.updated` event, it refreshes the task list.
+The static dashboard at `GET /` polls `/api/tasks` on load, then subscribes to `/api/events` via `EventSource`. On receiving a `task.updated` event, it refreshes the task list.
 
 ```javascript
-// embedded in dashboard HTML (src/web/server.ts)
+// src/web/public/dashboard.js
 const stream = new EventSource('/api/events');
 stream.addEventListener('task.updated', refresh);
 ```
@@ -124,6 +129,8 @@ stream.addEventListener('task.updated', refresh);
 ## Integration Points
 
 - **Task Orchestration**: All task routes delegate to `OrchestratorService` methods (`submitTask`, `approveTask`, `rejectTask`, `listTasks`, `getTask`).
+- **Meta-Loop**: Meta routes delegate to `OrchestratorService.submitMetaTask()` and `concludeExperiment()`.
+- **Event Log**: `GET /api/tasks/:id/events` delegates to `DbClient.listEvents(taskId)`.
 - **Event Sourcing**: `DbClient.metricsForProject()` queries the materialized `tasks` and `review_findings` tables.
 - **Live Events**: `LiveEventHub` is instantiated once in `createWebServer` and passed to both task and approval route factories.
 
@@ -131,8 +138,11 @@ stream.addEventListener('task.updated', refresh);
 
 | File | Purpose |
 |------|---------|
-| `src/web/server.ts` | `createWebServer` — Hono app, dashboard HTML, SSE endpoint |
-| `src/web/routes/tasks.ts` | `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/:id` |
-| `src/web/routes/approvals.ts` | `POST /api/tasks/:id/approve`, `POST /api/tasks/:id/reject` |
-| `src/web/routes/metrics.ts` | `GET /api/metrics/:projectId` |
+| `src/web/server.ts` | `createWebServer` — Hono app, static asset serving, SSE endpoint, health check |
+| `src/web/public/index.html` | Static dashboard HTML |
+| `src/web/public/dashboard.js` | Dashboard client JS — SSE subscription, task list rendering |
+| `src/web/routes/tasks.ts` | `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/:id`, `GET /api/tasks/:id/events` |
+| `src/web/routes/approvals.ts` | `POST /api/tasks/:id/approve`, `POST /api/tasks/:id/reject`, `POST /api/tasks/:id/cancel` |
+| `src/web/routes/meta.ts` | `POST /api/meta`, `POST /api/meta/:experimentId/conclude` |
+| `src/web/routes/metrics.ts` | `GET /api/metrics/:projectId`, `GET /api/metrics/:projectId/trends` |
 | `src/web/events.ts` | `LiveEventHub` — in-memory SSE fan-out |

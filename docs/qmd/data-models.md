@@ -57,29 +57,34 @@ CREATE TABLE IF NOT EXISTS tasks (
 // src/types/core.ts
 export interface PlanSubtask {
   id: string;
-  sequence: number;       // 1-based ordering
+  sequence: number;        // 1-based ordering
   description: string;
-  filesInScope: string[]; // paths the coder should touch
-  dependencies: string[]; // IDs of subtasks this depends on
-  testCriteria: string[]; // acceptance criteria strings
+  filesInScope: string[];  // paths the coder should touch
+  dependencies: string[];  // IDs of subtasks this depends on
+  testCriteria: string[];  // acceptance criteria strings
+  agentType?: AgentType;   // override the default agent for this subtask
 }
 ```
 
 ```sql
 CREATE TABLE IF NOT EXISTS subtasks (
-  id             TEXT PRIMARY KEY,
-  task_id        TEXT NOT NULL REFERENCES tasks(id),
-  sequence       INTEGER NOT NULL,
-  description    TEXT NOT NULL,
-  files_in_scope TEXT NOT NULL,  -- JSON string[]
-  dependencies   TEXT NOT NULL,  -- JSON string[]
-  state          TEXT NOT NULL DEFAULT 'pending',
-  status         TEXT,
-  agent_type     TEXT NOT NULL,
-  budget_seconds INTEGER NOT NULL,
-  elapsed_seconds REAL,
-  token_input    INTEGER,
-  token_output   INTEGER
+  id                TEXT PRIMARY KEY,
+  task_id           TEXT NOT NULL REFERENCES tasks(id),
+  sequence          INTEGER NOT NULL,
+  description       TEXT NOT NULL,
+  files_in_scope    TEXT NOT NULL,  -- JSON string[]
+  dependencies      TEXT NOT NULL,  -- JSON string[]
+  state             TEXT NOT NULL DEFAULT 'pending',
+  status            TEXT,
+  concerns          TEXT,
+  agent_type        TEXT NOT NULL,
+  started_at        TEXT,
+  completed_at      TEXT,
+  budget_seconds    INTEGER NOT NULL,
+  elapsed_seconds   REAL,
+  token_input       INTEGER,
+  token_output      INTEGER,
+  estimated_cost    REAL
 );
 ```
 
@@ -157,7 +162,7 @@ export type AutoforgeMessage<T = unknown> = {
   tokenUsage?: { input: number; output: number; estimatedCost: number };
 };
 
-export type AgentType = "planner" | "coder" | "reviewer" | "doc" | "pr" | "orchestrator" | "meta";
+export type AgentType = "planner" | "coder" | "reviewer" | "doc" | "doc-review" | "pr" | "orchestrator" | "meta";
 export type TaskStatus = "pending" | "in_progress" | "done" | "done_with_concerns" | "blocked" | "needs_context" | "failed" | "timeout";
 ```
 
@@ -205,6 +210,7 @@ CREATE TABLE IF NOT EXISTS experiments (
   metric_name          TEXT NOT NULL,
   metric_before        REAL NOT NULL,
   metric_after         REAL,
+  constraint_violations TEXT,
   status               TEXT NOT NULL DEFAULT 'proposed',
   human_notes          TEXT,
   created_at           TEXT NOT NULL DEFAULT (datetime('now')),
@@ -224,8 +230,8 @@ CREATE TABLE IF NOT EXISTS skill_versions (
   version       TEXT NOT NULL,
   content       TEXT NOT NULL,
   experiment_id TEXT REFERENCES experiments(id),
-  is_active     INTEGER NOT NULL DEFAULT 0,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  is_active     INTEGER NOT NULL DEFAULT 0
 );
 ```
 

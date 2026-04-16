@@ -12,6 +12,7 @@ const AGENT_SKILLS: Record<AgentType, string[]> = {
   coder: ["tdd.md", "systematic-debugging.md", "verification-before-completion.md"],
   reviewer: ["two-stage-review.md"],
   doc: ["documentation.md"],
+  "doc-review": ["documentation.md", "verification-before-completion.md"],
   pr: [],
   orchestrator: [],
   meta: ["writing-skills.md"]

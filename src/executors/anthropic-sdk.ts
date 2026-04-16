@@ -6,6 +6,8 @@ import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
 
 const STATUS_FILE = ".autoforge-status.json";
 const MAX_TOOL_ITERATIONS = 50;
+const PER_CALL_TIMEOUT_MS = 120_000;
+const CIRCUIT_BREAKER_READ_THRESHOLD = 12;
 
 // ---------------------------------------------------------------------------
 // Tool definitions
@@ -37,13 +39,37 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "list_directory",
-    description: "List files and directories at a given path relative to the working directory.",
+    description: "List files and directories at a given path. Set recursive=true for a tree view up to 3 levels deep.",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Directory path relative to the working directory. Use '.' for root." }
+        path: { type: "string", description: "Directory path relative to the working directory. Use '.' for root." },
+        recursive: { type: "boolean", description: "If true, list recursively up to 3 levels deep." }
       },
       required: ["path"]
+    }
+  },
+  {
+    name: "search_files",
+    description: "Search file contents with a regex pattern, like grep. Returns up to 20 matching lines with file paths and line numbers.",
+    input_schema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "Regex pattern to search for." },
+        glob: { type: "string", description: "Optional file glob filter, e.g. '*.ts' or '*.json'. Searches all files if omitted." }
+      },
+      required: ["pattern"]
+    }
+  },
+  {
+    name: "read_multiple_files",
+    description: "Read several files at once. More efficient than calling read_file repeatedly.",
+    input_schema: {
+      type: "object",
+      properties: {
+        paths: { type: "string", description: "JSON array of file paths relative to the working directory, e.g. [\"src/a.ts\",\"src/b.ts\"]." }
+      },
+      required: ["paths"]
     }
   },
   {
@@ -60,31 +86,85 @@ const TOOLS: Anthropic.Tool[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Tool stats (for circuit breaker and failure attribution)
+// ---------------------------------------------------------------------------
+
+interface ToolStats {
+  readCount: number;
+  writeCount: number;
+  bashCount: number;
+  searchCount: number;
+}
+
+// ---------------------------------------------------------------------------
 // Tool execution
 // ---------------------------------------------------------------------------
 
-function executeTool(name: string, input: Record<string, string>, cwd: string, env: Record<string, string>): string {
+function executeTool(
+  name: string,
+  input: Record<string, string>,
+  cwd: string,
+  env: Record<string, string>,
+  stats: ToolStats
+): string {
   try {
     switch (name) {
       case "read_file": {
+        stats.readCount++;
         const abs = resolve(cwd, input.path);
         if (!existsSync(abs)) return `Error: file not found: ${input.path}`;
         return readFileSync(abs, "utf8");
       }
       case "write_file": {
+        stats.writeCount++;
         const abs = resolve(cwd, input.path);
         mkdirSync(dirname(abs), { recursive: true });
         writeFileSync(abs, input.content, "utf8");
         return `Written: ${input.path}`;
       }
       case "list_directory": {
+        stats.readCount++;
         const abs = resolve(cwd, input.path);
         if (!existsSync(abs)) return `Error: directory not found: ${input.path}`;
+        const recursive = input.recursive === "true";
+        if (recursive) {
+          return listRecursive(abs, cwd, 0, 3);
+        }
         return readdirSync(abs, { withFileTypes: true })
           .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
           .join("\n");
       }
+      case "search_files": {
+        stats.searchCount++;
+        const args = ["-rn", "-m", "20"];
+        if (input.glob) args.push("--include", input.glob);
+        args.push(input.pattern, ".");
+        const result = spawnSync("grep", args, {
+          cwd,
+          encoding: "utf8",
+          timeout: 10_000,
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+        return result.stdout?.trim() || "(no matches)";
+      }
+      case "read_multiple_files": {
+        let paths: string[];
+        try {
+          paths = JSON.parse(input.paths) as string[];
+        } catch {
+          return "Error: paths must be a valid JSON array of strings";
+        }
+        stats.readCount += paths.length;
+        return paths
+          .map((p) => {
+            const abs = resolve(cwd, p);
+            if (!existsSync(abs)) return `--- ${p} ---\nError: file not found`;
+            return `--- ${p} ---\n${readFileSync(abs, "utf8")}`;
+          })
+          .join("\n\n");
+      }
       case "bash": {
+        stats.bashCount++;
         const result = spawnSync("bash", ["-c", input.command], {
           cwd,
           env: { ...process.env, ...env },
@@ -101,6 +181,29 @@ function executeTool(name: string, input: Record<string, string>, cwd: string, e
   } catch (err) {
     return `Error: ${err instanceof Error ? err.message : String(err)}`;
   }
+}
+
+function listRecursive(absPath: string, rootCwd: string, depth: number, maxDepth: number): string {
+  if (depth >= maxDepth) return "";
+  const indent = "  ".repeat(depth);
+  const lines: string[] = [];
+  try {
+    const entries = readdirSync(absPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name === ".git") continue;
+      const entryPath = join(absPath, entry.name);
+      if (entry.isDirectory()) {
+        lines.push(`${indent}${entry.name}/`);
+        const children = listRecursive(entryPath, rootCwd, depth + 1, maxDepth);
+        if (children) lines.push(children);
+      } else {
+        lines.push(`${indent}${entry.name}`);
+      }
+    }
+  } catch {
+    // skip unreadable dirs
+  }
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -128,26 +231,67 @@ export class AnthropicSdkExecutor implements AgentExecutor {
     let totalOutputTokens = 0;
     let timedOut = false;
     const deadlineMs = Date.now() + task.budgetSeconds * 1000;
+    const stats: ToolStats = { readCount: 0, writeCount: 0, bashCount: 0, searchCount: 0 };
 
     try {
       for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-        if (Date.now() >= deadlineMs) {
+        const remainingMs = deadlineMs - Date.now();
+        if (remainingMs <= 0) {
           timedOut = true;
           break;
         }
 
-        const response = await client.messages.create({
-          model: this.model,
-          max_tokens: 8192,
-          system: systemPrompt,
-          tools: TOOLS,
-          messages
-        });
+        // Circuit breaker: if many reads and zero writes, nudge toward implementation.
+        if (stats.readCount >= CIRCUIT_BREAKER_READ_THRESHOLD && stats.writeCount === 0 && iteration > 0) {
+          messages.push({
+            role: "user",
+            content: `You have read ${stats.readCount} files without writing any implementation yet. You have enough context — start writing the implementation now. Do not read more files unless strictly necessary.`
+          });
+          // Reset read count so the nudge isn't repeated every iteration.
+          stats.readCount = 0;
+        }
+
+        // Context window management: compress after 20 iterations to prevent bloat.
+        if (iteration === 20 && messages.length > 14) {
+          const first = messages.slice(0, 1);
+          const recent = messages.slice(-12);
+          messages.length = 0;
+          messages.push(...first, ...recent);
+        }
+
+        let response: Anthropic.Message;
+        try {
+          response = await client.messages.create(
+            {
+              model: this.model,
+              max_tokens: 8192,
+              system: systemPrompt,
+              tools: TOOLS,
+              messages
+            },
+            {
+              timeout: Math.min(PER_CALL_TIMEOUT_MS, remainingMs),
+              signal: AbortSignal.timeout(Math.min(PER_CALL_TIMEOUT_MS, remainingMs))
+            }
+          );
+        } catch (callErr) {
+          // Treat any per-call timeout/abort as overall budget exhaustion.
+          if (
+            callErr instanceof Error &&
+            (callErr.name === "AbortError" ||
+              callErr.message.includes("timeout") ||
+              callErr.message.includes("timed out") ||
+              callErr.message.includes("aborted"))
+          ) {
+            timedOut = true;
+            break;
+          }
+          throw callErr;
+        }
 
         totalInputTokens += response.usage.input_tokens;
         totalOutputTokens += response.usage.output_tokens;
 
-        // Append the assistant turn.
         messages.push({ role: "assistant", content: response.content });
 
         if (response.stop_reason === "end_turn") {
@@ -163,7 +307,8 @@ export class AnthropicSdkExecutor implements AgentExecutor {
               block.name,
               block.input as Record<string, string>,
               task.workingDirectory,
-              task.environment
+              task.environment,
+              stats
             );
             toolResults.push({
               type: "tool_result",
@@ -181,17 +326,28 @@ export class AnthropicSdkExecutor implements AgentExecutor {
         status: "FAILED",
         artifacts: [],
         blockReason: err instanceof Error ? err.message : String(err),
-        metrics: { elapsedSeconds, tokenInput: totalInputTokens, tokenOutput: totalOutputTokens }
+        metrics: {
+          elapsedSeconds,
+          tokenInput: totalInputTokens,
+          tokenOutput: totalOutputTokens,
+          toolStats: { ...stats, iterations: MAX_TOOL_ITERATIONS }
+        }
       };
     }
 
     const elapsedSeconds = (Date.now() - start) / 1000;
+    const totalIterations = messages.filter((m) => m.role === "assistant").length;
 
     if (timedOut) {
       return {
         status: "TIMEOUT",
         artifacts: [],
-        metrics: { elapsedSeconds: task.budgetSeconds, tokenInput: totalInputTokens, tokenOutput: totalOutputTokens }
+        metrics: {
+          elapsedSeconds: task.budgetSeconds,
+          tokenInput: totalInputTokens,
+          tokenOutput: totalOutputTokens,
+          toolStats: { ...stats, iterations: totalIterations }
+        }
       };
     }
 
@@ -201,7 +357,12 @@ export class AnthropicSdkExecutor implements AgentExecutor {
         status: "DONE_WITH_CONCERNS",
         artifacts: [],
         concerns: "Agent did not write .autoforge-status.json",
-        metrics: { elapsedSeconds, tokenInput: totalInputTokens, tokenOutput: totalOutputTokens }
+        metrics: {
+          elapsedSeconds,
+          tokenInput: totalInputTokens,
+          tokenOutput: totalOutputTokens,
+          toolStats: { ...stats, iterations: totalIterations }
+        }
       };
     }
 
@@ -211,7 +372,12 @@ export class AnthropicSdkExecutor implements AgentExecutor {
       concerns: statusFile.concerns,
       blockReason: statusFile.blockReason,
       output: statusFile,
-      metrics: { elapsedSeconds, tokenInput: totalInputTokens, tokenOutput: totalOutputTokens }
+      metrics: {
+        elapsedSeconds,
+        tokenInput: totalInputTokens,
+        tokenOutput: totalOutputTokens,
+        toolStats: { ...stats, iterations: totalIterations }
+      }
     };
   }
 
@@ -257,7 +423,7 @@ Valid status values:
 - **"BLOCKED"** — cannot proceed; add a "blockReason" field with a clear explanation
 - **"NEEDS_CONTEXT"** — missing information; add a "blockReason" field specifying what is needed
 
-Time budget: ${task.budgetSeconds} seconds. Work efficiently.`);
+Time budget: ${task.budgetSeconds} seconds. Work efficiently. Use search_files to find relevant code rather than reading every file. Use read_multiple_files to read several files at once.`);
 
   return sections.join("\n\n");
 }
@@ -281,7 +447,7 @@ interface AgentStatusFile {
   artifacts: string[];
   concerns?: string;
   blockReason?: string;
-  // Extra fields (e.g. "meta" from the meta agent) pass through as output.
+  // Extra fields (e.g. "meta" from the meta agent, "subtasks" from the planner) pass through as output.
   [key: string]: unknown;
 }
 

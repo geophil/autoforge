@@ -33,12 +33,23 @@ document.getElementById("btn-back-to-tasks").addEventListener("click", () => {
 function connectSSE() {
   const es = new EventSource(`${API}/api/events`);
 
-  es.addEventListener("connected", () => {
+  // Flip the badge to "live" on any sign the stream is actually flowing:
+  // - onopen fires when the HTTP connection is established.
+  // - heartbeat fires every 15s from the server (primary liveness signal).
+  // - task.updated arrives whenever a task event is published.
+  // The legacy "connected" listener is kept for backwards compatibility with
+  // any future server-sent hello event.
+  const markLive = () => {
     badge.textContent = "live";
     badge.className = "connection-badge connected";
-  });
+  };
+
+  es.onopen = markLive;
+  es.addEventListener("connected", markLive);
+  es.addEventListener("heartbeat", markLive);
 
   es.addEventListener("task.updated", () => {
+    markLive();
     refreshTasks();
     if (currentTaskId) refreshTaskDetail(currentTaskId);
   });
@@ -114,12 +125,20 @@ function renderTaskDetail(task) {
   const assessment = task.assessment || {};
   const subtasks = task.planSubtasks || [];
 
+  const terminalStates = ["completed", "failed"];
+  const nonTerminalStates = ["received", "assessing", "planning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting"];
   let actionsHtml = "";
   if (task.state === "awaiting_approval") {
     actionsHtml = `
       <div class="task-detail-actions">
         <button class="btn btn-approve" onclick="approveTask('${task.id}')">Approve &amp; Merge</button>
         <button class="btn btn-reject" onclick="rejectTask('${task.id}')">Reject</button>
+        <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel</button>
+      </div>`;
+  } else if (nonTerminalStates.includes(task.state)) {
+    actionsHtml = `
+      <div class="task-detail-actions">
+        <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')">Cancel task</button>
       </div>`;
   }
 
@@ -204,6 +223,18 @@ function formatElapsed(seconds) {
   return `${Math.floor(seconds / 60)}m ${(seconds % 60).toFixed(0)}s`;
 }
 
+const STATUS_COLORS = {
+  done: "var(--green)",
+  in_progress: "var(--orange)",
+  failed: "var(--red)",
+  done_with_concerns: "var(--yellow)",
+  pending: "var(--text-dim)",
+};
+
+function statusColor(status) {
+  return STATUS_COLORS[status] || "var(--text-dim)";
+}
+
 async function loadEvents(taskId) {
   const container = document.getElementById("findings-list");
   try {
@@ -215,17 +246,25 @@ async function loadEvents(taskId) {
     }
     container.innerHTML = events
       .map((ev) => {
-        const color = agentColor(ev.agent);
+        const agentCol = agentColor(ev.agent);
+        const dotColor = statusColor(ev.status);
         const elapsed = ev.elapsedSeconds !== null ? `<span class="tl-meta">${formatElapsed(ev.elapsedSeconds)}</span>` : "";
         const tokens = ev.tokenUsage ? `<span class="tl-meta">${ev.tokenUsage.input + ev.tokenUsage.output} tok</span>` : "";
+        const failureBadge = ev.failureCategory
+          ? `<span class="tl-failure-badge">${esc(ev.failureCategory)}</span>`
+          : "";
+        const failureReason = ev.failureReason && ev.type === "failure_analysis"
+          ? `<div class="tl-failure-reason">${esc(ev.failureReason)}</div>`
+          : "";
         return `
           <div class="tl-item">
-            <span class="tl-dot" style="background:${color}"></span>
+            <span class="tl-dot" style="background:${dotColor}"></span>
             <div class="tl-body">
-              <span class="tl-agent" style="color:${color}">${esc(ev.agent)}</span>
+              <span class="tl-agent" style="color:${agentCol}">${esc(ev.agent)}</span>
               <span class="tl-type">${esc(ev.type)}</span>
-              ${elapsed}${tokens}
+              ${failureBadge}${elapsed}${tokens}
               <span class="tl-time">${timeAgo(ev.timestamp)}</span>
+              ${failureReason}
             </div>
           </div>`;
       })
@@ -266,9 +305,27 @@ async function rejectTask(taskId) {
   }
 }
 
+async function cancelTask(taskId) {
+  const reason = prompt("Cancel reason (optional):", "Cancelled by operator.") ?? "Cancelled by operator.";
+  try {
+    const res = await fetch(`${API}/api/tasks/${taskId}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    toast("Task cancelled.", "success");
+    refreshTasks();
+    refreshTaskDetail(taskId);
+  } catch (err) {
+    toast(`Cancel failed: ${err.message}`, "error");
+  }
+}
+
 // Make actions available from inline onclick handlers
 window.approveTask = approveTask;
 window.rejectTask = rejectTask;
+window.cancelTask = cancelTask;
 
 // --- New Task Dialog ---
 const dialogTask = document.getElementById("dialog-new-task");
@@ -278,10 +335,25 @@ document.getElementById("btn-cancel-task").addEventListener("click", () => dialo
 document.getElementById("form-new-task").addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.target;
+  const submitBtn = form.querySelector('button[type="submit"]');
+  if (submitBtn.disabled) return;
+
   const body = {
     projectId: form.projectId.value.trim(),
     description: form.description.value.trim(),
   };
+  const originalLabel = submitBtn.textContent;
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Submitting…";
+
+  // Close the dialog immediately so the user never sees a still-open
+  // dialog after clicking submit. Backend kicks off the planner which
+  // can run for minutes, and we don't want the user to double-click.
+  dialogTask.close();
+  form.reset();
+  form.projectId.value = "autoforge";
+  toast("Task submitted — planner starting…", "success");
+
   try {
     const res = await fetch(`${API}/api/tasks`, {
       method: "POST",
@@ -289,13 +361,12 @@ document.getElementById("form-new-task").addEventListener("submit", async (e) =>
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(await res.text());
-    toast("Task submitted.", "success");
-    form.reset();
-    form.projectId.value = "autoforge";
-    dialogTask.close();
     refreshTasks();
   } catch (err) {
     toast(`Submit failed: ${err.message}`, "error");
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
   }
 });
 
@@ -330,10 +401,22 @@ document.getElementById("btn-cancel-meta").addEventListener("click", () => dialo
 document.getElementById("form-meta").addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.target;
+  const submitBtn = form.querySelector('button[type="submit"]');
+  if (submitBtn.disabled) return;
+
   const body = {
     projectId: form.projectId.value.trim(),
     focus: form.focus.value.trim() || undefined,
   };
+  const originalLabel = submitBtn.textContent;
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Running…";
+
+  dialogMeta.close();
+  form.reset();
+  form.projectId.value = "autoforge";
+  toast("Meta agent started…", "success");
+
   try {
     const res = await fetch(`${API}/api/meta`, {
       method: "POST",
@@ -348,11 +431,11 @@ document.getElementById("form-meta").addEventListener("submit", async (e) => {
         : `Meta agent completed (${result.status})`,
       "success"
     );
-    dialogMeta.close();
-    form.reset();
-    form.projectId.value = "autoforge";
   } catch (err) {
     toast(`Meta agent failed: ${err.message}`, "error");
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
   }
 });
 

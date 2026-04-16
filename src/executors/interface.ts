@@ -12,6 +12,14 @@ export interface AgentTask {
   metadata?: Record<string, unknown>;
 }
 
+export interface ToolStats {
+  readCount: number;
+  writeCount: number;
+  bashCount: number;
+  searchCount: number;
+  iterations: number;
+}
+
 export interface AgentResult {
   status: SubtaskReportStatus | "FAILED" | "TIMEOUT";
   artifacts: string[];
@@ -23,6 +31,7 @@ export interface AgentResult {
     tokenInput?: number;
     tokenOutput?: number;
     estimatedCost?: number;
+    toolStats?: ToolStats;
   };
 }
 

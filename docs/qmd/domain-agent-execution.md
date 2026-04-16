@@ -77,13 +77,14 @@ Every agent receives two distinct prompt inputs resolved by the orchestrator bef
 ```typescript
 // src/skills/registry.ts
 const AGENT_SKILLS: Record<AgentType, string[]> = {
-  planner:     ["writing-plans.md"],
-  coder:       ["tdd.md", "systematic-debugging.md", "verification-before-completion.md"],
-  reviewer:    ["two-stage-review.md"],
-  doc:         ["documentation.md"],
-  pr:          [],
-  orchestrator:[],
-  meta:        ["writing-skills.md"]
+  planner:      ["writing-plans.md"],
+  coder:        ["tdd.md", "systematic-debugging.md", "verification-before-completion.md"],
+  reviewer:     ["two-stage-review.md"],
+  doc:          ["documentation.md"],
+  "doc-review": ["documentation.md", "verification-before-completion.md"],
+  pr:           [],
+  orchestrator: [],
+  meta:         ["writing-skills.md"]
 };
 ```
 
@@ -176,6 +177,14 @@ export interface AgentTask {
   metadata?: Record<string, unknown>;
 }
 
+export interface ToolStats {
+  readCount: number;
+  writeCount: number;
+  bashCount: number;
+  searchCount: number;
+  iterations: number;
+}
+
 export interface AgentResult {
   status: SubtaskReportStatus | "FAILED" | "TIMEOUT";
   artifacts: string[];
@@ -187,6 +196,7 @@ export interface AgentResult {
     tokenInput?: number;
     tokenOutput?: number;
     estimatedCost?: number;
+    toolStats?: ToolStats;
   };
 }
 

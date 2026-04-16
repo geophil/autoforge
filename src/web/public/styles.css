@@ -397,6 +397,25 @@ h2 {
   margin-left: auto;
 }
 
+.tl-failure-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background: var(--red-dim);
+  color: var(--red);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.tl-failure-reason {
+  width: 100%;
+  font-size: 0.8rem;
+  color: var(--red);
+  margin-top: 0.2rem;
+  font-style: italic;
+}
+
 /* Assessment Grid */
 .assessment-grid {
   display: grid;

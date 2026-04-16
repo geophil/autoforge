@@ -138,24 +138,32 @@ export class DbClient {
     timestamp: string;
     elapsedSeconds: number | null;
     tokenUsage: { input: number; output: number } | null;
+    failureCategory: string | null;
+    failureReason: string | null;
   }> {
     const rows = this.sqlite
       .query(
-        "SELECT id, event_type, agent, status, timestamp, elapsed_seconds, token_input, token_output FROM events WHERE task_id = ? ORDER BY timestamp ASC"
+        "SELECT id, event_type, agent, status, timestamp, elapsed_seconds, token_input, token_output, payload FROM events WHERE task_id = ? ORDER BY timestamp ASC"
       )
       .all(taskId) as Array<Record<string, unknown>>;
-    return rows.map((row) => ({
-      id: String(row.id),
-      type: String(row.event_type),
-      agent: String(row.agent),
-      status: String(row.status),
-      timestamp: String(row.timestamp),
-      elapsedSeconds: row.elapsed_seconds !== null ? Number(row.elapsed_seconds) : null,
-      tokenUsage:
-        row.token_input !== null && row.token_output !== null
-          ? { input: Number(row.token_input), output: Number(row.token_output) }
-          : null,
-    }));
+    return rows.map((row) => {
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(String(row.payload)); } catch { /* ignore */ }
+      return {
+        id: String(row.id),
+        type: String(row.event_type),
+        agent: String(row.agent),
+        status: String(row.status),
+        timestamp: String(row.timestamp),
+        elapsedSeconds: row.elapsed_seconds !== null ? Number(row.elapsed_seconds) : null,
+        tokenUsage:
+          row.token_input !== null && row.token_output !== null
+            ? { input: Number(row.token_input), output: Number(row.token_output) }
+            : null,
+        failureCategory: (payload.failure_category as string) ?? null,
+        failureReason: (payload.failure_reason as string) ?? (payload.reason as string) ?? null,
+      };
+    });
   }
 
   listFindings(taskId: string): ReviewFinding[] {
