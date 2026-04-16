@@ -276,6 +276,15 @@ async function loadEvents(taskId) {
         const failureReason = ev.failureReason && ev.type === "failure_analysis"
           ? `<div class="tl-failure-reason">${esc(ev.failureReason)}</div>`
           : "";
+        const rejectionCategories = ev.payload?.rejection_categories?.length
+          ? `<div class="tl-rejection-categories">${ev.payload.rejection_categories.map((c) => `<span class="tl-cat">${esc(c)}</span>`).join("")}</div>`
+          : "";
+        const rejectionGuidance = ev.payload?.rejection_guidance
+          ? `<div class="tl-rejection-guidance"><span class="tl-guidance-label">Guidance:</span> ${esc(ev.payload.rejection_guidance)}</div>`
+          : "";
+        const restartLink = ev.type === "restart_spawned" && ev.payload?.restart_child_task_id
+          ? `<div class="tl-restart-link" style="cursor:pointer;color:var(--accent);font-size:0.8rem" onclick="window.openTask('${esc(ev.payload.restart_child_task_id)}')">New attempt: ${String(ev.payload.restart_child_task_id).slice(0, 8)} &rarr;</div>`
+          : "";
         return `
           <div class="tl-item">
             <span class="tl-dot" style="background:${dotColor}"></span>
@@ -284,7 +293,7 @@ async function loadEvents(taskId) {
               <span class="tl-type">${esc(ev.type)}</span>
               ${failureBadge}${elapsed}${tokens}
               <span class="tl-time">${timeAgo(ev.timestamp)}</span>
-              ${failureReason}
+              ${failureReason}${rejectionCategories}${rejectionGuidance}${restartLink}
             </div>
           </div>`;
       })
@@ -315,23 +324,60 @@ async function approveTask(taskId) {
   }
 }
 
-async function rejectTask(taskId) {
-  const reason = prompt("Rejection reason:");
+// --- Rejection modal ---
+const dialogReject = document.getElementById("dialog-reject");
+const formReject = document.getElementById("form-reject");
+let pendingRejectTaskId = null;
+
+document.getElementById("btn-cancel-reject").addEventListener("click", () => {
+  dialogReject.close();
+  pendingRejectTaskId = null;
+});
+
+function rejectTask(taskId) {
+  pendingRejectTaskId = taskId;
+  formReject.reset();
+  dialogReject.showModal();
+}
+
+formReject.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const submitBtn = formReject.querySelector('button[type="submit"]');
+  if (submitBtn.disabled || !pendingRejectTaskId) return;
+
+  const data = new FormData(formReject);
+  const reason = data.get("reason")?.toString().trim();
+  const guidance = data.get("guidance")?.toString().trim() || undefined;
+  const categories = data.getAll("categories").map(String);
+
   if (!reason) return;
+
+  const taskId = pendingRejectTaskId;
+  const originalLabel = submitBtn.textContent;
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Rejecting…";
+  dialogReject.close();
+  pendingRejectTaskId = null;
+
   try {
     const res = await fetch(`${API}/api/tasks/${taskId}/reject`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
+      body: JSON.stringify({ reason, guidance, categories: categories.length ? categories : undefined })
     });
     if (!res.ok) throw new Error(await res.text());
-    toast("Task rejected — rework queued.", "success");
+    const newTask = await res.json();
+    toast(`Task rejected — new attempt ${newTask.id.slice(0, 8)} started.`, "success");
     refreshTasks();
-    refreshTaskDetail(taskId);
+    currentTaskId = newTask.id;
+    refreshTaskDetail(newTask.id);
   } catch (err) {
     toast(`Rejection failed: ${err.message}`, "error");
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
   }
-}
+});
 
 async function cancelTask(taskId) {
   const reason = prompt("Cancel reason (optional):", "Cancelled by operator.") ?? "Cancelled by operator.";
@@ -354,6 +400,11 @@ async function cancelTask(taskId) {
 window.approveTask = approveTask;
 window.rejectTask = rejectTask;
 window.cancelTask = cancelTask;
+window.openTask = (taskId) => {
+  currentTaskId = taskId;
+  refreshTaskDetail(taskId);
+  showView("task-detail");
+};
 
 // --- New Task Dialog ---
 const dialogTask = document.getElementById("dialog-new-task");

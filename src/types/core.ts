@@ -55,6 +55,20 @@ export interface PlanSubtask {
   agentType?: AgentType;
 }
 
+export type RejectionCategory =
+  | "stale_base"
+  | "wrong_scope"
+  | "incomplete"
+  | "incorrect_output"
+  | "quality_issues"
+  | "other";
+
+export interface RejectionFeedback {
+  reason: string;
+  guidance?: string;
+  categories?: RejectionCategory[];
+}
+
 export interface PipelineTask {
   id: string;
   projectId: string;

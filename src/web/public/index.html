@@ -45,6 +45,33 @@
         </form>
       </dialog>
 
+      <dialog id="dialog-reject">
+        <form id="form-reject">
+          <h3>Reject &amp; Restart</h3>
+          <label>
+            What was wrong with this attempt? <span style="color:var(--red)">*</span>
+            <textarea name="reason" rows="3" placeholder="Describe what was incorrect or missing..." required></textarea>
+          </label>
+          <label>
+            Guidance for the next attempt (optional)
+            <textarea name="guidance" rows="2" placeholder="What should the agent do differently?"></textarea>
+          </label>
+          <div class="reject-categories-label">Categories (optional)</div>
+          <div class="reject-categories">
+            <label class="reject-category"><input type="checkbox" name="categories" value="stale_base" /> Stale base</label>
+            <label class="reject-category"><input type="checkbox" name="categories" value="wrong_scope" /> Wrong scope</label>
+            <label class="reject-category"><input type="checkbox" name="categories" value="incomplete" /> Incomplete</label>
+            <label class="reject-category"><input type="checkbox" name="categories" value="incorrect_output" /> Incorrect output</label>
+            <label class="reject-category"><input type="checkbox" name="categories" value="quality_issues" /> Quality issues</label>
+            <label class="reject-category"><input type="checkbox" name="categories" value="other" /> Other</label>
+          </div>
+          <div class="dialog-actions">
+            <button type="button" class="btn btn-ghost" id="btn-cancel-reject">Cancel</button>
+            <button type="submit" class="btn btn-reject-submit">Reject &amp; Restart</button>
+          </div>
+        </form>
+      </dialog>
+
       <div class="task-list" id="task-list">
         <div class="empty-state">Loading tasks...</div>
       </div>

@@ -140,6 +140,7 @@ export class DbClient {
     tokenUsage: { input: number; output: number } | null;
     failureCategory: string | null;
     failureReason: string | null;
+    payload: Record<string, unknown>;
   }> {
     const rows = this.sqlite
       .query(
@@ -162,6 +163,7 @@ export class DbClient {
             : null,
         failureCategory: (payload.failure_category as string) ?? null,
         failureReason: (payload.failure_reason as string) ?? (payload.reason as string) ?? null,
+        payload
       };
     });
   }

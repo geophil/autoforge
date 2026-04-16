@@ -7,7 +7,7 @@ import { type AutoforgeMessage } from "../nats/messages";
 import type { AgentExecutor } from "../executors/interface";
 import type { DbClient } from "../db/client";
 import type { NatsClient } from "../nats/client";
-import type { AgentType, PipelineTask, PlanSubtask, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
+import type { AgentType, PipelineTask, PlanSubtask, RejectionFeedback, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
 import { assertTransition } from "./state-machine";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
@@ -186,24 +186,64 @@ export class OrchestratorService {
     return this.requireTask(taskId);
   }
 
-  async rejectTask(taskId: string, reason: string): Promise<PipelineTask> {
-    const task = this.requireTask(taskId);
-    if (task.state !== "awaiting_approval") {
+  async rejectTask(taskId: string, feedback: RejectionFeedback): Promise<PipelineTask> {
+    const oldTask = this.requireTask(taskId);
+    if (oldTask.state !== "awaiting_approval") {
       throw new Error("Task is not awaiting approval.");
     }
 
-    // Close the PR if one was created.
-    if (task.prUrl) {
-      await closePullRequest(task.prUrl);
+    // Close the existing PR — best-effort so a GitHub outage doesn't block.
+    if (oldTask.prUrl) {
+      await closePullRequest(oldTask.prUrl).catch((err) => {
+        console.warn(`[orchestrator] Failed to close PR ${oldTask.prUrl}: ${err}`);
+      });
     }
 
-    const nextIteration = task.iteration + 1;
-    this.transition(taskId, task.projectId, "awaiting_approval", "reworking", { iteration: nextIteration, reason });
-    this.transition(taskId, task.projectId, "reworking", "executing", { iteration: nextIteration });
-    this.transition(taskId, task.projectId, "executing", "reviewing", { iteration: nextIteration });
-    this.transition(taskId, task.projectId, "reviewing", "pr_created", { iteration: nextIteration });
-    this.transition(taskId, task.projectId, "pr_created", "awaiting_approval", { iteration: nextIteration });
-    return this.requireTask(taskId);
+    // Record structured rejection feedback in the event log for meta-loop analytics.
+    this.recordEvent({
+      taskId,
+      projectId: oldTask.projectId,
+      agent: "orchestrator",
+      type: "failure_analysis",
+      status: "failed",
+      payload: {
+        stage_failed: "awaiting_approval",
+        failure_reason: `Rejected by reviewer: ${feedback.reason}`,
+        failure_category: "rejected",
+        rejection_categories: feedback.categories ?? [],
+        rejection_guidance: feedback.guidance ?? null,
+        planner_fallback: oldTask.planSubtasks.length === 1 &&
+          oldTask.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
+        iteration: oldTask.iteration
+      },
+      budgetSeconds: 60
+    });
+    this.transition(taskId, oldTask.projectId, "awaiting_approval", "failed", {
+      reason: `rejected: ${feedback.reason}`,
+      iteration: oldTask.iteration
+    });
+    this.cleanupWorktree(taskId);
+
+    // Spawn a fresh task from current HEAD with the operator's feedback
+    // appended to the description so the new planner sees it.
+    const newDescription = buildRestartDescription(oldTask.description, feedback, taskId);
+    const newTask = await this.submitTask(oldTask.projectId, newDescription);
+
+    // Record lineage so analytics (and the meta agent) can join old -> new.
+    this.recordEvent({
+      taskId,
+      projectId: oldTask.projectId,
+      agent: "orchestrator",
+      type: "restart_spawned",
+      status: "done",
+      payload: {
+        restart_child_task_id: newTask.id,
+        rejection_categories: feedback.categories ?? []
+      },
+      budgetSeconds: 60
+    });
+
+    return newTask;
   }
 
   async replayFromEvents(): Promise<void> {
@@ -917,6 +957,25 @@ function parseFindings(taskId: string, output: unknown): ReviewFinding[] {
     }));
   }
   return [];
+}
+
+function buildRestartDescription(
+  original: string,
+  feedback: RejectionFeedback,
+  parentId: string
+): string {
+  const lines = [
+    original,
+    "",
+    "## Reviewer feedback from previous attempt",
+    `Previous task ${parentId} was rejected. Treat the notes below as binding guidance — do not repeat the same mistakes.`,
+    "",
+    `**Reason for rejection:** ${feedback.reason}`
+  ];
+  if (feedback.guidance) {
+    lines.push("", `**Guidance for this attempt:** ${feedback.guidance}`);
+  }
+  return lines.join("\n");
 }
 
 function buildDocPrompt(description: string, subtasks: PlanSubtask[]): string {

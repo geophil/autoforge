@@ -558,6 +558,94 @@ dialog textarea:focus {
   margin-top: 1rem;
 }
 
+/* Rejection details in timeline */
+.tl-rejection-categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.3rem;
+}
+
+.tl-cat {
+  font-size: 0.72rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background: var(--red-dim);
+  color: var(--red);
+}
+
+.tl-rejection-guidance {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
+
+.tl-guidance-label {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Rejection modal category checkboxes */
+.reject-categories-label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 0.4rem;
+}
+
+.reject-categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.reject-category {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.25rem 0.55rem;
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 0;
+}
+
+.reject-category input[type="checkbox"] {
+  accent-color: var(--red);
+  width: 13px;
+  height: 13px;
+  margin: 0;
+}
+
+.reject-category:has(input:checked) {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+}
+
+.btn-reject-submit {
+  background: var(--red-dim);
+  color: var(--red);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 1rem;
+  font-size: 0.88rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.btn-reject-submit:hover {
+  background: var(--red);
+  color: #fff;
+}
+
 /* Utilities */
 .empty-state {
   text-align: center;

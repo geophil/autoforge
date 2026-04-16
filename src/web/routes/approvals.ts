@@ -3,8 +3,17 @@ import { z } from "zod";
 import type { OrchestratorService } from "../../orchestrator/service";
 import type { LiveEventHub } from "../events";
 
+const RejectionCategoryEnum = z.enum([
+  "stale_base", "wrong_scope", "incomplete",
+  "incorrect_output", "quality_issues", "other"
+]);
+
+// NOTE: the response to POST /:id/reject is the NEW (restart) task,
+// not the original. The original task will be in state "failed".
 const RejectSchema = z.object({
-  reason: z.string().min(1).default("Rejected by human reviewer.")
+  reason: z.string().min(1),
+  guidance: z.string().optional(),
+  categories: z.array(RejectionCategoryEnum).optional()
 });
 
 const CancelSchema = z.object({
@@ -21,8 +30,8 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
   });
 
   app.post("/:id/reject", async (ctx) => {
-    const payload = RejectSchema.parse(await ctx.req.json());
-    const task = await service.rejectTask(ctx.req.param("id"), payload.reason);
+    const feedback = RejectSchema.parse(await ctx.req.json());
+    const task = await service.rejectTask(ctx.req.param("id"), feedback);
     events.publish({ type: "task.updated", data: task });
     return ctx.json(task);
   });
