@@ -13,6 +13,7 @@ src/
   git/          — git worktree management
   nats/         — NATS client, stream definitions, message types
   orchestrator/ — OrchestratorService, state machine, recovery
+  personas/     — agent persona prompts (*.md) + PersonaRegistry
   privileged/   — GitHub PR operations, test runner (hold credentials)
   skills/       — SkillRegistry (reads from ../skills/*.md)
   types/        — canonical domain types shared across modules

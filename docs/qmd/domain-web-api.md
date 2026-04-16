@@ -65,15 +65,19 @@ publish(event: { type: string; data: unknown }): void {
 
 | Method | Path | Handler | Description |
 |--------|------|---------|-------------|
-| `GET`  | `/` | `server.ts` | HTML dashboard |
+| `GET`  | `/` | `server.ts` | Dashboard HTML (static asset) |
+| `GET`  | `/api/health` | `server.ts` | Health check (status, uptime) |
+| `GET`  | `/api/events` | `server.ts` | SSE stream for live updates |
 | `POST` | `/api/tasks` | `tasks.ts` | Submit a new task |
 | `GET`  | `/api/tasks` | `tasks.ts` | List all tasks |
 | `GET`  | `/api/tasks/:id` | `tasks.ts` | Get single task |
+| `GET`  | `/api/tasks/:id/events` | `tasks.ts` | Event log for a task |
 | `POST` | `/api/tasks/:id/approve` | `approvals.ts` | Approve awaiting task |
 | `POST` | `/api/tasks/:id/reject` | `approvals.ts` | Reject awaiting task with reason |
 | `GET`  | `/api/metrics/:projectId` | `metrics.ts` | Project metrics (total/completed tasks, unresolved findings) |
 | `GET`  | `/api/metrics/:projectId/trends` | `metrics.ts` | Trend data (stub, returns empty points) |
-| `GET`  | `/api/events` | `server.ts` | SSE stream for live updates |
+| `POST` | `/api/meta` | `meta.ts` | Trigger meta analysis (Zod: projectId, focus?) |
+| `POST` | `/api/meta/:experimentId/conclude` | `meta.ts` | Conclude experiment (Zod: metricAfter, keep) |
 
 ## Core Flows
 
@@ -100,10 +104,10 @@ POST /api/tasks/:id/approve
 
 ### SSE Dashboard Flow
 
-The dashboard HTML at `GET /` polls `/api/tasks` on load, then subscribes to `/api/events` via `EventSource`. On receiving a `task.updated` event, it refreshes the task list.
+The dashboard is a static SPA (`src/web/public/index.html` + `src/web/public/dashboard.js`) served via `serveStatic`. On load it polls `/api/tasks`, then subscribes to `/api/events` via `EventSource`. On receiving a `task.updated` event it refreshes the task list.
 
 ```javascript
-// embedded in dashboard HTML (src/web/server.ts)
+// src/web/public/dashboard.js
 const stream = new EventSource('/api/events');
 stream.addEventListener('task.updated', refresh);
 ```
@@ -131,8 +135,11 @@ stream.addEventListener('task.updated', refresh);
 
 | File | Purpose |
 |------|---------|
-| `src/web/server.ts` | `createWebServer` — Hono app, dashboard HTML, SSE endpoint |
-| `src/web/routes/tasks.ts` | `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/:id` |
+| `src/web/server.ts` | `createWebServer` — Hono app, `/api/health`, SSE endpoint, static file serving |
+| `src/web/routes/tasks.ts` | `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/:id`, `GET /api/tasks/:id/events` |
 | `src/web/routes/approvals.ts` | `POST /api/tasks/:id/approve`, `POST /api/tasks/:id/reject` |
-| `src/web/routes/metrics.ts` | `GET /api/metrics/:projectId` |
+| `src/web/routes/metrics.ts` | `GET /api/metrics/:projectId`, `GET /api/metrics/:projectId/trends` |
+| `src/web/routes/meta.ts` | `POST /api/meta`, `POST /api/meta/:experimentId/conclude` |
 | `src/web/events.ts` | `LiveEventHub` — in-memory SSE fan-out |
+| `src/web/public/index.html` | Dashboard HTML (static asset) |
+| `src/web/public/dashboard.js` | Dashboard JavaScript — SSE client, task views, meta dialog |

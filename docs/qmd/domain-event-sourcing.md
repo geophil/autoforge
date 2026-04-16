@@ -11,17 +11,22 @@ The `events` table has no `UPDATE` or `DELETE` paths. All projection mutations u
 ```sql
 -- src/db/schema.sql
 CREATE TABLE IF NOT EXISTS events (
-  id          TEXT PRIMARY KEY,
-  task_id     TEXT NOT NULL,
-  timestamp   TEXT NOT NULL,
-  agent       TEXT NOT NULL,
-  event_type  TEXT NOT NULL,
-  status      TEXT NOT NULL,
-  payload     TEXT NOT NULL,  -- JSON blob
-  budget_seconds INTEGER NOT NULL,
-  -- ... metrics columns
-  resumable   INTEGER NOT NULL DEFAULT 1,
-  executor_used TEXT,
+  id                    TEXT PRIMARY KEY,
+  task_id               TEXT NOT NULL,
+  subtask_id            TEXT,
+  timestamp             TEXT NOT NULL,
+  project_id            TEXT NOT NULL,
+  agent                 TEXT NOT NULL,
+  event_type            TEXT NOT NULL,
+  status                TEXT NOT NULL,
+  payload               TEXT NOT NULL,
+  budget_seconds        INTEGER NOT NULL,
+  elapsed_seconds       REAL,
+  token_input           INTEGER,
+  token_output          INTEGER,
+  estimated_cost        REAL,
+  resumable             INTEGER NOT NULL DEFAULT 1,
+  executor_used         TEXT,
   context_envelope_hash TEXT
 );
 ```
@@ -59,7 +64,7 @@ this.deps.nats?.publishTaskEvent(message).catch((err) => {
 });
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:353`
+**Enforced in**: `src/orchestrator/service.ts`
 
 ### NATS Connection Failure Degrades Gracefully
 

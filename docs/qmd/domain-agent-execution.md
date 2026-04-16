@@ -31,7 +31,7 @@ if (!statusFile) {
 }
 ```
 
-**Enforced in**: `src/executors/claude-code.ts:48`, `src/executors/anthropic-sdk.ts:197`
+**Enforced in**: `src/executors/claude-code.ts`, `src/executors/anthropic-sdk.ts`
 
 ### Budget Is Enforced by the Executor
 
@@ -50,7 +50,7 @@ const budgetTimer = setTimeout(() => {
 
 For `AnthropicSdkExecutor`, a deadline timestamp is checked at the start of each tool iteration loop.
 
-**Enforced in**: `src/executors/claude-code.ts:169`, `src/executors/anthropic-sdk.ts:129`
+**Enforced in**: `src/executors/claude-code.ts`, `src/executors/anthropic-sdk.ts`
 
 ### Executor Is Selected at Startup, Not Per-Task
 

@@ -161,10 +161,7 @@ sqlite3 data/autoforge.sqlite "SELECT id, state, tier, description FROM tasks"
 
 ### Replaying Projections (after schema change)
 
-```bash
-curl -X POST http://localhost:3000/api/tasks/replay
-# (or call OrchestratorService.replayFromEvents() directly in code)
-```
+There is no HTTP endpoint for projection replay. Call `db.rebuildProjectionsFromEvents()` directly in a one-off script, or restart the server after dropping and re-creating the database tables — the startup schema migration is idempotent.
 
 ### Resetting Local State
 

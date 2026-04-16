@@ -16,7 +16,7 @@ if (task.state === "awaiting_approval") {
 throw new Error(`Task ${taskId} did not reach approval state; current state: ${task.state}`);
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:99`
+**Enforced in**: `src/orchestrator/service.ts`
 
 ### Rework Is Capped at 3 Iterations
 
@@ -33,7 +33,7 @@ if (iteration > 3) {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:256`
+**Enforced in**: `src/orchestrator/service.ts`
 
 ### EXPRESS Tier Skips Review
 
@@ -47,7 +47,7 @@ if (tier === "EXPRESS") {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:219`
+**Enforced in**: `src/orchestrator/service.ts`
 
 ### Orchestrator Owns All Git Operations
 
@@ -59,7 +59,7 @@ Agents never push directly. The orchestrator commits each subtask's output after
 this.deps.worktrees.commit({ branch, path: worktreePath }, `autoforge: ${subtask.description}`);
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:214`. See `domain-pr-gate.md` > Git Worktree Isolation.
+**Enforced in**: `src/orchestrator/service.ts`. See `domain-pr-gate.md` > Git Worktree Isolation.
 
 ### Agents Receive a Time Budget
 
@@ -77,7 +77,7 @@ private budgetForTier(tier, step): number {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:364`
+**Enforced in**: `src/orchestrator/service.ts`
 
 ## Core Flows
 
@@ -145,7 +145,7 @@ if (!mustRework) {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:250`
+**Enforced in**: `src/orchestrator/service.ts`
 
 ### Plan Subtask Fallback
 
@@ -163,7 +163,7 @@ return [{
 }];
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:423`
+**Enforced in**: `src/orchestrator/service.ts`
 
 ## Integration Points
 
