@@ -156,7 +156,7 @@ export class DbClient {
     return {
       id: String(row.id),
       taskId: String(row.task_id),
-      stage: String(row.stage) as "planner",
+      stage: String(row.stage),
       attempt: Number(row.attempt),
       createdAt: String(row.created_at),
       executorUsed: String(row.executor_used),

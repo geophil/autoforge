@@ -1,6 +1,6 @@
 export interface AgentTranscriptInput {
   taskId: string;
-  stage: "planner";
+  stage: string;
   attempt: number;
   executorUsed: string;
   model: string | null;
