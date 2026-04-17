@@ -257,6 +257,60 @@ export class OrchestratorService {
     return this.requireTask(taskId);
   }
 
+  async critiquePlan(taskId: string, critique: string): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    if (task.state !== "awaiting_plan_approval") {
+      throw new Error(`Cannot critique plan: task is in state '${task.state}'`);
+    }
+
+    const transcripts = this.deps.db.listTranscriptsByTask(taskId);
+    const lastAttempt = transcripts.length === 0 ? 0 : Math.max(...transcripts.map((t) => t.attempt));
+    if (lastAttempt >= this.deps.env.PLANNER_MAX_ITERATIONS) {
+      throw new Error(`Re-plan iteration limit (${this.deps.env.PLANNER_MAX_ITERATIONS}) reached for task ${taskId}`);
+    }
+
+    const nextAttempt = lastAttempt + 1;
+    const priorPlan = task.planSubtasks;
+
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "plan_critiqued",
+      status: "in_progress",
+      payload: {
+        critique_text: critique,
+        critiqued_attempt: lastAttempt,
+        next_attempt: nextAttempt
+      },
+      budgetSeconds: 60
+    });
+
+    this.transition(taskId, task.projectId, "awaiting_plan_approval", "replanning", {});
+
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (!worktreePath) {
+      this.transition(taskId, task.projectId, "replanning", "failed", { reason: "worktree missing" });
+      throw new Error(`Worktree missing for task ${taskId}`);
+    }
+
+    let newPlan: PlanSubtask[];
+    try {
+      newPlan = await this.runPlannerAttempt(
+        taskId, task.projectId, task.description, task.tier,
+        worktreePath, nextAttempt, critique, priorPlan
+      );
+    } catch (err) {
+      this.transition(taskId, task.projectId, "replanning", "failed", {
+        reason: err instanceof Error ? err.message : String(err)
+      });
+      throw err;
+    }
+
+    this.transition(taskId, task.projectId, "replanning", "awaiting_plan_approval", { planSubtasks: newPlan });
+    return this.requireTask(taskId);
+  }
+
   async approveTask(taskId: string): Promise<PipelineTask> {
     const task = this.requireTask(taskId);
     if (task.state !== "awaiting_approval") {
