@@ -572,8 +572,9 @@ dialog label {
   margin-bottom: 0.75rem;
 }
 
-dialog input,
-dialog textarea {
+dialog input:not([type="checkbox"]):not([type="radio"]),
+dialog textarea,
+dialog select {
   display: block;
   width: 100%;
   background: var(--bg);
@@ -587,7 +588,8 @@ dialog textarea {
 }
 
 dialog input:focus,
-dialog textarea:focus {
+dialog textarea:focus,
+dialog select:focus {
   outline: none;
   border-color: var(--accent);
 }
