@@ -20,6 +20,10 @@ const CancelSchema = z.object({
   reason: z.string().min(1).default("Cancelled by operator.")
 });
 
+const CritiqueSchema = z.object({
+  critique: z.string().min(1).max(4000)
+});
+
 export function createApprovalRoutes(service: OrchestratorService, events: LiveEventHub): Hono {
   const app = new Hono();
 
@@ -47,6 +51,30 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
     const task = await service.cancelTask(ctx.req.param("id"), reason);
     events.publish({ type: "task.updated", data: task });
     return ctx.json(task);
+  });
+
+  app.post("/:id/approve-plan", async (ctx) => {
+    const task = await service.approvePlan(ctx.req.param("id"));
+    events.publish({ type: "task.updated", data: task });
+    return ctx.json(task);
+  });
+
+  app.post("/:id/critique-plan", async (ctx) => {
+    let body: { critique: string };
+    try {
+      body = CritiqueSchema.parse(await ctx.req.json());
+    } catch (err) {
+      return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    try {
+      const task = await service.critiquePlan(ctx.req.param("id"), body.critique);
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("limit")) return ctx.json({ error: "iteration_limit_reached", message: msg }, 409);
+      return ctx.json({ error: "critique_failed", message: msg }, 400);
+    }
   });
 
   return app;
