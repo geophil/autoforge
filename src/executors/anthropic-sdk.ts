@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import type { AgentExecutor, AgentResult, AgentTask, AgentTranscriptTurn } from "./interface";
+import type { AgentExecutor, AgentResult, AgentTask, AgentTranscript, AgentTranscriptTurn } from "./interface";
 
 const STATUS_FILE = ".autoforge-status.json";
 const MAX_TOOL_ITERATIONS = 50;
@@ -216,15 +216,11 @@ export class AnthropicSdkExecutor implements AgentExecutor {
   /**
    * Test hook: when set, used instead of constructing an Anthropic client.
    * Production code never sets this. Wired to support unit testing without
-   * stubbing the entire SDK module.
+   * stubbing the entire SDK module. The opts shape mirrors the messages.create
+   * params, optionally including mcp_servers when MCP is wired.
    */
-  private _testCreate?: (opts: {
-    model: string;
-    max_tokens: number;
-    system: string;
-    tools: unknown[];
-    mcp_servers?: unknown;
-    messages: unknown[];
+  private _testCreate?: (opts: Anthropic.MessageCreateParamsNonStreaming & {
+    mcp_servers?: Array<{ type: "url"; url: string; name: string }>;
   }) => Promise<{
     usage: { input_tokens: number; output_tokens: number };
     stop_reason: string;
@@ -245,6 +241,11 @@ export class AnthropicSdkExecutor implements AgentExecutor {
       { role: "user", content: task.prompt }
     ];
     const turns: AgentTranscriptTurn[] = [];
+    const buildTranscript = (): AgentTranscript => ({
+      systemPrompt,
+      userPrompt: task.prompt,
+      turns
+    });
 
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
@@ -284,26 +285,41 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           ? [{ type: "url" as const, url: task.environment.QMD_MCP_URL, name: "qmd" }]
           : undefined;
 
-        const callOpts = {
+        const baseParams: Anthropic.MessageCreateParamsNonStreaming = {
           model: task.model ?? this.model,
           max_tokens: 8192,
           system: systemPrompt,
           tools: TOOLS,
-          ...(mcpServers ? { mcp_servers: mcpServers } : {}),
           messages
         };
+        // Test hook expects a flat opts object including mcp_servers; merge here so both
+        // production and test branches see the same shape.
+        const callOpts = mcpServers ? { ...baseParams, mcp_servers: mcpServers } : baseParams;
+
+        const perCallTimeout = Math.min(PER_CALL_TIMEOUT_MS, remainingMs);
 
         let response: Anthropic.Message;
         try {
           if (this._testCreate) {
             response = (await this._testCreate(callOpts)) as Anthropic.Message;
+          } else if (mcpServers) {
+            // mcp_servers is only accepted by the beta messages endpoint. Routing the
+            // non-MCP path through `client.messages.create` keeps production traffic on
+            // the GA endpoint when MCP is not in use.
+            const betaResponse = await client.beta.messages.create(
+              callOpts as unknown as Anthropic.Beta.MessageCreateParamsNonStreaming,
+              {
+                timeout: perCallTimeout,
+                signal: AbortSignal.timeout(perCallTimeout)
+              }
+            );
+            response = betaResponse as unknown as Anthropic.Message;
           } else {
             response = await client.messages.create(
-              // mcp_servers is supported by the Anthropic API but not always in the SDK's typed params.
-              callOpts as unknown as Anthropic.MessageCreateParamsNonStreaming,
+              baseParams,
               {
-                timeout: Math.min(PER_CALL_TIMEOUT_MS, remainingMs),
-                signal: AbortSignal.timeout(Math.min(PER_CALL_TIMEOUT_MS, remainingMs))
+                timeout: perCallTimeout,
+                signal: AbortSignal.timeout(perCallTimeout)
               }
             );
           }
@@ -367,11 +383,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           tokenOutput: totalOutputTokens,
           toolStats: { ...stats, iterations: MAX_TOOL_ITERATIONS }
         },
-        transcript: {
-          systemPrompt,
-          userPrompt: task.prompt,
-          turns
-        }
+        transcript: buildTranscript()
       };
     }
 
@@ -388,11 +400,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           tokenOutput: totalOutputTokens,
           toolStats: { ...stats, iterations: totalIterations }
         },
-        transcript: {
-          systemPrompt,
-          userPrompt: task.prompt,
-          turns
-        }
+        transcript: buildTranscript()
       };
     }
 
@@ -408,11 +416,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           tokenOutput: totalOutputTokens,
           toolStats: { ...stats, iterations: totalIterations }
         },
-        transcript: {
-          systemPrompt,
-          userPrompt: task.prompt,
-          turns
-        }
+        transcript: buildTranscript()
       };
     }
 
@@ -428,11 +432,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
         tokenOutput: totalOutputTokens,
         toolStats: { ...stats, iterations: totalIterations }
       },
-      transcript: {
-        systemPrompt,
-        userPrompt: task.prompt,
-        turns
-      }
+      transcript: buildTranscript()
     };
   }
 

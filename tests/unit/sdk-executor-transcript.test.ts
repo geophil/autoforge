@@ -165,3 +165,109 @@ describe("SDK executor MCP wiring", () => {
     expect(captured.mcp_servers).toBeUndefined();
   });
 });
+
+describe("SDK executor return-path transcript invariants", () => {
+  test("FAILED return path includes transcript", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-fail-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      throw new Error("synthetic upstream failure");
+    };
+
+    const result = await exec.execute({
+      id: "tf", type: "planner", systemPrompt: "p-fail", prompt: "u-fail",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(result.status).toBe("FAILED");
+    expect(result.transcript).toBeDefined();
+    expect(result.transcript!.systemPrompt).toContain("p-fail");
+    expect(result.transcript!.userPrompt).toBe("u-fail");
+  });
+
+  test("TIMEOUT return path includes transcript", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-to-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      throw err;
+    };
+
+    const result = await exec.execute({
+      id: "tt", type: "planner", systemPrompt: "p-to", prompt: "u-to",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(result.status).toBe("TIMEOUT");
+    expect(result.transcript).toBeDefined();
+    expect(result.transcript!.systemPrompt).toContain("p-to");
+    expect(result.transcript!.userPrompt).toBe("u-to");
+  });
+
+  test("DONE_WITH_CONCERNS (no status file) return path includes transcript", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-dwc-"));
+    // intentionally do NOT write .autoforge-status.json
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => ({
+      usage: { input_tokens: 1, output_tokens: 1 },
+      stop_reason: "end_turn",
+      content: [{ type: "text", text: "done" }]
+    });
+
+    const result = await exec.execute({
+      id: "tdwc", type: "planner", systemPrompt: "p-dwc", prompt: "u-dwc",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE_WITH_CONCERNS");
+    expect(result.transcript).toBeDefined();
+    expect(result.transcript!.systemPrompt).toContain("p-dwc");
+    expect(result.transcript!.userPrompt).toBe("u-dwc");
+  });
+});
+
+describe("SDK executor compaction marker", () => {
+  test("records a compaction turn when iteration 20 triggers splice", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-cmp-"));
+    writeFileSync(join(dir, "hello.txt"), "world");
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    let callCount = 0;
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      callCount++;
+      if (callCount <= 21) {
+        return {
+          usage: { input_tokens: 5, output_tokens: 7 },
+          stop_reason: "tool_use",
+          content: [
+            { type: "tool_use", id: `tu_${callCount}`, name: "read_file", input: { path: "hello.txt" } }
+          ]
+        };
+      }
+      return {
+        usage: { input_tokens: 5, output_tokens: 7 },
+        stop_reason: "end_turn",
+        content: []
+      };
+    };
+
+    const result = await exec.execute({
+      id: "tcmp", type: "planner", systemPrompt: "p", prompt: "u",
+      workingDirectory: dir, budgetSeconds: 60, environment: {}, skillFiles: []
+    });
+
+    expect(result.transcript).toBeDefined();
+    const compaction = result.transcript!.turns.find((t) => t.kind === "compaction");
+    expect(compaction).toBeDefined();
+    if (compaction && compaction.kind === "compaction") {
+      expect(compaction.droppedTurns).toBeGreaterThan(0);
+    }
+  });
+});
