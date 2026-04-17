@@ -115,3 +115,53 @@ describe("SDK executor transcript capture", () => {
     }
   });
 });
+
+describe("SDK executor MCP wiring", () => {
+  test("includes mcp_servers when QMD_MCP_URL is set", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-mcp-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const captured: { mcp_servers?: unknown } = {};
+    const exec = new AnthropicSdkExecutor("test-key", "sonnet");
+    (exec as unknown as { _testCreate?: (opts: { mcp_servers?: unknown }) => Promise<unknown> })
+      ._testCreate = async (opts) => {
+        captured.mcp_servers = opts.mcp_servers;
+        return {
+          usage: { input_tokens: 1, output_tokens: 1 },
+          stop_reason: "end_turn",
+          content: []
+        };
+      };
+
+    await exec.execute({
+      id: "tm", type: "planner", systemPrompt: "p", prompt: "u",
+      workingDirectory: dir, budgetSeconds: 30,
+      environment: { QMD_MCP_URL: "http://localhost:8181/mcp" },
+      skillFiles: []
+    });
+
+    expect(captured.mcp_servers).toEqual([
+      { type: "url", url: "http://localhost:8181/mcp", name: "qmd" }
+    ]);
+  });
+
+  test("omits mcp_servers when QMD_MCP_URL is unset", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-nomcp-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const captured: { mcp_servers?: unknown } = {};
+    const exec = new AnthropicSdkExecutor("test-key", "sonnet");
+    (exec as unknown as { _testCreate?: (opts: { mcp_servers?: unknown }) => Promise<unknown> })
+      ._testCreate = async (opts) => {
+        captured.mcp_servers = opts.mcp_servers;
+        return { usage: { input_tokens: 1, output_tokens: 1 }, stop_reason: "end_turn", content: [] };
+      };
+
+    await exec.execute({
+      id: "tm2", type: "planner", systemPrompt: "p", prompt: "u",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(captured.mcp_servers).toBeUndefined();
+  });
+});

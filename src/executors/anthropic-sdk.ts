@@ -280,11 +280,16 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           messages.push(...first, ...recent);
         }
 
+        const mcpServers = task.environment.QMD_MCP_URL
+          ? [{ type: "url" as const, url: task.environment.QMD_MCP_URL, name: "qmd" }]
+          : undefined;
+
         const callOpts = {
           model: task.model ?? this.model,
           max_tokens: 8192,
           system: systemPrompt,
           tools: TOOLS,
+          ...(mcpServers ? { mcp_servers: mcpServers } : {}),
           messages
         };
 
@@ -294,7 +299,8 @@ export class AnthropicSdkExecutor implements AgentExecutor {
             response = (await this._testCreate(callOpts)) as Anthropic.Message;
           } else {
             response = await client.messages.create(
-              callOpts,
+              // mcp_servers is supported by the Anthropic API but not always in the SDK's typed params.
+              callOpts as unknown as Anthropic.MessageCreateParamsNonStreaming,
               {
                 timeout: Math.min(PER_CALL_TIMEOUT_MS, remainingMs),
                 signal: AbortSignal.timeout(Math.min(PER_CALL_TIMEOUT_MS, remainingMs))
