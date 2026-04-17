@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
+import type { AgentExecutor, AgentResult, AgentTask, AgentTranscriptTurn } from "./interface";
 
 const STATUS_FILE = ".autoforge-status.json";
 const MAX_TOOL_ITERATIONS = 50;
@@ -244,6 +244,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
     const messages: Anthropic.MessageParam[] = [
       { role: "user", content: task.prompt }
     ];
+    const turns: AgentTranscriptTurn[] = [];
 
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
@@ -271,6 +272,8 @@ export class AnthropicSdkExecutor implements AgentExecutor {
 
         // Context window management: compress after 20 iterations to prevent bloat.
         if (iteration === 20 && messages.length > 14) {
+          const droppedTurns = messages.length - 13;
+          turns.push({ kind: "compaction", droppedTurns });
           const first = messages.slice(0, 1);
           const recent = messages.slice(-12);
           messages.length = 0;
@@ -317,6 +320,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
         totalOutputTokens += response.usage.output_tokens;
 
         messages.push({ role: "assistant", content: response.content });
+        turns.push({ kind: "assistant", content: response.content });
 
         if (response.stop_reason === "end_turn") {
           break;
@@ -339,6 +343,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
               tool_use_id: block.id,
               content: result
             });
+            turns.push({ kind: "tool_result", toolUseId: block.id, content: result });
           }
 
           messages.push({ role: "user", content: toolResults });
@@ -355,6 +360,11 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           tokenInput: totalInputTokens,
           tokenOutput: totalOutputTokens,
           toolStats: { ...stats, iterations: MAX_TOOL_ITERATIONS }
+        },
+        transcript: {
+          systemPrompt,
+          userPrompt: task.prompt,
+          turns
         }
       };
     }
@@ -371,6 +381,11 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           tokenInput: totalInputTokens,
           tokenOutput: totalOutputTokens,
           toolStats: { ...stats, iterations: totalIterations }
+        },
+        transcript: {
+          systemPrompt,
+          userPrompt: task.prompt,
+          turns
         }
       };
     }
@@ -386,6 +401,11 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           tokenInput: totalInputTokens,
           tokenOutput: totalOutputTokens,
           toolStats: { ...stats, iterations: totalIterations }
+        },
+        transcript: {
+          systemPrompt,
+          userPrompt: task.prompt,
+          turns
         }
       };
     }
@@ -401,6 +421,11 @@ export class AnthropicSdkExecutor implements AgentExecutor {
         tokenInput: totalInputTokens,
         tokenOutput: totalOutputTokens,
         toolStats: { ...stats, iterations: totalIterations }
+      },
+      transcript: {
+        systemPrompt,
+        userPrompt: task.prompt,
+        turns
       }
     };
   }
