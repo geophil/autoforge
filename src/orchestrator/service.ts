@@ -222,6 +222,41 @@ export class OrchestratorService {
     ].join("\n\n");
   }
 
+  async approvePlan(taskId: string): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    if (task.state !== "awaiting_plan_approval") {
+      throw new Error(`Cannot approve plan: task is in state '${task.state}'`);
+    }
+
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "plan_approved",
+      status: "done",
+      payload: { state: "executing" },
+      budgetSeconds: 60
+    });
+
+    this.transition(taskId, task.projectId, "awaiting_plan_approval", "executing", {});
+
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (!worktreePath) throw new Error(`Worktree missing for task ${taskId}`);
+    const branch = `autoforge/${taskId}`;
+
+    try {
+      await this.executeAndReview(
+        taskId, task.projectId, task.description, task.tier,
+        task.planSubtasks, 0, worktreePath, branch
+      );
+    } catch (err) {
+      this.cleanupWorktree(taskId);
+      throw err;
+    }
+
+    return this.requireTask(taskId);
+  }
+
   async approveTask(taskId: string): Promise<PipelineTask> {
     const task = this.requireTask(taskId);
     if (task.state !== "awaiting_approval") {

@@ -15,3 +15,21 @@ describe("plan-review pause", () => {
     expect(task.state).toBe("awaiting_approval");
   });
 });
+
+describe("approvePlan", () => {
+  test("approves plan and runs to awaiting_approval", async () => {
+    const { service } = createTestService();
+    const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
+    expect(task.state).toBe("awaiting_plan_approval");
+
+    const resumed = await service.approvePlan(task.id);
+    expect(resumed.state).toBe("awaiting_approval");
+  });
+
+  test("rejects approve when task is not in awaiting_plan_approval", async () => {
+    const { service } = createTestService();
+    const task = await service.submitTask("autoforge", "x", { reviewPlan: false });
+    expect(task.state).toBe("awaiting_approval");
+    await expect(service.approvePlan(task.id)).rejects.toThrow();
+  });
+});
