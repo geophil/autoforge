@@ -772,42 +772,162 @@ async function openTranscript(transcriptId) {
 }
 window.openTranscript = openTranscript;
 
+// Map tool names to visual icons for the transcript viewer
+const TOOL_ICONS = {
+  read_file: "📄",
+  write_file: "✏️",
+  list_directory: "📁",
+  search_files: "🔍",
+  read_multiple_files: "📑",
+  bash: "▶",
+};
+function toolIcon(name) { return TOOL_ICONS[name] || "🔧"; }
+
+// Short preview of a tool_use argument set — first meaningful field value
+function toolInputPreview(input) {
+  if (!input || typeof input !== "object") return "";
+  const key = input.path ?? input.command ?? input.pattern ?? input.paths ?? "";
+  const str = typeof key === "string" ? key : JSON.stringify(key);
+  return str.length > 80 ? str.slice(0, 77) + "…" : str;
+}
+
+// First N lines of tool_result content for the <summary>
+function contentPreview(content, lines = 1) {
+  const head = String(content ?? "").split("\n").slice(0, lines).join(" ↵ ");
+  return head.length > 120 ? head.slice(0, 117) + "…" : head;
+}
+
+let transcriptFilter = "";
+
+function copyBtn(value, label = "copy") {
+  // Use a global helper wired below via window.copyToClipboard
+  return `<button class="copy-btn" onclick="copyToClipboard(this, ${JSON.stringify(value).replace(/"/g, "&quot;")})">${label}</button>`;
+}
+
+window.copyToClipboard = async (btn, text) => {
+  try {
+    await navigator.clipboard.writeText(text);
+    const original = btn.textContent;
+    btn.textContent = "copied ✓";
+    btn.classList.add("copied");
+    setTimeout(() => { btn.textContent = original; btn.classList.remove("copied"); }, 1500);
+  } catch {
+    toast("Copy failed.", "error");
+  }
+};
+
 function renderTranscriptTab() {
   if (!currentTranscript) return;
   if (currentTab === "system") {
-    transcriptPane.innerHTML = `<pre class="prompt-block">${esc(currentTranscript.systemPrompt)}</pre>`;
+    transcriptPane.innerHTML = `
+      <div class="pane-toolbar">${copyBtn(currentTranscript.systemPrompt, "Copy system prompt")}</div>
+      <pre class="prompt-block">${esc(currentTranscript.systemPrompt)}</pre>`;
   } else if (currentTab === "user") {
-    transcriptPane.innerHTML = `<pre class="prompt-block">${esc(currentTranscript.userPrompt)}</pre>`;
-    if (currentTranscript.critique) {
-      transcriptPane.innerHTML += `<div class="critique-block"><strong>Critique that triggered this attempt:</strong><br>${esc(currentTranscript.critique)}</div>`;
-    }
+    const critiquePart = currentTranscript.critique
+      ? `<div class="critique-block"><strong>Critique that triggered this attempt:</strong><br>${esc(currentTranscript.critique)}</div>`
+      : "";
+    transcriptPane.innerHTML = `
+      <div class="pane-toolbar">${copyBtn(currentTranscript.userPrompt, "Copy user prompt")}</div>
+      <pre class="prompt-block">${esc(currentTranscript.userPrompt)}</pre>
+      ${critiquePart}`;
   } else if (currentTab === "transcript") {
-    const lines = (currentTranscript.transcript || "").split("\n").filter(Boolean);
-    if (lines.length === 0) {
-      transcriptPane.innerHTML = `<div class="empty-state">No transcript captured (executor did not emit turns).</div>`;
-      return;
-    }
-    transcriptPane.innerHTML = lines.map((line) => {
-      let turn;
-      try { turn = JSON.parse(line); } catch { return ""; }
-      if (turn.kind === "compaction") {
-        return `<div class="turn-compaction">— history compacted (${turn.droppedTurns} turns dropped) —</div>`;
-      }
-      if (turn.kind === "tool_result") {
-        return `<details class="turn turn-tool-result"><summary>tool_result <code>${esc(turn.toolUseId)}</code></summary><pre>${esc(turn.content)}</pre></details>`;
-      }
-      const blocks = (turn.content || []).map((b) => {
-        if (b.type === "text") return `<div class="block-text">${esc(b.text)}</div>`;
-        if (b.type === "tool_use") return `<details class="turn turn-tool-use"><summary>tool_use <strong>${esc(b.name)}</strong></summary><pre>${esc(JSON.stringify(b.input, null, 2))}</pre></details>`;
-        if (b.type === "mcp_tool_use") return `<details class="turn turn-mcp"><summary><span class="mcp-badge">qmd</span> ${esc(b.name)}</summary><pre>${esc(JSON.stringify(b.input ?? {}, null, 2))}</pre></details>`;
-        return `<div class="block-other">${esc(JSON.stringify(b))}</div>`;
-      }).join("");
-      return `<div class="turn turn-assistant">${blocks}</div>`;
-    }).join("");
+    renderTranscriptTurns();
   } else if (currentTab === "output") {
     let output;
     try { output = JSON.parse(currentTranscript.output ?? "null"); } catch { output = currentTranscript.output; }
-    transcriptPane.innerHTML = `<pre class="output-block">${esc(JSON.stringify(output, null, 2))}</pre>`;
+    const pretty = JSON.stringify(output, null, 2);
+    transcriptPane.innerHTML = `
+      <div class="pane-toolbar">${copyBtn(pretty, "Copy output")}</div>
+      <pre class="output-block">${esc(pretty)}</pre>`;
+  }
+}
+
+function renderTranscriptTurns() {
+  const lines = (currentTranscript.transcript || "").split("\n").filter(Boolean);
+  if (lines.length === 0) {
+    transcriptPane.innerHTML = `<div class="empty-state">No transcript captured (executor did not emit turns).</div>`;
+    return;
+  }
+
+  const f = transcriptFilter.trim().toLowerCase();
+  const matches = (hay) => !f || String(hay).toLowerCase().includes(f);
+
+  const rendered = lines.map((line) => {
+    let turn;
+    try { turn = JSON.parse(line); } catch { return ""; }
+
+    if (turn.kind === "compaction") {
+      const show = !f; // compaction markers only shown when no filter
+      return show ? `<div class="turn-compaction">— history compacted (${turn.droppedTurns} turns dropped) —</div>` : "";
+    }
+
+    if (turn.kind === "tool_result") {
+      const preview = contentPreview(turn.content);
+      if (!matches(turn.content) && !matches(turn.toolUseId)) return "";
+      return `<details class="turn turn-tool-result">
+        <summary><span class="turn-icon">⤴</span> <strong>tool_result</strong> <code>${esc(turn.toolUseId)}</code>
+          <span class="turn-preview">${esc(preview)}</span>
+          ${copyBtn(String(turn.content ?? ""))}
+        </summary>
+        <pre>${esc(turn.content)}</pre>
+      </details>`;
+    }
+
+    // assistant turn
+    const blocks = (turn.content || []).map((b) => {
+      if (b.type === "text") {
+        if (!matches(b.text)) return "";
+        return `<div class="block-text">${esc(b.text)}</div>`;
+      }
+      if (b.type === "tool_use") {
+        const preview = toolInputPreview(b.input);
+        if (!matches(b.name) && !matches(preview) && !matches(JSON.stringify(b.input))) return "";
+        const args = JSON.stringify(b.input, null, 2);
+        return `<details class="turn turn-tool-use">
+          <summary><span class="turn-icon">${toolIcon(b.name)}</span> <strong>${esc(b.name)}</strong>
+            <span class="turn-preview">${esc(preview)}</span>
+            ${copyBtn(args)}
+          </summary>
+          <pre>${esc(args)}</pre>
+        </details>`;
+      }
+      if (b.type === "mcp_tool_use") {
+        const preview = toolInputPreview(b.input);
+        if (!matches(b.name) && !matches(preview)) return "";
+        const args = JSON.stringify(b.input ?? {}, null, 2);
+        return `<details class="turn turn-mcp">
+          <summary><span class="mcp-badge">qmd</span> <strong>${esc(b.name)}</strong>
+            <span class="turn-preview">${esc(preview)}</span>
+            ${copyBtn(args)}
+          </summary>
+          <pre>${esc(args)}</pre>
+        </details>`;
+      }
+      return `<div class="block-other">${esc(JSON.stringify(b))}</div>`;
+    }).filter(Boolean).join("");
+
+    return blocks ? `<div class="turn turn-assistant">${blocks}</div>` : "";
+  }).filter(Boolean).join("");
+
+  transcriptPane.innerHTML = `
+    <div class="pane-toolbar">
+      <input type="search" id="transcript-filter" class="transcript-filter"
+        placeholder="Filter turns…" value="${esc(transcriptFilter)}" autocomplete="off" />
+      <span class="transcript-filter-count">${lines.length} turn${lines.length !== 1 ? "s" : ""}</span>
+    </div>
+    <div id="transcript-turns">${rendered || `<div class="empty-state">No turns match the filter.</div>`}</div>
+  `;
+
+  const filterInput = document.getElementById("transcript-filter");
+  if (filterInput) {
+    filterInput.addEventListener("input", (e) => {
+      transcriptFilter = e.target.value;
+      // Re-render turns only (preserve focus on the input)
+      const sel = filterInput.selectionStart;
+      renderTranscriptTurns();
+      const again = document.getElementById("transcript-filter");
+      if (again) { again.focus(); again.setSelectionRange(sel, sel); }
+    });
   }
 }
 

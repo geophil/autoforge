@@ -947,3 +947,71 @@ dialog textarea:focus {
   color: var(--red);
   font-weight: 600;
 }
+
+/* Transcript viewer polish */
+.pane-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.25rem 0 0.5rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+}
+.copy-btn {
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  padding: 0.2rem 0.55rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.copy-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+.copy-btn.copied {
+  background: var(--green);
+  color: var(--bg);
+  border-color: var(--green);
+}
+.transcript-filter {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.3rem 0.5rem;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+.transcript-filter-count {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.turn-icon {
+  display: inline-block;
+  width: 1.2em;
+  text-align: center;
+  opacity: 0.85;
+}
+.turn-preview {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.8rem;
+  margin-left: 0.4rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.turn details summary {
+  cursor: pointer;
+  padding: 0.25rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.turn details summary .copy-btn {
+  margin-left: auto;
+}
