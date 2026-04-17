@@ -141,15 +141,48 @@ function renderTaskDetail(task) {
     const maxAttempts = plannerMaxIterations + 1;
     const planNum = attemptCount + 1;
     const reviseDisabled = attemptCount >= (maxAttempts - 1);
-    const latestTranscript = (task.transcripts ?? []).slice(-1)[0];
+    const transcripts = task.transcripts ?? [];
+    const latestTranscript = transcripts.slice(-1)[0];
     const viewLink = latestTranscript
       ? `<a href="#" onclick="openTranscript('${latestTranscript.id}'); return false;" class="view-transcript-link">View transcript →</a>`
       : "";
+
+    // Attempt stepper: one dot per attempt (so far), clickable to open that attempt's transcript
+    const stepper = transcripts.map((t, idx) => `
+      <button class="step-dot ${idx === transcripts.length - 1 ? "current" : ""}"
+        onclick="openTranscript('${t.id}')"
+        title="View transcript for plan #${idx + 1}">
+        ${idx + 1}
+      </button>
+    `).join("");
+    // Fill remaining dots up to maxAttempts as disabled "future" slots
+    const futureDots = Array.from({ length: maxAttempts - transcripts.length }, (_, i) => `
+      <span class="step-dot future" title="Plan #${transcripts.length + i + 1} (not attempted)">${transcripts.length + i + 1}</span>
+    `).join("");
+
+    // Prior critique callout — show the critique that triggered this attempt (if any)
+    const priorCritique = latestTranscript?.critique;
+    const critiqueCallout = priorCritique
+      ? `<div class="prior-critique">
+          <div class="prior-critique-label">Your critique from plan #${planNum - 1}:</div>
+          <div class="prior-critique-body">${esc(priorCritique)}</div>
+        </div>`
+      : "";
+
     actionsHtml = `
       <div class="task-detail-actions plan-review">
-        <h3 class="plan-review-title">Plan Review — plan #${planNum} of ${maxAttempts} ${viewLink}</h3>
-        <textarea id="critique-input" class="critique-input" rows="4"
-          placeholder="Optional: leave a natural-language critique to revise the plan."></textarea>
+        <div class="plan-review-header">
+          <h3 class="plan-review-title">Plan Review — plan #${planNum} of ${maxAttempts}</h3>
+          ${viewLink}
+        </div>
+        <div class="plan-review-stepper">${stepper}${futureDots}</div>
+        ${critiqueCallout}
+        <div class="critique-wrapper">
+          <textarea id="critique-input" class="critique-input" rows="4"
+            placeholder="Optional: leave a natural-language critique to revise the plan. Cmd/Ctrl+Enter to submit."
+            maxlength="4000"></textarea>
+          <div class="critique-counter" id="critique-counter">0 / 4000</div>
+        </div>
         <div class="plan-review-buttons">
           <button class="btn btn-approve" onclick="approvePlan('${task.id}')">Approve &amp; Continue</button>
           <button class="btn btn-secondary" id="btn-critique"
@@ -239,7 +272,31 @@ function renderTaskDetail(task) {
     </div>
   `;
 
+  wireCritiqueInput(task);
   loadEvents(task.id);
+}
+
+function wireCritiqueInput(task) {
+  const input = document.getElementById("critique-input");
+  const counter = document.getElementById("critique-counter");
+  if (!input || !counter) return;
+
+  const update = () => {
+    const len = input.value.length;
+    counter.textContent = `${len} / 4000`;
+    counter.classList.toggle("at-limit", len >= 4000);
+  };
+  input.addEventListener("input", update);
+  update();
+
+  // Cmd/Ctrl+Enter submits the critique
+  input.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      const btn = document.getElementById("btn-critique");
+      if (btn && !btn.disabled) critiquePlan(task.id);
+    }
+  });
 }
 
 // Per-token pricing (Claude Sonnet-class): $3/1M input, $15/1M output
