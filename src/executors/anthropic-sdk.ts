@@ -213,6 +213,24 @@ function listRecursive(absPath: string, rootCwd: string, depth: number, maxDepth
 export class AnthropicSdkExecutor implements AgentExecutor {
   readonly name = "anthropic-sdk";
 
+  /**
+   * Test hook: when set, used instead of constructing an Anthropic client.
+   * Production code never sets this. Wired to support unit testing without
+   * stubbing the entire SDK module.
+   */
+  private _testCreate?: (opts: {
+    model: string;
+    max_tokens: number;
+    system: string;
+    tools: unknown[];
+    mcp_servers?: unknown;
+    messages: unknown[];
+  }) => Promise<{
+    usage: { input_tokens: number; output_tokens: number };
+    stop_reason: string;
+    content: unknown[];
+  }>;
+
   constructor(
     private readonly apiKey: string,
     private readonly model: string
@@ -259,21 +277,27 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           messages.push(...first, ...recent);
         }
 
+        const callOpts = {
+          model: task.model ?? this.model,
+          max_tokens: 8192,
+          system: systemPrompt,
+          tools: TOOLS,
+          messages
+        };
+
         let response: Anthropic.Message;
         try {
-          response = await client.messages.create(
-            {
-              model: this.model,
-              max_tokens: 8192,
-              system: systemPrompt,
-              tools: TOOLS,
-              messages
-            },
-            {
-              timeout: Math.min(PER_CALL_TIMEOUT_MS, remainingMs),
-              signal: AbortSignal.timeout(Math.min(PER_CALL_TIMEOUT_MS, remainingMs))
-            }
-          );
+          if (this._testCreate) {
+            response = (await this._testCreate(callOpts)) as Anthropic.Message;
+          } else {
+            response = await client.messages.create(
+              callOpts,
+              {
+                timeout: Math.min(PER_CALL_TIMEOUT_MS, remainingMs),
+                signal: AbortSignal.timeout(Math.min(PER_CALL_TIMEOUT_MS, remainingMs))
+              }
+            );
+          }
         } catch (callErr) {
           // Treat any per-call timeout/abort as overall budget exhaustion.
           if (
