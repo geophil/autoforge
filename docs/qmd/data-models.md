@@ -141,6 +141,18 @@ Severity decision points:
 - **CRITICAL / MAJOR** → triggers rework loop
 - **MINOR / NITPICK** → recorded but do not block PR creation
 
+## SubtaskReportStatus
+
+**Owned by**: `domain-task-orchestration.md`
+**Storage**: `subtasks.status` column
+
+```typescript
+// src/types/core.ts
+export type SubtaskReportStatus = "DONE" | "DONE_WITH_CONCERNS" | "BLOCKED" | "NEEDS_CONTEXT";
+```
+
+Returned by implementer agents in `.autoforge-status.json`. The orchestrator uses `isSuccess()` to decide whether to advance the pipeline or halt.
+
 ## AutoforgeMessage (Event)
 
 **Owned by**: `domain-event-sourcing.md`
@@ -195,6 +207,30 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 ```
 
+## RejectionFeedback
+
+**Owned by**: `domain-web-api.md`
+**Storage**: passed directly to `OrchestratorService.rejectTask()`; not persisted as its own row
+
+```typescript
+// src/types/core.ts
+export type RejectionCategory =
+  | "stale_base"
+  | "wrong_scope"
+  | "incomplete"
+  | "incorrect_output"
+  | "quality_issues"
+  | "other";
+
+export interface RejectionFeedback {
+  reason: string;
+  guidance?: string;
+  categories?: RejectionCategory[];
+}
+```
+
+`reason` is required (non-empty). `guidance` is free-form operator advice forwarded to the restarted task. `categories` allows structured tagging of why the output was rejected.
+
 ## Experiment (Meta-Loop)
 
 **Owned by**: (planned meta-loop domain)
@@ -235,14 +271,90 @@ CREATE TABLE IF NOT EXISTS skill_versions (
 );
 ```
 
+## RoutingCalibration
+
+**Owned by**: `domain-complexity-routing.md`
+**Storage**: `routing_calibration` table
+
+Hindsight assessment of whether the tier assigned to a task was appropriate. Written by the orchestrator after a task completes or fails.
+
+```sql
+CREATE TABLE IF NOT EXISTS routing_calibration (
+  id               TEXT PRIMARY KEY,
+  task_id          TEXT NOT NULL REFERENCES tasks(id),
+  tier_assigned    TEXT NOT NULL,
+  tier_appropriate TEXT,
+  under_tiered     INTEGER,
+  over_tiered      INTEGER,
+  signals          TEXT,
+  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+## Materialized Views
+
+Two read-only views aggregate event and task data for performance analysis. Both are queried by the development workflow (see `development-workflow.md`).
+
+### task_outcomes
+
+Per-task summary of token cost, timing, findings, and whether the task passed on the first attempt.
+
+```sql
+CREATE VIEW IF NOT EXISTS task_outcomes AS
+SELECT
+  t.id                  AS task_id,
+  t.project_id,
+  t.tier,
+  t.state               AS final_state,
+  t.iteration           AS iterations,
+  SUM(e.token_input)    AS total_tokens_in,
+  SUM(e.token_output)   AS total_tokens_out,
+  SUM(e.estimated_cost) AS total_cost,
+  SUM(e.elapsed_seconds) AS total_elapsed,
+  (SELECT COUNT(*) FROM review_findings rf WHERE rf.task_id = t.id) AS finding_count,
+  (SELECT COUNT(*) FROM review_findings rf WHERE rf.task_id = t.id AND rf.severity IN ('CRITICAL','MAJOR')) AS blocking_finding_count,
+  CASE WHEN t.iteration = 0 AND t.state = 'completed' THEN 1 ELSE 0 END AS first_pass_success,
+  t.created_at
+FROM tasks t
+LEFT JOIN events e ON e.task_id = t.id AND e.agent != 'orchestrator'
+WHERE t.state IN ('completed', 'failed')
+GROUP BY t.id;
+```
+
+### agent_performance
+
+Performance breakdown by persona version and agent type. Answers: which persona version produces the best first-pass rate?
+
+```sql
+CREATE VIEW IF NOT EXISTS agent_performance AS
+SELECT
+  json_extract(e.payload, '$.persona_version_id') AS persona_version_id,
+  sv.skill_name                                    AS persona_name,
+  e.agent                                          AS agent_type,
+  COUNT(DISTINCT t.id)                             AS task_count,
+  AVG(CASE WHEN t.iteration = 0 AND t.state = 'completed' THEN 1.0 ELSE 0.0 END) AS first_pass_rate,
+  AVG(t.iteration)                                 AS avg_iterations,
+  AVG(e.estimated_cost)                            AS avg_step_cost
+FROM events e
+JOIN tasks t ON t.id = e.task_id
+LEFT JOIN skill_versions sv ON sv.id = json_extract(e.payload, '$.persona_version_id')
+WHERE e.agent IN ('planner', 'coder', 'reviewer', 'doc')
+  AND t.state IN ('completed', 'failed')
+  AND json_extract(e.payload, '$.persona_version_id') IS NOT NULL
+GROUP BY json_extract(e.payload, '$.persona_version_id'), e.agent;
+```
+
 ## Entity Relationship Summary
 
 ```
-projects (1) ──< tasks (N)
-tasks    (1) ──< subtasks (N)
-tasks    (1) ──< review_findings (N)
-tasks    (1) ──< events (N)
-experiments (1) ──< skill_versions (N)
+projects             (1) ──< tasks (N)
+tasks                (1) ──< subtasks (N)
+tasks                (1) ──< review_findings (N)
+tasks                (1) ──< events (N)
+tasks                (1) ──< routing_calibration (N)
+experiments          (1) ──< skill_versions (N)
+task_outcomes        — view over tasks + events + review_findings
+agent_performance    — view over events + tasks + skill_versions
 ```
 
 Tasks are the central entity. Every other table references `task_id`. Events are the authoritative record; `tasks`, `subtasks`, and `review_findings` are materialized projections rebuilt by replaying events.

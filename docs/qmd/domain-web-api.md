@@ -18,14 +18,21 @@ const CreateTaskSchema = z.object({
 
 **Enforced in**: `src/web/routes/tasks.ts:6`
 
-### Rejection Requires a Reason
+### Rejection Requires a Reason and Supports Structured Feedback
 
-The reject endpoint has a Zod schema with a non-empty `reason` field, defaulting to `"Rejected by human reviewer."` if not provided.
+The reject endpoint validates a non-empty `reason` string (required, no default) plus optional `guidance` text and structured `categories` for operator feedback.
 
 ```typescript
 // src/web/routes/approvals.ts
+const RejectionCategoryEnum = z.enum([
+  "stale_base", "wrong_scope", "incomplete",
+  "incorrect_output", "quality_issues", "other"
+]);
+
 const RejectSchema = z.object({
-  reason: z.string().min(1).default("Rejected by human reviewer.")
+  reason: z.string().min(1),
+  guidance: z.string().optional(),
+  categories: z.array(RejectionCategoryEnum).optional()
 });
 ```
 
@@ -72,13 +79,14 @@ publish(event: { type: string; data: unknown }): void {
 | `GET`  | `/api/tasks/:id` | `tasks.ts` | Get single task |
 | `GET`  | `/api/tasks/:id/events` | `tasks.ts` | Task event log (ordered by timestamp) |
 | `POST` | `/api/tasks/:id/approve` | `approvals.ts` | Approve awaiting task |
-| `POST` | `/api/tasks/:id/reject` | `approvals.ts` | Reject awaiting task with reason |
+| `POST` | `/api/tasks/:id/reject` | `approvals.ts` | Reject awaiting task with reason; response body is the **new restart task**, not the original |
 | `POST` | `/api/tasks/:id/cancel` | `approvals.ts` | Cancel a task (operator action) |
 | `POST` | `/api/meta` | `meta.ts` | Trigger meta-loop analysis; returns `experimentId` |
 | `POST` | `/api/meta/:experimentId/conclude` | `meta.ts` | Conclude experiment (keep or revert) |
 | `GET`  | `/api/metrics/:projectId` | `metrics.ts` | Project metrics (total/completed tasks, unresolved findings) |
 | `GET`  | `/api/metrics/:projectId/trends` | `metrics.ts` | Trend data (stub, returns empty points) |
 | `GET`  | `/api/events` | `server.ts` | SSE stream for live updates |
+| `GET`  | `/static/*` | `server.ts` | Static asset serving (`src/web/public/`) |
 
 ## Core Flows
 
