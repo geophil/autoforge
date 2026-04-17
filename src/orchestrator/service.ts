@@ -479,7 +479,12 @@ export class OrchestratorService {
    * threshold and auto-fail them with a failure_analysis event.
    */
   sweepStaleTasks(): void {
-    const nonTerminalStates = ["received", "assessing", "planning", "executing", "reviewing", "reworking", "pr_created", "documenting"];
+    const nonTerminalStates = [
+      "received", "assessing", "planning", "replanning",
+      "executing", "reviewing", "reworking", "pr_created", "documenting"
+      // 'awaiting_plan_approval' and 'awaiting_approval' are intentionally excluded
+      // — both are human gates with no in-flight work and no staleness deadline.
+    ];
     const thresholdsByTier: Record<string, number> = {
       EXPRESS: 20 * 60 * 1000,
       STANDARD: 40 * 60 * 1000,
