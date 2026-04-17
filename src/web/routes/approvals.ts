@@ -54,9 +54,17 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
   });
 
   app.post("/:id/approve-plan", async (ctx) => {
-    const task = await service.approvePlan(ctx.req.param("id"));
-    events.publish({ type: "task.updated", data: task });
-    return ctx.json(task);
+    try {
+      const task = await service.approvePlan(ctx.req.param("id"));
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot approve plan:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      throw err;
+    }
   });
 
   app.post("/:id/critique-plan", async (ctx) => {
@@ -72,7 +80,14 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
       return ctx.json(task);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("limit")) return ctx.json({ error: "iteration_limit_reached", message: msg }, 409);
+      // Match the orchestrator's specific iteration-limit phrasing to avoid
+      // false positives from unrelated "limit" words (e.g. "rate limit").
+      if (msg.includes("iteration limit")) {
+        return ctx.json({ error: "iteration_limit_reached", message: msg }, 409);
+      }
+      if (msg.startsWith("Cannot critique plan:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
       return ctx.json({ error: "critique_failed", message: msg }, 400);
     }
   });
