@@ -5,6 +5,8 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DbClient } from "../../src/db/client";
 import type { AgentTranscriptRow } from "../../src/types/transcripts";
+import { Hono } from "hono";
+import { createTranscriptsRoutes } from "../../src/web/routes/transcripts";
 
 function freshDb(): DbClient {
   const dir = mkdtempSync(join(tmpdir(), "transcripts-test-"));
@@ -121,5 +123,28 @@ describe("DbClient transcripts methods", () => {
       transcript: "", output: null, critique: null,
       tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
     })).toThrow();
+  });
+});
+
+describe("transcripts API", () => {
+  test("GET /api/transcripts/by-task/:taskId returns metadata", async () => {
+    const db = freshDb();
+    db.sqlite.query(
+      "INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+    ).run("t-api", "proj", "desc", "planning", "STANDARD", "{}", "[]", 0, "2026-04-16T00:00:00Z", "2026-04-16T00:00:00Z");
+    db.insertTranscript({
+      taskId: "t-api", stage: "planner", attempt: 0,
+      executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
+      transcript: "", output: null, critique: null,
+      tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
+    });
+
+    const app = new Hono();
+    app.route("/api/transcripts", createTranscriptsRoutes(db));
+    const res = await app.request("/api/transcripts/by-task/t-api");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0].attempt).toBe(0);
   });
 });

@@ -6,7 +6,8 @@ import type { DbClient } from "../../db/client";
 
 const CreateTaskSchema = z.object({
   projectId: z.string().min(1),
-  description: z.string().min(1)
+  description: z.string().min(1),
+  reviewPlan: z.boolean().optional()
 });
 
 export function createTaskRoutes(service: OrchestratorService, events: LiveEventHub, db: DbClient): Hono {
@@ -14,7 +15,9 @@ export function createTaskRoutes(service: OrchestratorService, events: LiveEvent
 
   app.post("/", async (ctx) => {
     const body = CreateTaskSchema.parse(await ctx.req.json());
-    const task = await service.submitTask(body.projectId, body.description);
+    const task = await service.submitTask(body.projectId, body.description, {
+      reviewPlan: body.reviewPlan
+    });
     events.publish({ type: "task.updated", data: task });
     return ctx.json(task, 201);
   });
