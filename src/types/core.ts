@@ -16,6 +16,8 @@ export type TaskStage =
   | "received"
   | "assessing"
   | "planning"
+  | "awaiting_plan_approval"
+  | "replanning"
   | "executing"
   | "reviewing"
   | "reworking"
