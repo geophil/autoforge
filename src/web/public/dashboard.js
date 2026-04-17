@@ -109,12 +109,18 @@ function renderTaskList() {
 // --- Task Detail ---
 async function refreshTaskDetail(taskId) {
   try {
-    const res = await fetch(`${API}/api/tasks/${taskId}`);
-    if (!res.ok) {
+    const [taskRes, transcriptsRes] = await Promise.all([
+      fetch(`${API}/api/tasks/${taskId}`),
+      fetch(`${API}/api/transcripts/by-task/${taskId}`)
+    ]);
+    if (!taskRes.ok) {
       detailContent.innerHTML = `<div class="empty-state">Task not found.</div>`;
       return;
     }
-    const task = await res.json();
+    const task = await taskRes.json();
+    const transcripts = transcriptsRes.ok ? await transcriptsRes.json() : [];
+    task.planAttempt = transcripts.length === 0 ? 0 : Math.max(...transcripts.map((t) => t.attempt));
+    task.transcripts = transcripts;
     renderTaskDetail(task);
   } catch {
     detailContent.innerHTML = `<div class="empty-state">Failed to load task.</div>`;
@@ -126,9 +132,28 @@ function renderTaskDetail(task) {
   const subtasks = task.planSubtasks || [];
 
   const terminalStates = ["completed", "failed"];
-  const nonTerminalStates = ["received", "assessing", "planning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting"];
+  const nonTerminalStates = ["received", "assessing", "planning", "awaiting_plan_approval", "replanning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting"];
   let actionsHtml = "";
-  if (task.state === "awaiting_approval") {
+  if (task.state === "awaiting_plan_approval") {
+    const attemptCount = task.planAttempt ?? 0;
+    const maxAttempts = (window.PLANNER_MAX_ITERATIONS ?? 3) + 1;
+    const planNum = attemptCount + 1;
+    const reviseDisabled = attemptCount >= (maxAttempts - 1);
+    actionsHtml = `
+      <div class="task-detail-actions plan-review">
+        <h3 class="plan-review-title">Plan Review — plan #${planNum} of ${maxAttempts}</h3>
+        <textarea id="critique-input" class="critique-input" rows="4"
+          placeholder="Optional: leave a natural-language critique to revise the plan."></textarea>
+        <div class="plan-review-buttons">
+          <button class="btn btn-approve" onclick="approvePlan('${task.id}')">Approve &amp; Continue</button>
+          <button class="btn btn-secondary" id="btn-critique"
+            onclick="critiquePlan('${task.id}')" ${reviseDisabled ? "disabled" : ""}>
+            Revise Plan${reviseDisabled ? " (limit reached)" : ""}
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel</button>
+        </div>
+      </div>`;
+  } else if (task.state === "awaiting_approval") {
     actionsHtml = `
       <div class="task-detail-actions">
         <button class="btn btn-approve" onclick="approveTask('${task.id}')">Approve &amp; Merge</button>
@@ -187,9 +212,16 @@ function renderTaskDetail(task) {
       <h3>Plan (${subtasks.length} subtask${subtasks.length !== 1 ? "s" : ""})</h3>
       ${subtasks.map((s) => `
         <div class="subtask-item">
-          <span class="subtask-seq">#${s.sequence}</span>
-          ${esc(s.description)}
-          ${s.filesInScope?.length ? `<div class="subtask-files">${s.filesInScope.join(", ")}</div>` : ""}
+          <div class="subtask-header">
+            <span class="subtask-seq">#${s.sequence}</span>
+            <span class="subtask-agent">${esc(s.agentType ?? "coder")}</span>
+            <span class="subtask-desc">${esc(s.description)}</span>
+          </div>
+          ${s.filesInScope?.length ? `<div class="subtask-files">files: ${s.filesInScope.join(", ")}</div>` : ""}
+          ${s.testCriteria?.length ? `<div class="subtask-tests">
+            <div class="subtask-tests-label">Test criteria:</div>
+            <ul>${s.testCriteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
+          </div>` : ""}
         </div>
       `).join("")}
     </div>` : ""}
@@ -396,10 +428,50 @@ async function cancelTask(taskId) {
   }
 }
 
+async function approvePlan(taskId) {
+  try {
+    const res = await fetch(`${API}/api/tasks/${taskId}/approve-plan`, { method: "POST" });
+    if (!res.ok) throw new Error(await res.text());
+    toast("Plan approved — execution starting…", "success");
+    refreshTasks();
+    refreshTaskDetail(taskId);
+  } catch (err) {
+    toast(`Approve plan failed: ${err.message}`, "error");
+  }
+}
+
+async function critiquePlan(taskId) {
+  const input = document.getElementById("critique-input");
+  const critique = (input?.value ?? "").trim();
+  if (!critique) {
+    toast("Please enter a critique to revise the plan.", "error");
+    return;
+  }
+  try {
+    const res = await fetch(`${API}/api/tasks/${taskId}/critique-plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ critique })
+    });
+    if (res.status === 409) {
+      toast("Re-plan limit reached — approve or cancel.", "error");
+      return;
+    }
+    if (!res.ok) throw new Error(await res.text());
+    toast("Critique submitted — re-planning…", "success");
+    refreshTasks();
+    refreshTaskDetail(taskId);
+  } catch (err) {
+    toast(`Critique failed: ${err.message}`, "error");
+  }
+}
+
 // Make actions available from inline onclick handlers
 window.approveTask = approveTask;
 window.rejectTask = rejectTask;
 window.cancelTask = cancelTask;
+window.approvePlan = approvePlan;
+window.critiquePlan = critiquePlan;
 window.openTask = (taskId) => {
   currentTaskId = taskId;
   refreshTaskDetail(taskId);
