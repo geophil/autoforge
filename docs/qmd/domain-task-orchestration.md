@@ -89,11 +89,12 @@ A new task progresses from submission through to a PR awaiting human approval.
 2. **Assessment**: `assessComplexity(description)` assigns scope/novelty/risk/coupling dimensions. `routeTier(assessment)` maps them to EXPRESS/STANDARD/THOROUGH. See `domain-complexity-routing.md`.
 3. **Worktree creation**: A git branch `autoforge/{taskId}` and isolated working directory are created. See `domain-pr-gate.md` > Git Worktree Isolation.
 4. **Initial events**: `created` and `state.assessing`/`state.planning` events are recorded atomically.
-5. **Planner agent**: Executor runs a `planner` type agent; output is parsed into `PlanSubtask[]`.
-6. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, then runs the reviewer (unless EXPRESS). Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
-7. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
-8. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
-9. **State**: Task transitions to `awaiting_approval`.
+5. **Planner agent**: Executor runs a `planner` type agent; output is parsed into `PlanSubtask[]` and the turn-by-turn transcript is persisted to `agent_transcripts` (stage `planner`, attempt 0).
+6. **Plan-review pause** (STANDARD/THOROUGH, or any task submitted with `reviewPlan: true`): task transitions to `awaiting_plan_approval` and awaits human action. On approve, the pipeline resumes at step 7. On critique, the planner re-runs with the prior plan and critique appended (up to `PLANNER_MAX_ITERATIONS` revisions), producing a new `agent_transcripts` row per attempt and returning to `awaiting_plan_approval`. EXPRESS tasks skip this pause and proceed directly to step 7.
+7. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, then runs the reviewer (unless EXPRESS). Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
+8. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
+9. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
+10. **State**: Task transitions to `awaiting_approval`.
 
 **Error paths**:
 - Any coder returning FAILED/TIMEOUT → task transitions to `failed`
@@ -120,16 +121,25 @@ Human rejects via `POST /api/tasks/:id/reject` with a reason.
 ## State Transitions
 
 ```
-received → assessing → planning → executing → reviewing → reworking → executing (...)
-                                                         ↓
-                                                    pr_created → awaiting_approval
-                                                                       ↓         ↓
-                                                                  documenting  reworking
-                                                                       ↓
-                                                                  completed
+received → assessing → planning → awaiting_plan_approval ⇄ replanning
+                                        ↓ (approve)
+                                    executing → reviewing → reworking → executing (...)
+                                                          ↓
+                                                     pr_created → awaiting_approval
+                                                                        ↓         ↓
+                                                                   documenting  reworking
+                                                                        ↓
+                                                                   completed
 ```
 
-Any stage can transition to `failed`. See `domain-event-sourcing.md` for how transitions are persisted.
+EXPRESS-tier tasks and tasks submitted with `reviewPlan: false` skip `awaiting_plan_approval` and transition directly from `planning` to `executing`. Any stage can transition to `failed`. See `domain-event-sourcing.md` for how transitions are persisted.
+
+### Plan-review states
+
+- `awaiting_plan_approval` — Set after the planner completes on STANDARD/THOROUGH tasks (or any task submitted with `reviewPlan: true`). Human gate; no in-flight work; exempt from the staleness sweeper.
+- `replanning` — Transient state during a critique-driven planner re-run. Returns to `awaiting_plan_approval` on success, transitions to `failed` on planner error or when `PLANNER_MAX_ITERATIONS` is exceeded.
+
+The plan attempt counter (0-indexed internally, displayed 1-indexed) is the row count of `agent_transcripts` for the task with `stage = 'planner'`. The cap is configurable via `PLANNER_MAX_ITERATIONS` (default 3 revisions, so up to 4 planner runs total).
 
 ## Decision Points
 
