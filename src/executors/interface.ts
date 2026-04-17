@@ -23,7 +23,7 @@ export interface ToolStats {
 }
 
 export type AgentTranscriptTurn =
-  | { kind: "assistant"; content: unknown }
+  | { kind: "assistant"; content: unknown[] }
   | { kind: "tool_result"; toolUseId: string; content: string }
   | { kind: "compaction"; droppedTurns: number };
 
