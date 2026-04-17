@@ -726,3 +726,58 @@ dialog textarea:focus {
 .subtask-tests { margin-top: 0.4rem; font-size: 0.8rem; color: var(--text-muted); }
 .subtask-tests-label { font-weight: 600; margin-bottom: 0.2rem; }
 .subtask-tests ul { margin: 0; padding-left: 1.2rem; }
+
+/* Transcript drill-down dialog */
+.dialog-wide { max-width: 80vw; width: 80vw; max-height: 85vh; }
+.dialog-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+.transcript-meta { display: flex; gap: 1rem; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+.transcript-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; }
+.tab-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
+.transcript-pane {
+  max-height: 65vh;
+  overflow: auto;
+  font-size: 0.85rem;
+  background: var(--bg);
+  padding: 0.5rem;
+  border-radius: 4px;
+}
+.prompt-block, .output-block {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  margin: 0;
+}
+.critique-block {
+  margin-top: 0.75rem;
+  padding: 0.5rem;
+  background: var(--bg-surface);
+  border-left: 3px solid var(--yellow);
+  border-radius: 3px;
+}
+.turn { margin: 0.4rem 0; }
+.turn-assistant { padding: 0.4rem; background: var(--bg-surface); border-radius: 3px; }
+.turn-tool-result, .turn-tool-use, .turn-mcp { background: var(--bg-surface); padding: 0.3rem 0.5rem; border-radius: 3px; }
+.turn-tool-result pre, .turn-tool-use pre, .turn-mcp pre {
+  white-space: pre-wrap; word-break: break-word; max-height: 30vh; overflow: auto; margin: 0.3rem 0 0 0;
+}
+.turn-compaction { color: var(--text-dim); text-align: center; padding: 0.5rem; font-style: italic; }
+.mcp-badge {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 0.65rem;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  margin-right: 0.3rem;
+}
+.view-transcript-link { color: var(--accent); font-weight: 500; font-size: 0.85rem; margin-left: 0.5rem; }
+.block-text { white-space: pre-wrap; }

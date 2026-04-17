@@ -129,6 +129,21 @@
     </section>
   </main>
 
+  <dialog id="dialog-transcript" class="dialog dialog-wide">
+    <div class="dialog-header">
+      <h2 id="transcript-title">Transcript</h2>
+      <button class="btn btn-ghost btn-sm" id="btn-close-transcript">Close</button>
+    </div>
+    <div class="transcript-meta" id="transcript-meta"></div>
+    <div class="transcript-tabs">
+      <button class="tab-btn active" data-tab="system">System Prompt</button>
+      <button class="tab-btn" data-tab="user">User Prompt</button>
+      <button class="tab-btn" data-tab="transcript">Transcript</button>
+      <button class="tab-btn" data-tab="output">Output</button>
+    </div>
+    <div class="transcript-pane" id="transcript-pane"></div>
+  </dialog>
+
   <script src="/static/dashboard.js"></script>
 </body>
 </html>

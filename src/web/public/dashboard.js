@@ -139,9 +139,13 @@ function renderTaskDetail(task) {
     const maxAttempts = (window.PLANNER_MAX_ITERATIONS ?? 3) + 1;
     const planNum = attemptCount + 1;
     const reviseDisabled = attemptCount >= (maxAttempts - 1);
+    const latestTranscript = (task.transcripts ?? []).slice(-1)[0];
+    const viewLink = latestTranscript
+      ? `<a href="#" onclick="openTranscript('${latestTranscript.id}'); return false;" class="view-transcript-link">View transcript →</a>`
+      : "";
     actionsHtml = `
       <div class="task-detail-actions plan-review">
-        <h3 class="plan-review-title">Plan Review — plan #${planNum} of ${maxAttempts}</h3>
+        <h3 class="plan-review-title">Plan Review — plan #${planNum} of ${maxAttempts} ${viewLink}</h3>
         <textarea id="critique-input" class="critique-input" rows="4"
           placeholder="Optional: leave a natural-language critique to revise the plan."></textarea>
         <div class="plan-review-buttons">
@@ -291,7 +295,10 @@ async function loadEvents(taskId) {
   const costSummary = document.getElementById("cost-summary");
   try {
     const res = await fetch(`${API}/api/tasks/${taskId}/events`);
-    const events = await res.json();
+    const events = (await res.json()).map((ev) => ({
+      ...ev,
+      payload: typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload
+    }));
     if (events.length === 0) {
       container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">No events yet.</span>`;
       return;
@@ -317,8 +324,12 @@ async function loadEvents(taskId) {
         const restartLink = ev.type === "restart_spawned" && ev.payload?.restart_child_task_id
           ? `<div class="tl-restart-link" style="cursor:pointer;color:var(--accent);font-size:0.8rem" onclick="window.openTask('${esc(ev.payload.restart_child_task_id)}')">New attempt: ${String(ev.payload.restart_child_task_id).slice(0, 8)} &rarr;</div>`
           : "";
+        const transcriptId = ev.payload?.transcript_id;
+        const clickAttr = transcriptId
+          ? `style="cursor:pointer" onclick="openTranscript('${transcriptId}')" title="View transcript"`
+          : "";
         return `
-          <div class="tl-item">
+          <div class="tl-item" ${clickAttr}>
             <span class="tl-dot" style="background:${dotColor}"></span>
             <div class="tl-body">
               <span class="tl-agent" style="color:${agentCol}">${esc(ev.agent)}</span>
@@ -620,6 +631,90 @@ function toast(message, type = "") {
   el.textContent = message;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 4000);
+}
+
+// --- Transcript drill-down ---
+const dialogTranscript = document.getElementById("dialog-transcript");
+const transcriptMeta = document.getElementById("transcript-meta");
+const transcriptPane = document.getElementById("transcript-pane");
+let currentTranscript = null;
+let currentTab = "system";
+
+document.getElementById("btn-close-transcript").addEventListener("click", () => dialogTranscript.close());
+
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentTab = btn.dataset.tab;
+    renderTranscriptTab();
+  });
+});
+
+async function openTranscript(transcriptId) {
+  try {
+    const res = await fetch(`${API}/api/transcripts/${transcriptId}`);
+    if (!res.ok) {
+      toast("Transcript not found.", "error");
+      return;
+    }
+    currentTranscript = await res.json();
+    document.getElementById("transcript-title").textContent =
+      `Planner — attempt ${currentTranscript.attempt} — ${currentTranscript.model ?? currentTranscript.executorUsed}`;
+    transcriptMeta.innerHTML = `
+      <span>tokens: ${currentTranscript.tokenInput ?? "?"} in / ${currentTranscript.tokenOutput ?? "?"} out</span>
+      <span>elapsed: ${formatElapsed(currentTranscript.elapsedSeconds)}</span>
+      <span>executor: ${esc(currentTranscript.executorUsed)}</span>
+    `;
+    currentTab = "system";
+    document.querySelectorAll(".tab-btn").forEach((b) =>
+      b.classList.toggle("active", b.dataset.tab === "system")
+    );
+    renderTranscriptTab();
+    dialogTranscript.showModal();
+  } catch (err) {
+    toast(`Failed to load transcript: ${err.message}`, "error");
+  }
+}
+window.openTranscript = openTranscript;
+
+function renderTranscriptTab() {
+  if (!currentTranscript) return;
+  if (currentTab === "system") {
+    transcriptPane.innerHTML = `<pre class="prompt-block">${esc(currentTranscript.systemPrompt)}</pre>`;
+  } else if (currentTab === "user") {
+    transcriptPane.innerHTML = `<pre class="prompt-block">${esc(currentTranscript.userPrompt)}</pre>`;
+    if (currentTranscript.critique) {
+      transcriptPane.innerHTML += `<div class="critique-block"><strong>Critique that triggered this attempt:</strong><br>${esc(currentTranscript.critique)}</div>`;
+    }
+  } else if (currentTab === "transcript") {
+    const lines = (currentTranscript.transcript || "").split("\n").filter(Boolean);
+    if (lines.length === 0) {
+      transcriptPane.innerHTML = `<div class="empty-state">No transcript captured (executor did not emit turns).</div>`;
+      return;
+    }
+    transcriptPane.innerHTML = lines.map((line) => {
+      let turn;
+      try { turn = JSON.parse(line); } catch { return ""; }
+      if (turn.kind === "compaction") {
+        return `<div class="turn-compaction">— history compacted (${turn.droppedTurns} turns dropped) —</div>`;
+      }
+      if (turn.kind === "tool_result") {
+        return `<details class="turn turn-tool-result"><summary>tool_result <code>${esc(turn.toolUseId)}</code></summary><pre>${esc(turn.content)}</pre></details>`;
+      }
+      const blocks = (turn.content || []).map((b) => {
+        if (b.type === "text") return `<div class="block-text">${esc(b.text)}</div>`;
+        if (b.type === "tool_use") return `<details class="turn turn-tool-use"><summary>tool_use <strong>${esc(b.name)}</strong></summary><pre>${esc(JSON.stringify(b.input, null, 2))}</pre></details>`;
+        if (b.type === "mcp_tool_use") return `<details class="turn turn-mcp"><summary><span class="mcp-badge">qmd</span> ${esc(b.name)}</summary><pre>${esc(JSON.stringify(b.input ?? {}, null, 2))}</pre></details>`;
+        return `<div class="block-other">${esc(JSON.stringify(b))}</div>`;
+      }).join("");
+      return `<div class="turn turn-assistant">${blocks}</div>`;
+    }).join("");
+  } else if (currentTab === "output") {
+    let output;
+    try { output = JSON.parse(currentTranscript.output ?? "null"); } catch { output = currentTranscript.output; }
+    transcriptPane.innerHTML = `<pre class="output-block">${esc(JSON.stringify(output, null, 2))}</pre>`;
+  }
 }
 
 // --- Init ---
