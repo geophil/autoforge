@@ -35,7 +35,7 @@ const service = new OrchestratorService({
 // previous run or a timed-out executor) as failed with a failure_analysis event.
 service.sweepStaleTasks();
 
-const app = createWebServer(service, db);
+const app = createWebServer(service, db, env);
 
 serve(
   {

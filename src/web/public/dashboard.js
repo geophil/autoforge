@@ -3,6 +3,7 @@ const API = "";
 // --- State ---
 let tasks = [];
 let currentTaskId = null;
+let plannerMaxIterations = 3;
 
 // --- DOM refs ---
 const badge = document.getElementById("connection-badge");
@@ -137,7 +138,7 @@ function renderTaskDetail(task) {
   let actionsHtml = "";
   if (task.state === "awaiting_plan_approval") {
     const attemptCount = task.planAttempt ?? 0;
-    const maxAttempts = (window.PLANNER_MAX_ITERATIONS ?? 3) + 1;
+    const maxAttempts = plannerMaxIterations + 1;
     const planNum = attemptCount + 1;
     const reviseDisabled = attemptCount >= (maxAttempts - 1);
     const latestTranscript = (task.transcripts ?? []).slice(-1)[0];
@@ -718,6 +719,22 @@ function renderTranscriptTab() {
   }
 }
 
+// --- Config ---
+async function loadConfig() {
+  try {
+    const res = await fetch(`${API}/api/config`);
+    if (res.ok) {
+      const cfg = await res.json();
+      if (typeof cfg.plannerMaxIterations === "number") {
+        plannerMaxIterations = cfg.plannerMaxIterations;
+      }
+    }
+  } catch {
+    // best-effort; fall back to default
+  }
+}
+
 // --- Init ---
+loadConfig();
 connectSSE();
 refreshTasks();

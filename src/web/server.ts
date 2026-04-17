@@ -9,8 +9,13 @@ import { createTranscriptsRoutes } from "./routes/transcripts";
 import type { OrchestratorService } from "../orchestrator/service";
 import type { DbClient } from "../db/client";
 import { LiveEventHub } from "./events";
+import { loadEnv, type AppEnv } from "../config/env";
 
-export function createWebServer(service: OrchestratorService, db: DbClient): Hono {
+export function createWebServer(
+  service: OrchestratorService,
+  db: DbClient,
+  env: AppEnv = loadEnv()
+): Hono {
   const app = new Hono();
   const events = new LiveEventHub();
 
@@ -22,6 +27,12 @@ export function createWebServer(service: OrchestratorService, db: DbClient): Hon
 
   app.get("/api/health", (ctx) => {
     return ctx.json({ status: "ok", uptime: process.uptime() });
+  });
+
+  app.get("/api/config", (ctx) => {
+    return ctx.json({
+      plannerMaxIterations: env.PLANNER_MAX_ITERATIONS
+    });
   });
 
   app.get("/api/events", (ctx) => {
