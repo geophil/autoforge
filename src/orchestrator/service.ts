@@ -831,13 +831,17 @@ export class OrchestratorService {
     const set = this.deps.executors;
     if (!set) return this.deps.executor;
 
+    // Planner always routed to SDK so we can capture transcripts and pick
+    // the model per run (Opus for STANDARD/THOROUGH). Falls back to Claude
+    // Code if no SDK executor is configured (e.g. local dev without API key).
+    if (agentType === "planner") return set.sdk ?? set.claudeCode;
+
     // Meta agent always gets Claude Code — needs broad exploration.
     if (agentType === "meta") return set.claudeCode;
 
-    // SDK executor for EXPRESS tier (simple, focused tasks where token cost matters).
+    // SDK executor for EXPRESS tier (existing behavior).
     if (tier === "EXPRESS" && set.sdk) return set.sdk;
 
-    // Claude Code for everything else.
     return set.claudeCode;
   }
 
