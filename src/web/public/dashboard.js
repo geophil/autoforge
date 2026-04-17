@@ -72,16 +72,32 @@ async function refreshTasks() {
   }
 }
 
+// States that mean "server is actively doing something with this task right now"
+const RUNNING_STATES = new Set([
+  "assessing", "planning", "replanning", "executing", "reviewing", "reworking", "documenting"
+]);
+
 function renderTaskList() {
   if (tasks.length === 0) {
     taskList.innerHTML = `<div class="empty-state">No tasks yet. Submit one to get started.</div>`;
     return;
   }
 
+  // Update the global "N running" header badge
+  const runningCount = tasks.filter((t) => RUNNING_STATES.has(t.state)).length;
+  const runningBadge = document.getElementById("running-badge");
+  const runningCountEl = document.getElementById("running-count");
+  if (runningBadge && runningCountEl) {
+    runningCountEl.textContent = String(runningCount);
+    runningBadge.hidden = runningCount === 0;
+  }
+
   taskList.innerHTML = tasks
     .map(
-      (t) => `
-    <div class="task-card" data-id="${t.id}">
+      (t) => {
+        const isRunning = RUNNING_STATES.has(t.state);
+        return `
+    <div class="task-card ${isRunning ? "running-pulse" : ""}" data-id="${t.id}">
       <div class="task-card-body">
         <div class="task-card-description">${esc(t.description)}</div>
         <div class="task-card-meta">
@@ -96,7 +112,8 @@ function renderTaskList() {
         <span class="badge badge-tier">${t.tier}</span>
         <span class="badge badge-state" data-state="${t.state}">${formatState(t.state)}</span>
       </div>
-    </div>`
+    </div>`;
+      }
     )
     .join("");
 
@@ -185,9 +202,9 @@ function renderTaskDetail(task) {
           <div class="critique-counter" id="critique-counter">0 / 4000</div>
         </div>
         <div class="plan-review-buttons">
-          <button class="btn btn-approve" onclick="approvePlan('${task.id}')">Approve &amp; Continue</button>
+          <button class="btn btn-approve" onclick="approvePlan('${task.id}', this)">Approve &amp; Continue</button>
           <button class="btn btn-secondary" id="btn-critique"
-            onclick="critiquePlan('${task.id}')" ${reviseDisabled ? "disabled" : ""}>
+            onclick="critiquePlan('${task.id}', this)" ${reviseDisabled ? "disabled" : ""}>
             Revise Plan${reviseDisabled ? " (limit reached)" : ""}
           </button>
           <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel</button>
@@ -196,7 +213,7 @@ function renderTaskDetail(task) {
   } else if (task.state === "awaiting_approval") {
     actionsHtml = `
       <div class="task-detail-actions">
-        <button class="btn btn-approve" onclick="approveTask('${task.id}')">Approve &amp; Merge</button>
+        <button class="btn btn-approve" onclick="approveTask('${task.id}', this)">Approve &amp; Merge</button>
         <button class="btn btn-reject" onclick="rejectTask('${task.id}')">Reject</button>
         <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel</button>
       </div>`;
@@ -212,6 +229,14 @@ function renderTaskDetail(task) {
     prHtml = `<a class="pr-link" href="${esc(task.prUrl)}" target="_blank">View Pull Request &rarr;</a>`;
   }
 
+  const isRunning = RUNNING_STATES.has(task.state);
+  const liveBanner = isRunning
+    ? `<div class="live-state-banner">
+         <span class="dot"></span>
+         <span><strong>${formatState(task.state)}</strong> — the pipeline is actively working on this task right now. Updates stream in as they happen.</span>
+       </div>`
+    : "";
+
   detailContent.innerHTML = `
     <div class="task-detail-header">
       <h2>${esc(task.description)}</h2>
@@ -221,6 +246,7 @@ function renderTaskDetail(task) {
         <code style="font-size: 0.75rem; color: var(--text-dim);">${task.id}</code>
         ${prHtml}
       </div>
+      ${liveBanner}
       ${actionsHtml}
     </div>
 
@@ -251,8 +277,9 @@ function renderTaskDetail(task) {
     <div class="detail-section">
       <h3>Plan (${subtasks.length} subtask${subtasks.length !== 1 ? "s" : ""})</h3>
       ${subtasks.map((s) => `
-        <div class="subtask-item">
+        <div class="subtask-item" data-subtask-id="${esc(s.id)}" data-subtask-status="pending">
           <div class="subtask-header">
+            <span class="subtask-status-icon" aria-hidden="true"></span>
             <span class="subtask-seq">#${s.sequence}</span>
             <span class="subtask-agent">${esc(s.agentType ?? "coder")}</span>
             <span class="subtask-desc">${esc(s.description)}</span>
@@ -295,7 +322,7 @@ function wireCritiqueInput(task) {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       const btn = document.getElementById("btn-critique");
-      if (btn && !btn.disabled) critiquePlan(task.id);
+      if (btn && !btn.disabled) critiquePlan(task.id, btn);
     }
   });
 }
@@ -409,22 +436,57 @@ async function loadEvents(taskId) {
         <span class="cost-stat"><span class="cost-label">Output</span> ${outputTokens.toLocaleString()} tok</span>
         <span class="cost-stat"><span class="cost-label">Est. cost</span> $${estimatedCostUsd.toFixed(4)}</span>`;
     }
+
+    markSubtaskProgress(events);
   } catch {
     container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Could not load events.</span>`;
   }
 }
 
-// --- Task Actions ---
-async function approveTask(taskId) {
-  try {
-    const res = await fetch(`${API}/api/tasks/${taskId}/approve`, { method: "POST" });
-    if (!res.ok) throw new Error(await res.text());
-    toast("Task approved and merged.", "success");
-    refreshTasks();
-    refreshTaskDetail(taskId);
-  } catch (err) {
-    toast(`Approval failed: ${err.message}`, "error");
+/**
+ * Walk event history and mark each subtask card with its current status.
+ * - subtask_done → done (green check)
+ * - if a subtask_done fired for subtask N but not yet for N+1, and the task
+ *   is in a running state, mark N+1 as "running" (pulse)
+ * - otherwise pending (dim)
+ */
+function markSubtaskProgress(events) {
+  const doneIds = new Set();
+  for (const ev of events) {
+    if (ev.type === "subtask_done" && ev.payload?.subtaskId) {
+      doneIds.add(ev.payload.subtaskId);
+    }
   }
+
+  const items = document.querySelectorAll("[data-subtask-id]");
+  let runningAssigned = false;
+  items.forEach((el) => {
+    const id = el.getAttribute("data-subtask-id");
+    if (doneIds.has(id)) {
+      el.setAttribute("data-subtask-status", "done");
+    } else if (!runningAssigned) {
+      el.setAttribute("data-subtask-status", "running");
+      runningAssigned = true;
+    } else {
+      el.setAttribute("data-subtask-status", "pending");
+    }
+  });
+}
+
+// --- Task Actions ---
+async function approveTask(taskId, btnEl) {
+  const button = btnEl ?? document.querySelector('.btn-approve');
+  await runAction(button, "Merging…", null, async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/approve`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      toast("Task approved and merged.", "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Approval failed: ${err.message}`, "error");
+    }
+  });
 }
 
 // --- Rejection modal ---
@@ -529,42 +591,76 @@ document.getElementById("form-cancel").addEventListener("submit", async (e) => {
   }
 });
 
-async function approvePlan(taskId) {
+/**
+ * Wrap an async action to give immediate button feedback.
+ * - Disables all action buttons in the container while in flight.
+ * - Swaps the clicked button's label for a "working…" spinner variant.
+ * - Restores state after completion (success or failure).
+ *
+ * buttonEl: the button that was clicked (its label is what gets swapped)
+ * workingLabel: text shown while the action is running (e.g. "Approving…")
+ * container: ancestor element whose buttons should ALL be disabled (defaults to the button's form / action block)
+ */
+async function runAction(buttonEl, workingLabel, container, fn) {
+  const original = buttonEl.textContent;
+  const btnContainer = container ?? buttonEl.closest(".task-detail-actions") ?? buttonEl.parentElement;
+  const allButtons = btnContainer?.querySelectorAll("button, input[type=submit]") ?? [];
+
+  const prevDisabled = [];
+  allButtons.forEach((b, i) => { prevDisabled[i] = b.disabled; b.disabled = true; });
+  buttonEl.innerHTML = `<span class="spinner" aria-hidden="true"></span>${workingLabel}`;
+  buttonEl.classList.add("btn-working");
+
   try {
-    const res = await fetch(`${API}/api/tasks/${taskId}/approve-plan`, { method: "POST" });
-    if (!res.ok) throw new Error(await res.text());
-    toast("Plan approved — execution starting…", "success");
-    refreshTasks();
-    refreshTaskDetail(taskId);
-  } catch (err) {
-    toast(`Approve plan failed: ${err.message}`, "error");
+    await fn();
+  } finally {
+    allButtons.forEach((b, i) => { b.disabled = prevDisabled[i]; });
+    buttonEl.innerHTML = original;
+    buttonEl.classList.remove("btn-working");
   }
 }
 
-async function critiquePlan(taskId) {
+async function approvePlan(taskId, btnEl) {
+  await runAction(btnEl, "Approving…", btnEl?.closest(".plan-review-buttons"), async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/approve-plan`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      toast("Plan approved — execution starting…", "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Approve plan failed: ${err.message}`, "error");
+    }
+  });
+}
+
+async function critiquePlan(taskId, btnEl) {
   const input = document.getElementById("critique-input");
   const critique = (input?.value ?? "").trim();
   if (!critique) {
     toast("Please enter a critique to revise the plan.", "error");
     return;
   }
-  try {
-    const res = await fetch(`${API}/api/tasks/${taskId}/critique-plan`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ critique })
-    });
-    if (res.status === 409) {
-      toast("Re-plan limit reached — approve or cancel.", "error");
-      return;
+  const button = btnEl ?? document.getElementById("btn-critique");
+  await runAction(button, "Re-planning… (up to a few minutes)", button.closest(".plan-review-buttons"), async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/critique-plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ critique })
+      });
+      if (res.status === 409) {
+        toast("Re-plan limit reached — approve or cancel.", "error");
+        return;
+      }
+      if (!res.ok) throw new Error(await res.text());
+      toast("Critique submitted — re-planning…", "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Critique failed: ${err.message}`, "error");
     }
-    if (!res.ok) throw new Error(await res.text());
-    toast("Critique submitted — re-planning…", "success");
-    refreshTasks();
-    refreshTaskDetail(taskId);
-  } catch (err) {
-    toast(`Critique failed: ${err.message}`, "error");
-  }
+  });
 }
 
 // Make actions available from inline onclick handlers

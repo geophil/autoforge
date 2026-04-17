@@ -533,10 +533,31 @@ dialog {
   padding: 1.5rem;
   max-width: 480px;
   width: 90vw;
+  /* Explicit centering — some browsers don't center <dialog> by default,
+     and wrapper layouts can knock UA centering off. */
+  margin: auto;
+  inset: 0;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
 }
 
 dialog::backdrop {
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  animation: dialog-backdrop-fade 0.15s ease-out;
+}
+
+dialog[open] {
+  animation: dialog-fade-in 0.15s ease-out;
+}
+
+@keyframes dialog-fade-in {
+  from { opacity: 0; transform: translateY(-8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes dialog-backdrop-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 dialog h3 {
@@ -1036,4 +1057,138 @@ dialog textarea:focus {
 }
 .turn details summary .copy-btn {
   margin-left: auto;
+}
+
+/* Button working state + spinner */
+.btn-working {
+  opacity: 0.85;
+  cursor: progress !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+button:disabled:not(.btn-working) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.spinner {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* In-flight task pulse — used on cards and badges to signal "running now" */
+.running-pulse {
+  position: relative;
+}
+.running-pulse::after {
+  content: "";
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  width: 0.55rem;
+  height: 0.55rem;
+  background: var(--orange);
+  border-radius: 50%;
+  box-shadow: 0 0 0 0 var(--orange);
+  animation: pulse 1.6s ease-out infinite;
+}
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(251, 146, 60, 0.55); }
+  70%  { box-shadow: 0 0 0 10px rgba(251, 146, 60, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(251, 146, 60, 0); }
+}
+
+/* Live state banner inside task detail, when state is actively running */
+.live-state-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--orange-dim);
+  color: var(--orange);
+  border-radius: 4px;
+  font-size: 0.85rem;
+  margin-top: 0.5rem;
+}
+.live-state-banner .dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  background: var(--orange);
+  border-radius: 50%;
+  flex-shrink: 0;
+  animation: pulse 1.6s ease-out infinite;
+}
+
+/* Subtask status indicators (done / running / pending) */
+.subtask-status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.subtask-item[data-subtask-status="done"] .subtask-status-icon {
+  background: var(--green);
+  color: var(--bg);
+}
+.subtask-item[data-subtask-status="done"] .subtask-status-icon::before {
+  content: "✓";
+}
+.subtask-item[data-subtask-status="running"] .subtask-status-icon {
+  background: var(--orange);
+  color: var(--bg);
+  animation: pulse 1.6s ease-out infinite;
+}
+.subtask-item[data-subtask-status="running"] .subtask-status-icon::before {
+  content: "●";
+}
+.subtask-item[data-subtask-status="pending"] .subtask-status-icon {
+  background: var(--bg);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+.subtask-item[data-subtask-status="pending"] .subtask-status-icon::before {
+  content: "○";
+}
+.subtask-item[data-subtask-status="done"] {
+  opacity: 0.75;
+}
+.subtask-item[data-subtask-status="running"] {
+  border-left: 3px solid var(--orange);
+  padding-left: calc(0.75rem - 3px);
+}
+
+/* Global "N running" header badge */
+.running-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: var(--orange-dim);
+  color: var(--orange);
+  padding: 0.15rem 0.55rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.running-badge[hidden] { display: none; }
+.running-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--orange);
+  animation: pulse 1.6s ease-out infinite;
 }
