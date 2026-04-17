@@ -38,6 +38,25 @@
             Description
             <textarea name="description" rows="4" placeholder="Describe the feature or change..." required></textarea>
           </label>
+          <details class="advanced-options">
+            <summary>Advanced options</summary>
+            <label class="checkbox-label">
+              <input type="checkbox" name="reviewPlan" id="opt-review-plan" checked />
+              <span class="checkbox-text">
+                Review plan before execution
+                <small>Pause after planning so you can inspect or critique the plan. Ignored for EXPRESS unless forced on. Tier-based by default.</small>
+              </span>
+            </label>
+            <label>
+              Tier override
+              <select name="forceTier" id="opt-force-tier">
+                <option value="">Auto (assessed from description)</option>
+                <option value="EXPRESS">EXPRESS — quick, single-shot, no review</option>
+                <option value="STANDARD">STANDARD — full pipeline with review</option>
+                <option value="THOROUGH">THOROUGH — extended budgets, deeper planning</option>
+              </select>
+            </label>
+          </details>
           <div class="dialog-actions">
             <button type="button" class="btn btn-ghost" id="btn-cancel-task">Cancel</button>
             <button type="submit" class="btn btn-primary">Submit</button>

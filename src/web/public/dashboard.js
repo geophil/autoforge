@@ -505,7 +505,11 @@ document.getElementById("form-new-task").addEventListener("submit", async (e) =>
   const body = {
     projectId: form.projectId.value.trim(),
     description: form.description.value.trim(),
+    reviewPlan: form.reviewPlan.checked,
   };
+  const forceTierValue = form.forceTier.value;
+  if (forceTierValue) body.forceTier = forceTierValue;
+
   const originalLabel = submitBtn.textContent;
   submitBtn.disabled = true;
   submitBtn.textContent = "Submitting…";
@@ -516,6 +520,7 @@ document.getElementById("form-new-task").addEventListener("submit", async (e) =>
   dialogTask.close();
   form.reset();
   form.projectId.value = "autoforge";
+  form.reviewPlan.checked = true;
   toast("Task submitted — planner starting…", "success");
 
   try {
