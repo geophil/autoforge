@@ -781,3 +781,21 @@ dialog textarea:focus {
 }
 .view-transcript-link { color: var(--accent); font-weight: 500; font-size: 0.85rem; margin-left: 0.5rem; }
 .block-text { white-space: pre-wrap; }
+
+/* Plan-review state badges */
+.badge-state[data-state="awaiting_plan_approval"] {
+  background: var(--yellow);
+  color: var(--bg);
+}
+.badge-state[data-state="replanning"] {
+  background: var(--orange);
+  color: var(--bg);
+}
+.card-plan-badge {
+  background: var(--yellow);
+  color: var(--bg);
+  font-size: 0.7rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  font-weight: 500;
+}

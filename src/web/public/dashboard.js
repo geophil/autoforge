@@ -87,6 +87,7 @@ function renderTaskList() {
           <code>${t.id.slice(0, 8)}</code>
           <span>${timeAgo(t.createdAt)}</span>
           ${t.iteration > 0 ? `<span>iteration ${t.iteration}</span>` : ""}
+          ${t.state === "awaiting_plan_approval" || t.state === "replanning" ? `<span class="card-plan-badge">plan review</span>` : ""}
         </div>
       </div>
       <div class="task-card-right">
