@@ -63,3 +63,26 @@ describe("critiquePlan", () => {
     await expect(service.critiquePlan(task.id, "feedback 4")).rejects.toThrow(/limit/i);
   });
 });
+
+describe("end-to-end critique loop", () => {
+  test("submit -> critique -> approve -> awaiting_approval", async () => {
+    const { service, db } = createTestService();
+    const created = await service.submitTask("autoforge", "Build a STANDARD-tier widget");
+    expect(created.state).toBe("awaiting_plan_approval");
+
+    await service.critiquePlan(created.id, "be more specific about file paths");
+    const afterCritique = service.getTask(created.id)!;
+    expect(afterCritique.state).toBe("awaiting_plan_approval");
+
+    const approved = await service.approvePlan(created.id);
+    expect(approved.state).toBe("awaiting_approval");
+
+    const transcripts = db.listTranscriptsByTask(created.id);
+    expect(transcripts.length).toBe(2);
+    expect(transcripts[0].attempt).toBe(0);
+    expect(transcripts[1].attempt).toBe(1);
+
+    const completed = await service.approveTask(created.id);
+    expect(completed.state).toBe("completed");
+  });
+});
