@@ -1,15 +1,8 @@
 {
-  "status": "DONE_WITH_CONCERNS",
+  "status": "DONE",
   "artifacts": [
     "docs/qmd/domain-web-api.md",
-    "docs/qmd/development-workflow.md",
-    "docs/qmd/patterns-and-conventions.md",
     "docs/qmd/data-models.md",
-    "docs/postmortem/2026-04-14-anthropic-sdk-executor-stall.md",
-    "src/web/token-utils.ts",
-    "src/web/public/dashboard.js",
-    "src/web/public/styles.css",
-    "tests/unit/token-utils.test.ts"
-  ],
-  "concerns": "The runtime worktree was unavailable (already cleaned up), so changes were applied directly to the main repo working tree. All five known drift issues were corrected: (1) domain-web-api.md: added GET /api/health, GET /api/tasks/:id/events, POST /api/tasks/:id/cancel, POST /api/meta, POST /api/meta/:experimentId/conclude; updated SSE dashboard description to reference src/web/public/index.html + dashboard.js static assets; updated File Map and Integration Points. (2) development-workflow.md: removed non-existent POST /api/tasks/replay curl example; replaced with programmatic note about OrchestratorService.replayFromEvents()/DbClient.rebuildProjectionsFromEvents(). (3) patterns-and-conventions.md: added personas/ to src/ directory tree. (4) data-models.md: added agentType?: AgentType to PlanSubtask; fixed subtasks SQL (added concerns, started_at, completed_at, estimated_cost); added constraint_violations to experiments; corrected skill_versions column ordering. (5) postmortem: corrected DbClient.listTaskEvents to DbClient.listEvents. Additionally, the dashboard cost summary feature (token-utils.ts, dashboard.js, styles.css, test) was merged from origin/main during reconciliation."
+    "docs/qmd/patterns-and-conventions.md"
+  ]
 }

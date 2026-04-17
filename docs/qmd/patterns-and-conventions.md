@@ -48,10 +48,11 @@ interface ServiceDeps {
   env: AppEnv;
   db: DbClient;
   executor: AgentExecutor;
+  executors?: ExecutorSet;
   worktrees: WorktreeManager;
   nats?: NatsClient;
   testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
-  prCreator?: (payload: PrPayload) => Promise<string>;
+  prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
 }
 ```
 
