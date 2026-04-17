@@ -18,6 +18,8 @@
   --red-dim: rgba(248, 113, 113, 0.12);
   --orange: #fb923c;
   --orange-dim: rgba(251, 146, 60, 0.12);
+  --cyan: #22d3ee;
+  --cyan-dim: rgba(34, 211, 238, 0.14);
   --radius: 8px;
   --radius-sm: 4px;
   --font-mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
@@ -244,11 +246,29 @@ h2 {
 .badge-state { background: var(--accent-dim); color: var(--accent); }
 .badge-state[data-state="completed"] { background: var(--green-dim); color: var(--green); }
 .badge-state[data-state="failed"] { background: var(--red-dim); color: var(--red); }
-.badge-state[data-state="awaiting_approval"] { background: var(--yellow-dim); color: var(--yellow); }
+/* PR review (awaiting merge) — cyan to distinguish from plan review (yellow) */
+.badge-state[data-state="awaiting_approval"] { background: var(--cyan-dim); color: var(--cyan); }
 .badge-state[data-state="executing"],
 .badge-state[data-state="reviewing"],
 .badge-state[data-state="planning"],
 .badge-state[data-state="documenting"] { background: var(--orange-dim); color: var(--orange); }
+
+/* State badge icons for at-a-glance + colorblind distinction */
+.badge-state::before {
+  display: inline-block;
+  margin-right: 0.3em;
+  font-size: 0.85em;
+  line-height: 1;
+}
+.badge-state[data-state="awaiting_plan_approval"]::before { content: "◐"; }
+.badge-state[data-state="replanning"]::before { content: "↻"; }
+.badge-state[data-state="awaiting_approval"]::before { content: "⇡"; }
+.badge-state[data-state="executing"]::before,
+.badge-state[data-state="reviewing"]::before,
+.badge-state[data-state="planning"]::before,
+.badge-state[data-state="documenting"]::before { content: "●"; }
+.badge-state[data-state="completed"]::before { content: "✓"; }
+.badge-state[data-state="failed"]::before { content: "✕"; }
 
 .badge-tier { background: var(--bg-surface-active); color: var(--text-muted); }
 
@@ -791,14 +811,16 @@ dialog textarea:focus {
   background: var(--orange);
   color: var(--bg);
 }
-.card-plan-badge {
-  background: var(--yellow);
-  color: var(--bg);
+.card-pill {
   font-size: 0.7rem;
   padding: 0.05rem 0.4rem;
   border-radius: 3px;
   font-weight: 500;
 }
+.card-pill-plan { background: var(--yellow); color: var(--bg); }
+.card-pill-pr { background: var(--cyan); color: var(--bg); }
+/* Legacy alias — older commits referenced this class name */
+.card-plan-badge { background: var(--yellow); color: var(--bg); font-size: 0.7rem; padding: 0.05rem 0.4rem; border-radius: 3px; font-weight: 500; }
 
 /* ============================================================ */
 /* UI polish pass — advanced options, dialogs, transcript, etc. */
