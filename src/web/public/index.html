@@ -64,6 +64,21 @@
         </form>
       </dialog>
 
+      <dialog id="dialog-cancel">
+        <form id="form-cancel">
+          <h3>Cancel Task</h3>
+          <p class="dialog-blurb">This will stop the task, close any open PR, and mark it as failed.</p>
+          <label>
+            Reason (optional)
+            <textarea name="reason" rows="3" placeholder="Why are you cancelling? (used in the failure event)"></textarea>
+          </label>
+          <div class="dialog-actions">
+            <button type="button" class="btn btn-ghost" id="btn-cancel-cancel">Back</button>
+            <button type="submit" class="btn btn-reject-submit">Cancel Task</button>
+          </div>
+        </form>
+      </dialog>
+
       <dialog id="dialog-reject">
         <form id="form-reject">
           <h3>Reject &amp; Restart</h3>

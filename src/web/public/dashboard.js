@@ -424,8 +424,35 @@ formReject.addEventListener("submit", async (e) => {
   }
 });
 
-async function cancelTask(taskId) {
-  const reason = prompt("Cancel reason (optional):", "Cancelled by operator.") ?? "Cancelled by operator.";
+const dialogCancel = document.getElementById("dialog-cancel");
+let pendingCancelTaskId = null;
+
+function cancelTask(taskId) {
+  pendingCancelTaskId = taskId;
+  const form = document.getElementById("form-cancel");
+  form.reset();
+  dialogCancel.showModal();
+}
+
+document.getElementById("btn-cancel-cancel").addEventListener("click", () => {
+  dialogCancel.close();
+  pendingCancelTaskId = null;
+});
+
+document.getElementById("form-cancel").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const reason = form.reason.value.trim() || "Cancelled by operator.";
+  const taskId = pendingCancelTaskId;
+  if (!taskId) return;
+
+  const submitBtn = form.querySelector('button[type="submit"]');
+  const originalLabel = submitBtn.textContent;
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Cancelling…";
+  dialogCancel.close();
+  pendingCancelTaskId = null;
+
   try {
     const res = await fetch(`${API}/api/tasks/${taskId}/cancel`, {
       method: "POST",
@@ -438,8 +465,11 @@ async function cancelTask(taskId) {
     refreshTaskDetail(taskId);
   } catch (err) {
     toast(`Cancel failed: ${err.message}`, "error");
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
   }
-}
+});
 
 async function approvePlan(taskId) {
   try {

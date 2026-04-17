@@ -853,3 +853,9 @@ dialog textarea:focus {
   margin-top: 0.2rem;
   font-weight: normal;
 }
+
+.dialog-blurb {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
