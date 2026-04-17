@@ -7,7 +7,7 @@ import { createTestService } from "../helpers/create-service";
 describe("event-sourced recovery", () => {
   test("rebuilds task projections from append-only events", async () => {
     const { service, dbPath } = createTestService();
-    const created = await service.submitTask("autoforge", "Create a status endpoint");
+    const created = await service.submitTask("autoforge", "Create a status endpoint", { reviewPlan: false });
     expect(created.state).toBe("awaiting_approval");
 
     const restartedDb = new DbClient(dbPath);

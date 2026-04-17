@@ -44,11 +44,14 @@ export class OrchestratorService {
     return this.deps.db.getTask(taskId);
   }
 
-  async submitTask(projectId: string, description: string): Promise<PipelineTask> {
+  async submitTask(
+    projectId: string,
+    description: string,
+    opts: { reviewPlan?: boolean; forceTier?: Tier } = {}
+  ): Promise<PipelineTask> {
     const taskId = randomUUID();
-    const now = new Date().toISOString();
     const assessment = assessComplexity(description);
-    const tier = routeTier(assessment);
+    const tier = opts.forceTier ?? routeTier(assessment);
     const worktree = this.deps.worktrees.create(taskId);
 
     this.recordEvent({
@@ -71,45 +74,22 @@ export class OrchestratorService {
     this.transition(taskId, projectId, "received", "assessing", { assessment, tier });
     this.transition(taskId, projectId, "assessing", "planning", {});
 
-    const plannerExecutor = this.routeExecutor(tier, "planner");
-    const plannerResult = await plannerExecutor.execute({
-      id: taskId,
-      type: "planner",
-      systemPrompt: this.personas.resolve("planner"),
-      prompt: `## Task\n${description}\n\n## Complexity signals\nTier: ${tier} | Scope: ${assessment.scope} | Risk: ${assessment.risk} | Coupling: ${assessment.coupling}`,
-      workingDirectory: worktree.path,
-      budgetSeconds: this.budgetForTier(tier, "planner"),
-      environment: this.agentEnvironment(),
-      skillFiles: this.skills.skillsForAgent("planner"),
-      metadata: { description, tier }
-    });
-
-    const plannerPersonaId = this.personas.snapshotId("planner");
-    const plannerSkillIds = this.skills.snapshotIds("planner");
-    const planSubtasks = parsePlanSubtasks(taskId, plannerResult.output, worktree.path);
-    const plannerFallback = planSubtasks.length === 1 && planSubtasks[0].description === "Implement requested behavior with tests-first workflow.";
-    this.recordEvent({
+    const planSubtasks = await this.runPlannerAttempt(
       taskId,
       projectId,
-      agent: "planner",
-      type: "planned",
-      status: plannerFallback ? "done_with_concerns" : "done",
-      payload: {
-        state: "executing",
-        planSubtasks,
-        planner_fallback: plannerFallback
-      },
-      budgetSeconds: this.budgetForTier(tier, "planner"),
-      elapsedSeconds: plannerResult.metrics.elapsedSeconds,
-      tokenUsage: plannerResult.metrics.tokenInput !== undefined ? {
-        input: plannerResult.metrics.tokenInput,
-        output: plannerResult.metrics.tokenOutput ?? 0,
-        estimatedCost: plannerResult.metrics.estimatedCost
-      } : undefined,
-      executorUsed: plannerExecutor.name,
-      personaVersionId: plannerPersonaId,
-      skillVersionIds: plannerSkillIds
-    });
+      description,
+      tier,
+      worktree.path,
+      0,
+      null
+    );
+
+    if (this.pausePolicy(tier, opts.reviewPlan)) {
+      this.transition(taskId, projectId, "planning", "awaiting_plan_approval", { planSubtasks });
+      return this.requireTask(taskId);
+    }
+
+    this.transition(taskId, projectId, "planning", "executing", { planSubtasks });
 
     try {
       await this.executeAndReview(taskId, projectId, description, tier, planSubtasks, 0, worktree.path, worktree.branch);
@@ -125,6 +105,121 @@ export class OrchestratorService {
       return task;
     }
     throw new Error(`Task ${taskId} did not reach approval state; current state: ${task.state}`);
+  }
+
+  private pausePolicy(tier: Tier, reviewPlanOverride?: boolean): boolean {
+    if (reviewPlanOverride !== undefined) return reviewPlanOverride;
+    return tier === "STANDARD" || tier === "THOROUGH";
+  }
+
+  private plannerModel(tier: Tier): string {
+    if (tier === "EXPRESS") return this.deps.env.PLANNER_MODEL_EXPRESS;
+    return this.deps.env.PLANNER_MODEL_COMPLEX;
+  }
+
+  private async runPlannerAttempt(
+    taskId: string,
+    projectId: string,
+    description: string,
+    tier: Tier,
+    worktreePath: string,
+    attempt: number,
+    critique: string | null,
+    priorPlan?: PlanSubtask[]
+  ): Promise<PlanSubtask[]> {
+    const plannerExecutor = this.routeExecutor(tier, "planner");
+    const userPrompt = this.buildPlannerPrompt(description, tier, attempt, priorPlan, critique);
+
+    const plannerResult = await plannerExecutor.execute({
+      id: taskId,
+      type: "planner",
+      systemPrompt: this.personas.resolve("planner"),
+      prompt: userPrompt,
+      workingDirectory: worktreePath,
+      budgetSeconds: this.budgetForTier(tier, "planner"),
+      environment: this.agentEnvironment(),
+      skillFiles: this.skills.skillsForAgent("planner"),
+      metadata: { description, tier, attempt },
+      model: this.plannerModel(tier)
+    });
+
+    const plannerPersonaId = this.personas.snapshotId("planner");
+    const plannerSkillIds = this.skills.snapshotIds("planner");
+    const planSubtasks = parsePlanSubtasks(taskId, plannerResult.output, worktreePath);
+    const plannerFallback =
+      planSubtasks.length === 1 &&
+      planSubtasks[0].description === "Implement requested behavior with tests-first workflow.";
+
+    // Persist transcript before emitting `planned` so the event payload pointer
+    // is always valid.
+    const transcript = plannerResult.transcript;
+    const turnsJsonl = transcript
+      ? transcript.turns.map((t) => JSON.stringify(t)).join("\n")
+      : "";
+
+    const transcriptId = this.deps.db.insertTranscript({
+      taskId,
+      stage: "planner",
+      attempt,
+      executorUsed: plannerExecutor.name,
+      model: this.plannerModel(tier),
+      systemPrompt: transcript?.systemPrompt ?? this.personas.resolve("planner"),
+      userPrompt: transcript?.userPrompt ?? userPrompt,
+      transcript: turnsJsonl,
+      output: plannerResult.output ? JSON.stringify(plannerResult.output) : null,
+      critique,
+      tokenInput: plannerResult.metrics.tokenInput ?? null,
+      tokenOutput: plannerResult.metrics.tokenOutput ?? null,
+      elapsedSeconds: plannerResult.metrics.elapsedSeconds
+    });
+
+    this.recordEvent({
+      taskId,
+      projectId,
+      agent: "planner",
+      type: "planned",
+      status: plannerFallback ? "done_with_concerns" : "done",
+      payload: {
+        planSubtasks,
+        planner_fallback: plannerFallback,
+        attempt,
+        transcript_id: transcriptId
+      },
+      budgetSeconds: this.budgetForTier(tier, "planner"),
+      elapsedSeconds: plannerResult.metrics.elapsedSeconds,
+      tokenUsage: plannerResult.metrics.tokenInput !== undefined ? {
+        input: plannerResult.metrics.tokenInput,
+        output: plannerResult.metrics.tokenOutput ?? 0,
+        estimatedCost: plannerResult.metrics.estimatedCost
+      } : undefined,
+      executorUsed: plannerExecutor.name,
+      personaVersionId: plannerPersonaId,
+      skillVersionIds: plannerSkillIds
+    });
+
+    return planSubtasks;
+  }
+
+  private buildPlannerPrompt(
+    description: string,
+    tier: Tier,
+    attempt: number,
+    priorPlan: PlanSubtask[] | undefined,
+    critique: string | null
+  ): string {
+    const assessment = assessComplexity(description);
+    const base = `## Task\n${description}\n\n## Complexity signals\nTier: ${tier} | Scope: ${assessment.scope} | Risk: ${assessment.risk} | Coupling: ${assessment.coupling}`;
+    if (attempt === 0 || !priorPlan || !critique) return base;
+
+    return [
+      base,
+      `## Prior plan (attempt ${attempt - 1})`,
+      JSON.stringify(priorPlan, null, 2),
+      `## Human feedback on prior plan`,
+      critique,
+      `## Instructions`,
+      "Revise the plan to address the feedback. Prefer minimal changes — keep subtasks that were not critiqued, unless the feedback implies they should change."
+    ].join("\n\n");
   }
 
   async approveTask(taskId: string): Promise<PipelineTask> {
@@ -227,7 +322,10 @@ export class OrchestratorService {
     // Spawn a fresh task from current HEAD with the operator's feedback
     // appended to the description so the new planner sees it.
     const newDescription = buildRestartDescription(oldTask.description, feedback, taskId);
-    const newTask = await this.submitTask(oldTask.projectId, newDescription);
+    // Restart tasks already carry human feedback in the description, so skip
+    // the plan-review pause — the operator has effectively pre-approved the
+    // direction via their rejection guidance.
+    const newTask = await this.submitTask(oldTask.projectId, newDescription, { reviewPlan: false });
 
     // Record lineage so analytics (and the meta agent) can join old -> new.
     this.recordEvent({

@@ -36,14 +36,14 @@ describe("review and rejection rework loops", () => {
     };
 
     const { service } = createTestService(handlers);
-    const task = await service.submitTask("autoforge", "Implement API input validation");
+    const task = await service.submitTask("autoforge", "Implement API input validation", { reviewPlan: false });
     expect(task.state).toBe("awaiting_approval");
     expect(task.iteration).toBe(1);
   });
 
   test("human rejection fails old task and spawns a fresh restart task", async () => {
     const { service, db } = createTestService();
-    const oldTask = await service.submitTask("autoforge", "Add request tracing");
+    const oldTask = await service.submitTask("autoforge", "Add request tracing", { reviewPlan: false });
     expect(oldTask.state).toBe("awaiting_approval");
 
     const feedback = {
