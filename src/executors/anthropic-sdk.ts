@@ -373,10 +373,17 @@ export class AnthropicSdkExecutor implements AgentExecutor {
       }
     } catch (err) {
       const elapsedSeconds = (Date.now() - start) / 1000;
+      const errorName = err instanceof Error ? err.name : "UnknownError";
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorStack = err instanceof Error ? err.stack : undefined;
+      // Preserve the error in the transcript so forensics survive downstream.
+      // Without this, a pre-flight failure (bad model alias, auth error, network)
+      // leaves an empty transcript and the caller has no way to see why.
+      turns.push({ kind: "error", name: errorName, message: errorMessage, stack: errorStack });
       return {
         status: "FAILED",
         artifacts: [],
-        blockReason: err instanceof Error ? err.message : String(err),
+        blockReason: errorMessage,
         metrics: {
           elapsedSeconds,
           tokenInput: totalInputTokens,

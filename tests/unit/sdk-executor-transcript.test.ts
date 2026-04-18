@@ -182,9 +182,18 @@ describe("SDK executor return-path transcript invariants", () => {
     });
 
     expect(result.status).toBe("FAILED");
+    expect(result.blockReason).toBe("synthetic upstream failure");
     expect(result.transcript).toBeDefined();
     expect(result.transcript!.systemPrompt).toContain("p-fail");
     expect(result.transcript!.userPrompt).toBe("u-fail");
+    // The catch-block now pushes an `error` turn so forensics survive even
+    // when the API call never returned a response (no assistant/tool turns).
+    const errorTurn = result.transcript!.turns.find((t) => t.kind === "error");
+    expect(errorTurn).toBeDefined();
+    if (errorTurn && errorTurn.kind === "error") {
+      expect(errorTurn.message).toBe("synthetic upstream failure");
+      expect(errorTurn.name).toBe("Error");
+    }
   });
 
   test("TIMEOUT return path includes transcript", async () => {

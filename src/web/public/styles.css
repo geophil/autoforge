@@ -246,6 +246,7 @@ h2 {
 .badge-state { background: var(--accent-dim); color: var(--accent); }
 .badge-state[data-state="completed"] { background: var(--green-dim); color: var(--green); }
 .badge-state[data-state="failed"] { background: var(--red-dim); color: var(--red); }
+.badge-state[data-state="awaiting_intervention"] { background: rgba(220, 120, 80, 0.18); color: rgb(220, 120, 80); }
 /* PR review (awaiting merge) — cyan to distinguish from plan review (yellow) */
 .badge-state[data-state="awaiting_approval"] { background: var(--cyan-dim); color: var(--cyan); }
 .badge-state[data-state="executing"],
@@ -269,6 +270,7 @@ h2 {
 .badge-state[data-state="documenting"]::before { content: "●"; }
 .badge-state[data-state="completed"]::before { content: "✓"; }
 .badge-state[data-state="failed"]::before { content: "✕"; }
+.badge-state[data-state="awaiting_intervention"]::before { content: "⚠"; }
 
 .badge-tier { background: var(--bg-surface-active); color: var(--text-muted); }
 
@@ -756,6 +758,66 @@ dialog select:focus {
 }
 .btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* Intervention panel — surfaced failure awaiting operator input */
+.task-detail-actions.intervention {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.75rem;
+  border: 1px solid rgba(220, 120, 80, 0.35);
+  background: rgba(220, 120, 80, 0.06);
+  border-radius: 6px;
+  padding: 1rem;
+}
+.intervention-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.intervention-title {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--text);
+}
+.intervention-reason {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.intervention-forensics {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  font-size: 0.85rem;
+}
+.forensic-row {
+  display: contents;
+}
+.forensic-label {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  padding-top: 0.15rem;
+}
+.forensic-value {
+  color: var(--text);
+  word-break: break-word;
+}
+.forensic-value code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+}
+.intervention-buttons {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.25rem;
+}
+
 /* Subtask card extensions */
 .subtask-header { display: flex; gap: 0.5rem; align-items: center; }
 .subtask-agent {
@@ -1193,4 +1255,84 @@ button:disabled:not(.btn-working) {
   border-radius: 50%;
   background: var(--orange);
   animation: pulse 1.6s ease-out infinite;
+}
+
+/* Rendered plan markdown — shared by Plan Review Panel and transcript Plan tab. */
+.plan-review-markdown {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.9rem 1.1rem;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.plan-review-markdown h1,
+.plan-review-markdown h2,
+.plan-review-markdown h3 {
+  margin: 0.9rem 0 0.4rem 0;
+  line-height: 1.3;
+}
+.plan-review-markdown h1 { font-size: 1.05rem; margin-top: 0; color: var(--text); }
+.plan-review-markdown h2 {
+  font-size: 0.95rem;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.25rem;
+}
+.plan-review-markdown h3 {
+  font-size: 0.9rem;
+  color: var(--text);
+}
+.plan-review-markdown p {
+  margin: 0.35rem 0;
+  color: var(--text-muted);
+}
+.plan-review-markdown ul {
+  margin: 0.25rem 0 0.5rem 0;
+  padding-left: 1.25rem;
+}
+.plan-review-markdown li { margin: 0.15rem 0; }
+.plan-review-markdown li ul { margin-top: 0.2rem; }
+.plan-review-markdown code {
+  background: var(--bg);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  color: var(--text);
+}
+.plan-review-markdown strong { color: var(--text); }
+.plan-review-markdown em { color: var(--text-muted); }
+
+.plan-tab-pane {
+  background: transparent;
+  border: none;
+  padding: 0.25rem 0.25rem 1rem 0.25rem;
+}
+
+/* Collapsible "raw structured view" of subtasks, shown below the markdown plan
+   on the plan-review page. */
+.raw-subtasks > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.1rem 0;
+}
+.raw-subtasks > summary::-webkit-details-marker { display: none; }
+.raw-subtasks > summary::before {
+  content: "▸";
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+.raw-subtasks[open] > summary::before { content: "▾"; }
+.raw-subtasks-hint {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }

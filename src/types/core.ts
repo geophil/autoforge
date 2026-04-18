@@ -24,6 +24,7 @@ export type TaskStage =
   | "pr_created"
   | "awaiting_approval"
   | "documenting"
+  | "awaiting_intervention"
   | "completed"
   | "failed";
 

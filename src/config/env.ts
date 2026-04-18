@@ -21,7 +21,7 @@ const EnvSchema = z.object({
   ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6"),
   // QMD MCP endpoint — passed to agent environments so agents can query the knowledge base.
   QMD_MCP_URL: z.string().optional(),
-  PLANNER_MODEL_COMPLEX: z.string().default("claude-opus-4-1"),
+  PLANNER_MODEL_COMPLEX: z.string().default("claude-opus-4-7"),
   PLANNER_MODEL_EXPRESS: z.string().default("claude-sonnet-4-6"),
   PLANNER_MAX_ITERATIONS: z.coerce.number().int().min(0).max(10).default(3)
 });

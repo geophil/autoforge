@@ -27,6 +27,24 @@ interface ServiceDeps {
   prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
 }
 
+/**
+ * Thrown internally when a pipeline stage fails in a way the operator
+ * needs to see. The task has already been transitioned to
+ * `awaiting_intervention` with a `failure_analysis` event recorded before
+ * this is thrown. Callers catch it and return the paused task rather than
+ * propagating as a 500 — the point is to pause, not to crash the server.
+ */
+export class StageFailedError extends Error {
+  readonly taskId: string;
+  readonly stage: TaskStage;
+  constructor(taskId: string, stage: TaskStage, message: string) {
+    super(message);
+    this.name = "StageFailedError";
+    this.taskId = taskId;
+    this.stage = stage;
+  }
+}
+
 export class OrchestratorService {
   private readonly skills: SkillRegistry;
   private readonly personas: PersonaRegistry;
@@ -74,15 +92,26 @@ export class OrchestratorService {
     this.transition(taskId, projectId, "received", "assessing", { assessment, tier });
     this.transition(taskId, projectId, "assessing", "planning", {});
 
-    const planSubtasks = await this.runPlannerAttempt(
-      taskId,
-      projectId,
-      description,
-      tier,
-      worktree.path,
-      0,
-      null
-    );
+    let planSubtasks: PlanSubtask[];
+    try {
+      planSubtasks = await this.runPlannerAttempt(
+        taskId,
+        projectId,
+        description,
+        tier,
+        worktree.path,
+        0,
+        null
+      );
+    } catch (err) {
+      // Planner failure has already been surfaced (failure_analysis event +
+      // awaiting_intervention transition inside runPlannerAttempt). Return
+      // the paused task so the caller can show the operator what happened.
+      if (err instanceof StageFailedError) {
+        return this.requireTask(taskId);
+      }
+      throw err;
+    }
 
     if (this.pausePolicy(tier, opts.reviewPlan)) {
       this.transition(taskId, projectId, "planning", "awaiting_plan_approval", { planSubtasks });
@@ -94,6 +123,10 @@ export class OrchestratorService {
     try {
       await this.executeAndReview(taskId, projectId, description, tier, planSubtasks, 0, worktree.path, worktree.branch);
     } catch (err) {
+      if (err instanceof StageFailedError) {
+        // Leave worktree intact so the operator can inspect or retry.
+        return this.requireTask(taskId);
+      }
       this.cleanupWorktree(taskId);
       throw err;
     }
@@ -101,7 +134,7 @@ export class OrchestratorService {
     if (!task) {
       throw new Error("Task disappeared after orchestration.");
     }
-    if (task.state === "awaiting_approval") {
+    if (task.state === "awaiting_approval" || task.state === "awaiting_intervention") {
       return task;
     }
     throw new Error(`Task ${taskId} did not reach approval state; current state: ${task.state}`);
@@ -145,13 +178,10 @@ export class OrchestratorService {
 
     const plannerPersonaId = this.personas.snapshotId("planner");
     const plannerSkillIds = this.skills.snapshotIds("planner");
-    const planSubtasks = parsePlanSubtasks(taskId, plannerResult.output, worktreePath);
-    const plannerFallback =
-      planSubtasks.length === 1 &&
-      planSubtasks[0].description === "Implement requested behavior with tests-first workflow.";
 
-    // Persist transcript before emitting `planned` so the event payload pointer
-    // is always valid.
+    // Persist transcript before we do anything else — even on failure we want
+    // the full I/O (including the `error` turn captured by the SDK executor)
+    // so the operator can see WHY planning failed.
     const transcript = plannerResult.transcript;
     const turnsJsonl = transcript
       ? transcript.turns.map((t) => JSON.stringify(t)).join("\n")
@@ -172,6 +202,42 @@ export class OrchestratorService {
       tokenOutput: plannerResult.metrics.tokenOutput ?? null,
       elapsedSeconds: plannerResult.metrics.elapsedSeconds
     });
+
+    // Surface executor failures instead of silently falling back. Previously
+    // a FAILED/TIMEOUT planner result was parsed into the generic fallback
+    // subtask and the pipeline marched on — hiding a real API error under a
+    // downstream coder TIMEOUT 12 minutes later.
+    if (plannerResult.status === "FAILED" || plannerResult.status === "TIMEOUT") {
+      // Use live task state so the pause emits a valid transition whether
+      // the caller is submitTask (planning), critiquePlan (replanning), or
+      // retryFromIntervention (planning, but with attempt > 0).
+      const currentStage = this.requireTask(taskId).state;
+      this.pauseForIntervention({
+        taskId,
+        projectId,
+        fromStage: currentStage,
+        failureCategory: plannerResult.status === "TIMEOUT" ? "planner_timeout" : "planner_failed",
+        failureReason: plannerResult.blockReason ?? `planner returned ${plannerResult.status}`,
+        forensics: {
+          agent: "planner",
+          executor_used: plannerExecutor.name,
+          model: this.plannerModel(tier),
+          persona_version_id: plannerPersonaId,
+          skill_version_ids: plannerSkillIds,
+          transcript_id: transcriptId,
+          attempt,
+          budget_seconds: this.budgetForTier(tier, "planner"),
+          elapsed_seconds: plannerResult.metrics.elapsedSeconds,
+          token_input: plannerResult.metrics.tokenInput ?? 0,
+          token_output: plannerResult.metrics.tokenOutput ?? 0
+        }
+      });
+    }
+
+    const planSubtasks = parsePlanSubtasks(taskId, plannerResult.output, worktreePath);
+    const plannerFallback =
+      planSubtasks.length === 1 &&
+      planSubtasks[0].description === "Implement requested behavior with tests-first workflow.";
 
     this.recordEvent({
       taskId,
@@ -250,6 +316,9 @@ export class OrchestratorService {
         task.planSubtasks, 0, worktreePath, branch
       );
     } catch (err) {
+      if (err instanceof StageFailedError) {
+        return this.requireTask(taskId);
+      }
       this.cleanupWorktree(taskId);
       throw err;
     }
@@ -301,6 +370,11 @@ export class OrchestratorService {
         worktreePath, nextAttempt, critique, priorPlan
       );
     } catch (err) {
+      if (err instanceof StageFailedError) {
+        // runPlannerAttempt already paused the task in awaiting_intervention
+        // with full forensics. Return the paused task so the API surfaces it.
+        return this.requireTask(taskId);
+      }
       this.transition(taskId, task.projectId, "replanning", "failed", {
         reason: err instanceof Error ? err.message : String(err)
       });
@@ -475,6 +549,102 @@ export class OrchestratorService {
   }
 
   /**
+   * Retry a paused task from a prior stage. Only valid when the task is
+   * currently in `awaiting_intervention`. Without `fromStage`, retries the
+   * stage that failed. With `fromStage`, restarts from an earlier stage (e.g.
+   * re-run the planner after a coder failure).
+   *
+   * Supported re-entry points:
+   *   - "planning"  -> re-run planner (fresh attempt)
+   *   - "executing" -> re-run coder with current plan
+   */
+  async retryFromIntervention(
+    taskId: string,
+    opts: { fromStage?: "planning" | "executing" } = {}
+  ): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    if (task.state !== "awaiting_intervention") {
+      throw new Error(`Cannot retry: task is in state '${task.state}', expected 'awaiting_intervention'`);
+    }
+
+    const events = this.deps.db.listEvents(taskId);
+    const lastFailure = [...events].reverse().find((e) => e.type === "failure_analysis");
+    const failedStage = (lastFailure?.payload.stage_failed as TaskStage | undefined) ?? "planning";
+    // `replanning` folds into `planning` for retry purposes — we re-run the
+    // planner from scratch rather than trying to resume a partial revision.
+    const targetStage = opts.fromStage ?? (failedStage === "replanning" ? "planning" : failedStage);
+
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "retry_requested",
+      status: "in_progress",
+      payload: {
+        from_stage: targetStage,
+        previously_failed_stage: failedStage,
+        iteration: task.iteration
+      },
+      budgetSeconds: 60
+    });
+
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (!worktreePath) {
+      throw new Error(`Worktree missing for task ${taskId}; cannot retry`);
+    }
+    const branch = `autoforge/${taskId}`;
+
+    if (targetStage === "planning") {
+      this.transition(taskId, task.projectId, "awaiting_intervention", "planning", { retry: true });
+      // Use the next attempt number so the failed transcript is preserved
+      // for forensics and we don't collide with the UNIQUE(task_id, stage,
+      // attempt) constraint.
+      const existingTranscripts = this.deps.db.listTranscriptsByTask(taskId);
+      const nextAttempt = existingTranscripts.filter((t) => t.stage === "planner").length;
+      try {
+        const planSubtasks = await this.runPlannerAttempt(
+          taskId, task.projectId, task.description, task.tier,
+          worktreePath, nextAttempt, null
+        );
+        // Same pause policy as submitTask so the operator reviews the new plan.
+        if (this.pausePolicy(task.tier, undefined)) {
+          this.transition(taskId, task.projectId, "planning", "awaiting_plan_approval", { planSubtasks });
+          return this.requireTask(taskId);
+        }
+        this.transition(taskId, task.projectId, "planning", "executing", { planSubtasks });
+        await this.executeAndReview(
+          taskId, task.projectId, task.description, task.tier,
+          planSubtasks, 0, worktreePath, branch
+        );
+      } catch (err) {
+        if (err instanceof StageFailedError) {
+          return this.requireTask(taskId);
+        }
+        throw err;
+      }
+      return this.requireTask(taskId);
+    }
+
+    if (targetStage === "executing") {
+      this.transition(taskId, task.projectId, "awaiting_intervention", "executing", { retry: true });
+      try {
+        await this.executeAndReview(
+          taskId, task.projectId, task.description, task.tier,
+          task.planSubtasks, task.iteration, worktreePath, branch
+        );
+      } catch (err) {
+        if (err instanceof StageFailedError) {
+          return this.requireTask(taskId);
+        }
+        throw err;
+      }
+      return this.requireTask(taskId);
+    }
+
+    throw new Error(`Retry from stage '${targetStage}' is not supported. Supported: 'planning', 'executing'.`);
+  }
+
+  /**
    * On startup, find tasks stuck in non-terminal states beyond their staleness
    * threshold and auto-fail them with a failure_analysis event.
    */
@@ -482,8 +652,9 @@ export class OrchestratorService {
     const nonTerminalStates = [
       "received", "assessing", "planning", "replanning",
       "executing", "reviewing", "reworking", "pr_created", "documenting"
-      // 'awaiting_plan_approval' and 'awaiting_approval' are intentionally excluded
-      // — both are human gates with no in-flight work and no staleness deadline.
+      // 'awaiting_plan_approval', 'awaiting_approval', and 'awaiting_intervention'
+      // are intentionally excluded — all three are human gates with no in-flight
+      // work and no staleness deadline.
     ];
     const thresholdsByTier: Record<string, number> = {
       EXPRESS: 20 * 60 * 1000,
@@ -711,16 +882,16 @@ export class OrchestratorService {
 
         if (!isSuccess(coderResult.status)) {
           const failureCategory = coderResult.status === "TIMEOUT" ? "executor_timeout" : "coder_failed";
-          this.recordEvent({
+          this.pauseForIntervention({
             taskId,
             projectId,
-            agent: "orchestrator",
-            type: "failure_analysis",
-            status: "failed",
-            payload: {
-              stage_failed: "executing",
-              failure_reason: coderResult.blockReason ?? `coder returned ${coderResult.status}`,
-              failure_category: failureCategory,
+            fromStage: "executing",
+            failureCategory,
+            failureReason: coderResult.blockReason ?? `coder returned ${coderResult.status}`,
+            forensics: {
+              agent: subtaskAgentType,
+              subtask_id: subtask.id,
+              subtask_description: subtask.description,
               executor_used: coderExecutor.name,
               persona_version_id: subtaskPersonaId,
               skill_version_ids: subtaskSkillIds,
@@ -729,15 +900,12 @@ export class OrchestratorService {
                 planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
               budget_seconds: this.budgetForTier(tier, "coder"),
               elapsed_seconds: coderResult.metrics.elapsedSeconds,
+              token_input: coderResult.metrics.tokenInput ?? 0,
+              token_output: coderResult.metrics.tokenOutput ?? 0,
+              status: coderResult.status,
               iteration
-            },
-            budgetSeconds: 60
+            }
           });
-          this.transition(taskId, projectId, "executing", "failed", {
-            reason: coderResult.blockReason ?? "coder failed",
-            iteration
-          });
-          throw new Error(`Coder failed with status ${coderResult.status}`);
         }
 
         this.recordEvent({
@@ -826,28 +994,20 @@ export class OrchestratorService {
 
       iteration += 1;
       if (iteration > 3) {
-        this.recordEvent({
+        this.pauseForIntervention({
           taskId,
           projectId,
-          agent: "orchestrator",
-          type: "failure_analysis",
-          status: "failed",
-          payload: {
-            stage_failed: "reviewing",
-            failure_reason: "Exceeded rework iteration limit (3 rounds of CRITICAL/MAJOR findings)",
-            failure_category: "rework_limit",
+          fromStage: "reviewing",
+          failureCategory: "rework_limit",
+          failureReason: "Exceeded rework iteration limit (3 rounds of CRITICAL/MAJOR findings)",
+          forensics: {
             planner_fallback: planSubtasks.length === 1 &&
               planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
             budget_seconds: this.budgetForTier(tier, "coder"),
+            unresolved_findings: unresolvedFindings.length,
             iteration
-          },
-          budgetSeconds: 60
+          }
         });
-        this.transition(taskId, projectId, "reviewing", "failed", {
-          reason: "Exceeded rework iteration limit",
-          iteration
-        });
-        throw new Error("Exceeded rework iteration limit");
       }
 
       this.transition(taskId, projectId, "reviewing", "reworking", { iteration });
@@ -887,25 +1047,22 @@ export class OrchestratorService {
     });
 
     if (!gate.accepted) {
-      this.recordEvent({
+      this.pauseForIntervention({
         taskId,
         projectId,
-        agent: "orchestrator",
-        type: "failure_analysis",
-        status: "failed",
-        payload: {
-          stage_failed: "reviewing",
-          failure_reason: gate.reason ?? "PR gate rejected task",
-          failure_category: "pr_gate",
+        fromStage: "reviewing",
+        failureCategory: "pr_gate",
+        failureReason: gate.reason ?? "PR gate rejected task",
+        forensics: {
+          test_pass_rate: testResult.passRate,
+          review_score: reviewScore,
+          unresolved_findings: unresolvedFindings.length,
           planner_fallback: planSubtasks.length === 1 &&
             planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
           budget_seconds: this.budgetForTier(tier, "coder"),
           iteration
-        },
-        budgetSeconds: 60
+        }
       });
-      this.transition(taskId, projectId, "reviewing", "failed", { reason: gate.reason, iteration });
-      throw new Error(gate.reason ?? "PR gate rejected task");
     }
 
     const createPr = this.deps.prCreator ?? createPullRequest;
@@ -940,6 +1097,45 @@ export class OrchestratorService {
       },
       budgetSeconds: 60
     });
+  }
+
+  /**
+   * Centralized failure path: record full forensics, pause the task in
+   * `awaiting_intervention`, and throw `StageFailedError`. While the system
+   * is being built we want EVERY stage failure surfaced to a human rather
+   * than silently swallowed or auto-retried. The operator decides whether
+   * to retry the failed stage or cancel.
+   */
+  private pauseForIntervention(args: {
+    taskId: string;
+    projectId: string;
+    fromStage: TaskStage;
+    failureCategory: string;
+    failureReason: string;
+    forensics: Record<string, unknown>;
+  }): never {
+    const { taskId, projectId, fromStage, failureCategory, failureReason, forensics } = args;
+    this.recordEvent({
+      taskId,
+      projectId,
+      agent: "orchestrator",
+      type: "failure_analysis",
+      status: "failed",
+      payload: {
+        stage_failed: fromStage,
+        failure_reason: failureReason,
+        failure_category: failureCategory,
+        awaiting_intervention: true,
+        ...forensics
+      },
+      budgetSeconds: 60
+    });
+    this.transition(taskId, projectId, fromStage, "awaiting_intervention", {
+      stage_failed: fromStage,
+      failure_category: failureCategory,
+      failure_reason: failureReason
+    });
+    throw new StageFailedError(taskId, fromStage, failureReason);
   }
 
   private recordEvent(input: {

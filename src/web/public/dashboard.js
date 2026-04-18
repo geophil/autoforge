@@ -129,9 +129,10 @@ function renderTaskList() {
 // --- Task Detail ---
 async function refreshTaskDetail(taskId) {
   try {
-    const [taskRes, transcriptsRes] = await Promise.all([
+    const [taskRes, transcriptsRes, eventsRes] = await Promise.all([
       fetch(`${API}/api/tasks/${taskId}`),
-      fetch(`${API}/api/transcripts/by-task/${taskId}`)
+      fetch(`${API}/api/transcripts/by-task/${taskId}`),
+      fetch(`${API}/api/tasks/${taskId}/events`)
     ]);
     if (!taskRes.ok) {
       detailContent.innerHTML = `<div class="empty-state">Task not found.</div>`;
@@ -141,6 +142,17 @@ async function refreshTaskDetail(taskId) {
     const transcripts = transcriptsRes.ok ? await transcriptsRes.json() : [];
     task.planAttempt = transcripts.length === 0 ? 0 : Math.max(...transcripts.map((t) => t.attempt));
     task.transcripts = transcripts;
+    // Surface the most recent failure_analysis so the intervention card can
+    // render forensics without a second round trip.
+    if (eventsRes.ok) {
+      const allEvents = await eventsRes.json();
+      for (let i = allEvents.length - 1; i >= 0; i--) {
+        if (allEvents[i].type === "failure_analysis") {
+          task.latestFailureAnalysis = allEvents[i];
+          break;
+        }
+      }
+    }
     renderTaskDetail(task);
   } catch {
     detailContent.innerHTML = `<div class="empty-state">Failed to load task.</div>`;
@@ -152,9 +164,61 @@ function renderTaskDetail(task) {
   const subtasks = task.planSubtasks || [];
 
   const terminalStates = ["completed", "failed"];
-  const nonTerminalStates = ["received", "assessing", "planning", "awaiting_plan_approval", "replanning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting"];
+  const nonTerminalStates = ["received", "assessing", "planning", "awaiting_plan_approval", "replanning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting", "awaiting_intervention"];
   let actionsHtml = "";
-  if (task.state === "awaiting_plan_approval") {
+
+  if (task.state === "awaiting_intervention") {
+    const fa = task.latestFailureAnalysis?.payload ?? {};
+    const stageFailed = fa.stage_failed ?? "unknown";
+    const category = fa.failure_category ?? "unknown";
+    const reason = fa.failure_reason ?? "Unknown failure";
+    const executorUsed = fa.executor_used ?? "unknown";
+    const model = fa.model ? `<div class="forensic-row"><span class="forensic-label">Model</span><span class="forensic-value">${esc(fa.model)}</span></div>` : "";
+    const elapsed = fa.elapsed_seconds != null ? `${Number(fa.elapsed_seconds).toFixed(1)}s` : "—";
+    const budget = fa.budget_seconds != null ? `${fa.budget_seconds}s` : "—";
+    const tokens = fa.token_input != null ? `${fa.token_input} in / ${fa.token_output ?? 0} out` : "—";
+    const transcriptLink = fa.transcript_id
+      ? `<div class="forensic-row"><span class="forensic-label">Transcript</span><span class="forensic-value"><a href="#" onclick="openTranscript('${esc(fa.transcript_id)}'); return false;">View full transcript →</a></span></div>`
+      : "";
+    const toolStats = fa.tool_stats
+      ? `<div class="forensic-row"><span class="forensic-label">Tool stats</span><span class="forensic-value"><code>${esc(JSON.stringify(fa.tool_stats))}</code></span></div>`
+      : "";
+
+    // Retry target: if planner failed, retrying "the failed stage" re-runs
+    // planning. If coder failed, the operator can either re-run the coder
+    // with the current plan, or go back and re-plan from scratch.
+    const canRetryFromPlanning = stageFailed === "planning" || stageFailed === "replanning" || stageFailed === "executing" || stageFailed === "reviewing";
+    const canRetryFromExecuting = stageFailed === "executing" || stageFailed === "reviewing";
+    const retryButtons = [];
+    if (canRetryFromPlanning) {
+      retryButtons.push(`<button class="btn btn-approve" onclick="retryTask('${task.id}', 'planning', this)">Retry from Planning</button>`);
+    }
+    if (canRetryFromExecuting) {
+      retryButtons.push(`<button class="btn btn-secondary" onclick="retryTask('${task.id}', 'executing', this)">Retry from Execution</button>`);
+    }
+
+    actionsHtml = `
+      <div class="task-detail-actions intervention">
+        <div class="intervention-header">
+          <h3 class="intervention-title">⚠ Paused for Intervention</h3>
+          <span class="badge badge-state" data-state="failed">${esc(category)}</span>
+        </div>
+        <div class="intervention-reason">${esc(reason)}</div>
+        <div class="intervention-forensics">
+          <div class="forensic-row"><span class="forensic-label">Failed stage</span><span class="forensic-value"><code>${esc(stageFailed)}</code></span></div>
+          <div class="forensic-row"><span class="forensic-label">Executor</span><span class="forensic-value">${esc(executorUsed)}</span></div>
+          ${model}
+          <div class="forensic-row"><span class="forensic-label">Elapsed / budget</span><span class="forensic-value">${esc(elapsed)} / ${esc(budget)}</span></div>
+          <div class="forensic-row"><span class="forensic-label">Tokens</span><span class="forensic-value">${esc(tokens)}</span></div>
+          ${toolStats}
+          ${transcriptLink}
+        </div>
+        <div class="intervention-buttons">
+          ${retryButtons.join("")}
+          <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel task</button>
+        </div>
+      </div>`;
+  } else if (task.state === "awaiting_plan_approval") {
     const attemptCount = task.planAttempt ?? 0;
     const maxAttempts = plannerMaxIterations + 1;
     const planNum = attemptCount + 1;
@@ -187,6 +251,16 @@ function renderTaskDetail(task) {
         </div>`
       : "";
 
+    const planMarkdown = typeof window.renderPlanMarkdown === "function"
+      ? window.renderPlanMarkdown(task)
+      : "";
+    const planHtml = typeof window.markdownToHtml === "function" && planMarkdown
+      ? window.markdownToHtml(planMarkdown)
+      : "";
+    const planDocBlock = planHtml
+      ? `<section class="plan-review-markdown" aria-label="Proposed plan">${planHtml}</section>`
+      : "";
+
     actionsHtml = `
       <div class="task-detail-actions plan-review">
         <div class="plan-review-header">
@@ -194,6 +268,7 @@ function renderTaskDetail(task) {
           ${viewLink}
         </div>
         <div class="plan-review-stepper">${stepper}${futureDots}</div>
+        ${planDocBlock}
         ${critiqueCallout}
         <div class="critique-wrapper">
           <textarea id="critique-input" class="critique-input" rows="4"
@@ -273,10 +348,8 @@ function renderTaskDetail(task) {
       ${assessment.rationale ? `<p style="margin-top: 0.75rem; font-size: 0.85rem; color: var(--text-muted);">${esc(assessment.rationale)}</p>` : ""}
     </div>
 
-    ${subtasks.length > 0 ? `
-    <div class="detail-section">
-      <h3>Plan (${subtasks.length} subtask${subtasks.length !== 1 ? "s" : ""})</h3>
-      ${subtasks.map((s) => `
+    ${subtasks.length > 0 ? (() => {
+      const subtaskCards = subtasks.map((s) => `
         <div class="subtask-item" data-subtask-id="${esc(s.id)}" data-subtask-status="pending">
           <div class="subtask-header">
             <span class="subtask-status-icon" aria-hidden="true"></span>
@@ -290,8 +363,26 @@ function renderTaskDetail(task) {
             <ul>${s.testCriteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
           </div>` : ""}
         </div>
-      `).join("")}
-    </div>` : ""}
+      `).join("");
+      const heading = `Plan (${subtasks.length} subtask${subtasks.length !== 1 ? "s" : ""})`;
+      // When the markdown plan is shown above (awaiting_plan_approval state), collapse
+      // the raw structured view to avoid duplication. Otherwise keep it expanded so the
+      // live subtask-progress indicators remain visible during execution.
+      if (task.state === "awaiting_plan_approval") {
+        return `
+    <div class="detail-section">
+      <details class="raw-subtasks">
+        <summary><h3 style="display:inline; margin:0;">${heading}</h3> <span class="raw-subtasks-hint">raw structured view</span></summary>
+        ${subtaskCards}
+      </details>
+    </div>`;
+      }
+      return `
+    <div class="detail-section">
+      <h3>${heading}</h3>
+      ${subtaskCards}
+    </div>`;
+    })() : ""}
 
     <div class="detail-section" id="findings-section">
       <h3>Pipeline Event Log</h3>
@@ -663,12 +754,36 @@ async function critiquePlan(taskId, btnEl) {
   });
 }
 
+async function retryTask(taskId, fromStage, btnEl) {
+  const label = fromStage === "planning" ? "Re-planning…" : "Retrying execution…";
+  await runAction(btnEl, label, btnEl?.closest(".intervention-buttons"), async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fromStage })
+      });
+      if (res.status === 409) {
+        toast("Task is no longer paused for intervention.", "error");
+        return;
+      }
+      if (!res.ok) throw new Error(await res.text());
+      toast(`Retry started from ${fromStage}.`, "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Retry failed: ${err.message}`, "error");
+    }
+  });
+}
+
 // Make actions available from inline onclick handlers
 window.approveTask = approveTask;
 window.rejectTask = rejectTask;
 window.cancelTask = cancelTask;
 window.approvePlan = approvePlan;
 window.critiquePlan = critiquePlan;
+window.retryTask = retryTask;
 window.openTask = (taskId) => {
   currentTaskId = taskId;
   refreshTaskDetail(taskId);
@@ -829,7 +944,8 @@ const dialogTranscript = document.getElementById("dialog-transcript");
 const transcriptMeta = document.getElementById("transcript-meta");
 const transcriptPane = document.getElementById("transcript-pane");
 let currentTranscript = null;
-let currentTab = "system";
+let currentTranscriptTask = null;
+let currentTab = "plan";
 
 document.getElementById("btn-close-transcript").addEventListener("click", () => dialogTranscript.close());
 
@@ -850,6 +966,16 @@ async function openTranscript(transcriptId) {
       return;
     }
     currentTranscript = await res.json();
+    currentTranscriptTask = null;
+    // Fetch the parent task so the Plan tab can render with full context
+    // (description, tier, assessment). Non-fatal if it fails — the Plan tab
+    // will fall back to showing just the subtasks from the transcript output.
+    if (currentTranscript.taskId) {
+      try {
+        const taskRes = await fetch(`${API}/api/tasks/${currentTranscript.taskId}`);
+        if (taskRes.ok) currentTranscriptTask = await taskRes.json();
+      } catch { /* ignore */ }
+    }
     document.getElementById("transcript-title").textContent =
       `Planner — attempt ${currentTranscript.attempt} — ${currentTranscript.model ?? currentTranscript.executorUsed}`;
     transcriptMeta.innerHTML = `
@@ -857,9 +983,9 @@ async function openTranscript(transcriptId) {
       <span>elapsed: ${formatElapsed(currentTranscript.elapsedSeconds)}</span>
       <span>executor: ${esc(currentTranscript.executorUsed)}</span>
     `;
-    currentTab = "system";
+    currentTab = "plan";
     document.querySelectorAll(".tab-btn").forEach((b) =>
-      b.classList.toggle("active", b.dataset.tab === "system")
+      b.classList.toggle("active", b.dataset.tab === "plan")
     );
     renderTranscriptTab();
     dialogTranscript.showModal();
@@ -915,6 +1041,31 @@ window.copyToClipboard = async (btn, text) => {
 
 function renderTranscriptTab() {
   if (!currentTranscript) return;
+  if (currentTab === "plan") {
+    let parsedOutput = null;
+    try { parsedOutput = JSON.parse(currentTranscript.output ?? "null"); } catch { parsedOutput = null; }
+    const subtasks = Array.isArray(parsedOutput?.subtasks) ? parsedOutput.subtasks : [];
+    const taskForRender = {
+      description: currentTranscriptTask?.description ?? "",
+      tier: currentTranscriptTask?.tier ?? "",
+      assessment: currentTranscriptTask?.assessment ?? {},
+      planSubtasks: subtasks
+    };
+    const md = typeof window.renderPlanMarkdown === "function"
+      ? window.renderPlanMarkdown(taskForRender)
+      : "";
+    const html = typeof window.markdownToHtml === "function" && md
+      ? window.markdownToHtml(md)
+      : "";
+    if (!html) {
+      transcriptPane.innerHTML = `<div class="empty-state">No plan produced for this attempt.</div>`;
+      return;
+    }
+    transcriptPane.innerHTML = `
+      <div class="pane-toolbar">${copyBtn(md, "Copy as markdown")}</div>
+      <section class="plan-review-markdown plan-tab-pane">${html}</section>`;
+    return;
+  }
   if (currentTab === "system") {
     transcriptPane.innerHTML = `
       <div class="pane-toolbar">${copyBtn(currentTranscript.systemPrompt, "Copy system prompt")}</div>

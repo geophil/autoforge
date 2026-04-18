@@ -24,6 +24,10 @@ const CritiqueSchema = z.object({
   critique: z.string().min(1).max(4000)
 });
 
+const RetrySchema = z.object({
+  fromStage: z.enum(["planning", "executing"]).optional()
+});
+
 export function createApprovalRoutes(service: OrchestratorService, events: LiveEventHub): Hono {
   const app = new Hono();
 
@@ -64,6 +68,30 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
         return ctx.json({ error: "invalid_state", message: msg }, 409);
       }
       throw err;
+    }
+  });
+
+  app.post("/:id/retry", async (ctx) => {
+    let fromStage: "planning" | "executing" | undefined;
+    try {
+      const body = RetrySchema.parse(await ctx.req.json().catch(() => ({})));
+      fromStage = body.fromStage;
+    } catch (err) {
+      return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    try {
+      const task = await service.retryFromIntervention(ctx.req.param("id"), { fromStage });
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot retry:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      if (msg.startsWith("Retry from stage")) {
+        return ctx.json({ error: "unsupported_stage", message: msg }, 400);
+      }
+      return ctx.json({ error: "retry_failed", message: msg }, 400);
     }
   });
 
