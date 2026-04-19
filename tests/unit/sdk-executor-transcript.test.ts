@@ -116,21 +116,106 @@ describe("SDK executor transcript capture", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// MCP wiring (client-side)
+//
+// AnthropicSdkExecutor opens a Streamable HTTP MCP client to QMD_MCP_URL at
+// the start of each execute() call, lists its tools, exposes them alongside
+// the executor's local tools, and routes tool_use blocks named after an MCP
+// tool to the MCP client. These tests stub the MCP client via a private
+// `_testMcpClient` hook so they don't need a real server.
+// ---------------------------------------------------------------------------
+
+interface FakeMcpCall {
+  name: string;
+  arguments?: Record<string, unknown>;
+}
+
+function buildFakeMcpClient(opts?: {
+  tools?: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>;
+  callResponse?: (call: FakeMcpCall) => Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }>;
+}) {
+  const calls: FakeMcpCall[] = [];
+  let closed = false;
+  const tools = opts?.tools ?? [
+    {
+      name: "query",
+      description: "Query the QMD knowledge base",
+      inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] }
+    }
+  ];
+  const client = {
+    async listTools() {
+      return {
+        tools: tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: (t.inputSchema ?? { type: "object" }) as {
+            type: "object";
+            properties?: Record<string, unknown>;
+            required?: string[];
+          }
+        }))
+      };
+    },
+    async callTool(params: { name: string; arguments?: Record<string, unknown> }) {
+      calls.push({ name: params.name, arguments: params.arguments });
+      if (opts?.callResponse) return opts.callResponse(params);
+      return { content: [{ type: "text" as const, text: `result for ${params.name}` }] };
+    },
+    async close() {
+      closed = true;
+    }
+  };
+  return { client, calls, isClosed: () => closed };
+}
+
+describe("SDK executor prompt caching", () => {
+  test("places an ephemeral cache_control breakpoint on the system prompt", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-cache-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const captured: { system?: unknown } = {};
+    const exec = new AnthropicSdkExecutor("test-key", "sonnet");
+    (exec as unknown as { _testCreate?: (opts: { system?: unknown }) => Promise<unknown> })
+      ._testCreate = async (opts) => {
+        captured.system = opts.system;
+        return { usage: { input_tokens: 1, output_tokens: 1 }, stop_reason: "end_turn", content: [] };
+      };
+
+    await exec.execute({
+      id: "tc", type: "planner", systemPrompt: "persona-text", prompt: "u",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(Array.isArray(captured.system)).toBe(true);
+    const blocks = captured.system as Array<{ type: string; text: string; cache_control?: { type: string } }>;
+    expect(blocks.length).toBe(1);
+    expect(blocks[0].type).toBe("text");
+    expect(blocks[0].text).toContain("persona-text");
+    expect(blocks[0].cache_control).toEqual({ type: "ephemeral" });
+  });
+});
+
 describe("SDK executor MCP wiring", () => {
-  test("includes mcp_servers when QMD_MCP_URL is set", async () => {
+  test("registers MCP tools alongside local tools when QMD_MCP_URL is set", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sdk-mcp-"));
     writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
 
-    const captured: { mcp_servers?: unknown } = {};
+    const fake = buildFakeMcpClient({
+      tools: [
+        { name: "query", description: "QMD search" },
+        { name: "get", description: "Fetch a doc" }
+      ]
+    });
+    const captured: { tools?: Array<{ name: string }> } = {};
+
     const exec = new AnthropicSdkExecutor("test-key", "sonnet");
-    (exec as unknown as { _testCreate?: (opts: { mcp_servers?: unknown }) => Promise<unknown> })
+    (exec as unknown as { _testMcpClient?: unknown })._testMcpClient = fake.client;
+    (exec as unknown as { _testCreate?: (opts: { tools?: Array<{ name: string }> }) => Promise<unknown> })
       ._testCreate = async (opts) => {
-        captured.mcp_servers = opts.mcp_servers;
-        return {
-          usage: { input_tokens: 1, output_tokens: 1 },
-          stop_reason: "end_turn",
-          content: []
-        };
+        captured.tools = opts.tools;
+        return { usage: { input_tokens: 1, output_tokens: 1 }, stop_reason: "end_turn", content: [] };
       };
 
     await exec.execute({
@@ -140,20 +225,74 @@ describe("SDK executor MCP wiring", () => {
       skillFiles: []
     });
 
-    expect(captured.mcp_servers).toEqual([
-      { type: "url", url: "http://localhost:8181/mcp", name: "qmd" }
-    ]);
+    const toolNames = (captured.tools ?? []).map((t) => t.name);
+    expect(toolNames).toContain("read_file");
+    expect(toolNames).toContain("bash");
+    expect(toolNames).toContain("query");
+    expect(toolNames).toContain("get");
+    expect(fake.isClosed()).toBe(true);
   });
 
-  test("omits mcp_servers when QMD_MCP_URL is unset", async () => {
+  test("dispatches tool_use to the MCP client when the tool name matches", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-mcp-disp-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const fake = buildFakeMcpClient({
+      tools: [{ name: "query", description: "QMD search" }],
+      callResponse: async () => ({
+        content: [{ type: "text" as const, text: "doc snippet about caching" }]
+      })
+    });
+
+    const exec = new AnthropicSdkExecutor("test-key", "sonnet");
+    (exec as unknown as { _testMcpClient?: unknown })._testMcpClient = fake.client;
+    let callCount = 0;
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          usage: { input_tokens: 5, output_tokens: 7 },
+          stop_reason: "tool_use",
+          content: [
+            { type: "tool_use", id: "tu_q", name: "query", input: { q: "caching" } }
+          ]
+        };
+      }
+      return {
+        usage: { input_tokens: 5, output_tokens: 7 },
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "done" }]
+      };
+    };
+
+    const result = await exec.execute({
+      id: "tm-disp", type: "planner", systemPrompt: "p", prompt: "u",
+      workingDirectory: dir, budgetSeconds: 30,
+      environment: { QMD_MCP_URL: "http://localhost:8181/mcp" },
+      skillFiles: []
+    });
+
+    expect(fake.calls).toEqual([{ name: "query", arguments: { q: "caching" } }]);
+    const toolResult = result.transcript!.turns.find((t) => t.kind === "tool_result");
+    expect(toolResult).toBeDefined();
+    if (toolResult && toolResult.kind === "tool_result") {
+      expect(toolResult.content).toBe("doc snippet about caching");
+    }
+    expect(fake.isClosed()).toBe(true);
+  });
+
+  test("skips MCP entirely when QMD_MCP_URL is unset", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sdk-nomcp-"));
     writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
 
-    const captured: { mcp_servers?: unknown } = {};
+    const fake = buildFakeMcpClient();
+    const captured: { tools?: Array<{ name: string }> } = {};
+
     const exec = new AnthropicSdkExecutor("test-key", "sonnet");
-    (exec as unknown as { _testCreate?: (opts: { mcp_servers?: unknown }) => Promise<unknown> })
+    (exec as unknown as { _testMcpClient?: unknown })._testMcpClient = fake.client;
+    (exec as unknown as { _testCreate?: (opts: { tools?: Array<{ name: string }> }) => Promise<unknown> })
       ._testCreate = async (opts) => {
-        captured.mcp_servers = opts.mcp_servers;
+        captured.tools = opts.tools;
         return { usage: { input_tokens: 1, output_tokens: 1 }, stop_reason: "end_turn", content: [] };
       };
 
@@ -162,7 +301,11 @@ describe("SDK executor MCP wiring", () => {
       workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
-    expect(captured.mcp_servers).toBeUndefined();
+    const toolNames = (captured.tools ?? []).map((t) => t.name);
+    expect(toolNames).toContain("read_file");
+    expect(toolNames).not.toContain("query");
+    expect(fake.calls).toEqual([]);
+    expect(fake.isClosed()).toBe(false);
   });
 });
 
