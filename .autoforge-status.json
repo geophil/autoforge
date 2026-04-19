@@ -1,10 +1,4 @@
 {
   "status": "DONE",
-  "artifacts": [
-    "src/orchestrator/service.ts",
-    "src/db/client.ts",
-    "tests/integration/archive.test.ts",
-    "tests/db-archive.test.ts",
-    "tests/unit/archived-tasks.test.ts"
-  ]
+  "artifacts": ["src/web/routes/tasks.ts", "tests/unit/task-archive-routes.test.ts"]
 }
