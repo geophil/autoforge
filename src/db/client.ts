@@ -394,6 +394,34 @@ export class DbClient {
     }
   }
 
+  archiveTask(taskId: string): void {
+    const row = this.sqlite.query("SELECT id FROM tasks WHERE id = ?").get(taskId);
+    if (!row) throw new Error(`Task not found: ${taskId}`);
+    const now = new Date().toISOString();
+    this.sqlite.query("UPDATE tasks SET archived_at = ?, updated_at = ? WHERE id = ?").run(now, now, taskId);
+  }
+
+  unarchiveTask(taskId: string): void {
+    const row = this.sqlite.query("SELECT id FROM tasks WHERE id = ?").get(taskId);
+    if (!row) throw new Error(`Task not found: ${taskId}`);
+    const now = new Date().toISOString();
+    this.sqlite.query("UPDATE tasks SET archived_at = NULL, updated_at = ? WHERE id = ?").run(now, taskId);
+  }
+
+  deleteTaskPermanently(taskId: string): void {
+    const row = this.sqlite.query("SELECT id, archived_at FROM tasks WHERE id = ?").get(taskId) as { id: string; archived_at: string | null } | null;
+    if (!row) throw new Error(`Task not found: ${taskId}`);
+    if (!row.archived_at) throw new Error(`Task must be archived before permanent deletion: ${taskId}`);
+    this.sqlite.transaction(() => {
+      this.sqlite.query("DELETE FROM subtasks WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM review_findings WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM events WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM agent_transcripts WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM routing_calibration WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM tasks WHERE id = ?").run(taskId);
+    })();
+  }
+
   metricsForProject(projectId: string): Record<string, number> {
     const totals = this.sqlite
       .query(
