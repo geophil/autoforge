@@ -11,6 +11,10 @@
     <div class="header-left">
       <h1>Autoforge</h1>
       <span class="connection-badge" id="connection-badge">connecting</span>
+      <span class="running-badge" id="running-badge" hidden>
+        <span class="running-dot"></span>
+        <span id="running-count">0</span> running
+      </span>
     </div>
     <nav>
       <button class="nav-btn active" data-view="tasks">Tasks</button>
@@ -38,9 +42,43 @@
             Description
             <textarea name="description" rows="4" placeholder="Describe the feature or change..." required></textarea>
           </label>
+          <details class="advanced-options">
+            <summary>Advanced options</summary>
+            <label class="checkbox-label">
+              <input type="checkbox" name="reviewPlan" id="opt-review-plan" checked />
+              <span class="checkbox-text">
+                Review plan before execution
+                <small>Pause after planning so you can inspect or critique the plan. Ignored for EXPRESS unless forced on. Tier-based by default.</small>
+              </span>
+            </label>
+            <label>
+              Tier override
+              <select name="forceTier" id="opt-force-tier">
+                <option value="">Auto (assessed from description)</option>
+                <option value="EXPRESS">EXPRESS — quick, single-shot, no review</option>
+                <option value="STANDARD">STANDARD — full pipeline with review</option>
+                <option value="THOROUGH">THOROUGH — extended budgets, deeper planning</option>
+              </select>
+            </label>
+          </details>
           <div class="dialog-actions">
             <button type="button" class="btn btn-ghost" id="btn-cancel-task">Cancel</button>
             <button type="submit" class="btn btn-primary">Submit</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog id="dialog-cancel">
+        <form id="form-cancel">
+          <h3>Cancel Task</h3>
+          <p class="dialog-blurb">This will stop the task, close any open PR, and mark it as failed.</p>
+          <label>
+            Reason (optional)
+            <textarea name="reason" rows="3" placeholder="Why are you cancelling? (used in the failure event)"></textarea>
+          </label>
+          <div class="dialog-actions">
+            <button type="button" class="btn btn-ghost" id="btn-cancel-cancel">Back</button>
+            <button type="submit" class="btn btn-reject-submit">Cancel Task</button>
           </div>
         </form>
       </dialog>
@@ -129,6 +167,23 @@
     </section>
   </main>
 
+  <dialog id="dialog-transcript" class="dialog dialog-wide">
+    <div class="dialog-header">
+      <h2 id="transcript-title">Transcript</h2>
+      <button class="btn btn-ghost btn-sm" id="btn-close-transcript">Close</button>
+    </div>
+    <div class="transcript-meta" id="transcript-meta"></div>
+    <div class="transcript-tabs">
+      <button class="tab-btn active" data-tab="plan">Plan</button>
+      <button class="tab-btn" data-tab="system">System Prompt</button>
+      <button class="tab-btn" data-tab="user">User Prompt</button>
+      <button class="tab-btn" data-tab="transcript">Transcript</button>
+      <button class="tab-btn" data-tab="output">Output</button>
+    </div>
+    <div class="transcript-pane" id="transcript-pane"></div>
+  </dialog>
+
+  <script src="/static/plan-markdown.js"></script>
   <script src="/static/dashboard.js"></script>
 </body>
 </html>

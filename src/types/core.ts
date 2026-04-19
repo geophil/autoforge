@@ -16,12 +16,15 @@ export type TaskStage =
   | "received"
   | "assessing"
   | "planning"
+  | "awaiting_plan_approval"
+  | "replanning"
   | "executing"
   | "reviewing"
   | "reworking"
   | "pr_created"
   | "awaiting_approval"
   | "documenting"
+  | "awaiting_intervention"
   | "completed"
   | "failed";
 

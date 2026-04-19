@@ -18,6 +18,8 @@
   --red-dim: rgba(248, 113, 113, 0.12);
   --orange: #fb923c;
   --orange-dim: rgba(251, 146, 60, 0.12);
+  --cyan: #22d3ee;
+  --cyan-dim: rgba(34, 211, 238, 0.14);
   --radius: 8px;
   --radius-sm: 4px;
   --font-mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
@@ -244,11 +246,31 @@ h2 {
 .badge-state { background: var(--accent-dim); color: var(--accent); }
 .badge-state[data-state="completed"] { background: var(--green-dim); color: var(--green); }
 .badge-state[data-state="failed"] { background: var(--red-dim); color: var(--red); }
-.badge-state[data-state="awaiting_approval"] { background: var(--yellow-dim); color: var(--yellow); }
+.badge-state[data-state="awaiting_intervention"] { background: rgba(220, 120, 80, 0.18); color: rgb(220, 120, 80); }
+/* PR review (awaiting merge) — cyan to distinguish from plan review (yellow) */
+.badge-state[data-state="awaiting_approval"] { background: var(--cyan-dim); color: var(--cyan); }
 .badge-state[data-state="executing"],
 .badge-state[data-state="reviewing"],
 .badge-state[data-state="planning"],
 .badge-state[data-state="documenting"] { background: var(--orange-dim); color: var(--orange); }
+
+/* State badge icons for at-a-glance + colorblind distinction */
+.badge-state::before {
+  display: inline-block;
+  margin-right: 0.3em;
+  font-size: 0.85em;
+  line-height: 1;
+}
+.badge-state[data-state="awaiting_plan_approval"]::before { content: "◐"; }
+.badge-state[data-state="replanning"]::before { content: "↻"; }
+.badge-state[data-state="awaiting_approval"]::before { content: "⇡"; }
+.badge-state[data-state="executing"]::before,
+.badge-state[data-state="reviewing"]::before,
+.badge-state[data-state="planning"]::before,
+.badge-state[data-state="documenting"]::before { content: "●"; }
+.badge-state[data-state="completed"]::before { content: "✓"; }
+.badge-state[data-state="failed"]::before { content: "✕"; }
+.badge-state[data-state="awaiting_intervention"]::before { content: "⚠"; }
 
 .badge-tier { background: var(--bg-surface-active); color: var(--text-muted); }
 
@@ -513,10 +535,31 @@ dialog {
   padding: 1.5rem;
   max-width: 480px;
   width: 90vw;
+  /* Explicit centering — some browsers don't center <dialog> by default,
+     and wrapper layouts can knock UA centering off. */
+  margin: auto;
+  inset: 0;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
 }
 
 dialog::backdrop {
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  animation: dialog-backdrop-fade 0.15s ease-out;
+}
+
+dialog[open] {
+  animation: dialog-fade-in 0.15s ease-out;
+}
+
+@keyframes dialog-fade-in {
+  from { opacity: 0; transform: translateY(-8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes dialog-backdrop-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 dialog h3 {
@@ -531,8 +574,9 @@ dialog label {
   margin-bottom: 0.75rem;
 }
 
-dialog input,
-dialog textarea {
+dialog input:not([type="checkbox"]):not([type="radio"]),
+dialog textarea,
+dialog select {
   display: block;
   width: 100%;
   background: var(--bg);
@@ -546,7 +590,8 @@ dialog textarea {
 }
 
 dialog input:focus,
-dialog textarea:focus {
+dialog textarea:focus,
+dialog select:focus {
   outline: none;
   border-color: var(--accent);
 }
@@ -685,4 +730,609 @@ dialog textarea:focus {
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* Plan review panel */
+.task-detail-actions.plan-review {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.75rem;
+}
+.plan-review-title { margin: 0 0 0.25rem 0; font-size: 0.95rem; color: var(--text-muted); }
+.critique-input {
+  width: 100%;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  resize: vertical;
+}
+.plan-review-buttons { display: flex; gap: 0.5rem; align-items: center; }
+.btn-secondary {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Intervention panel — surfaced failure awaiting operator input */
+.task-detail-actions.intervention {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.75rem;
+  border: 1px solid rgba(220, 120, 80, 0.35);
+  background: rgba(220, 120, 80, 0.06);
+  border-radius: 6px;
+  padding: 1rem;
+}
+.intervention-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.intervention-title {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--text);
+}
+.intervention-reason {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.intervention-forensics {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  font-size: 0.85rem;
+}
+.forensic-row {
+  display: contents;
+}
+.forensic-label {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  padding-top: 0.15rem;
+}
+.forensic-value {
+  color: var(--text);
+  word-break: break-word;
+}
+.forensic-value code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+}
+.intervention-buttons {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.25rem;
+}
+
+/* Subtask card extensions */
+.subtask-header { display: flex; gap: 0.5rem; align-items: center; }
+.subtask-agent {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  background: var(--bg-surface);
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  color: var(--text-muted);
+}
+.subtask-tests { margin-top: 0.4rem; font-size: 0.8rem; color: var(--text-muted); }
+.subtask-tests-label { font-weight: 600; margin-bottom: 0.2rem; }
+.subtask-tests ul { margin: 0; padding-left: 1.2rem; }
+
+/* Transcript drill-down dialog */
+.dialog-wide { max-width: 80vw; width: 80vw; max-height: 85vh; }
+.dialog-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+.transcript-meta { display: flex; gap: 1rem; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+.transcript-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; }
+.tab-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
+.transcript-pane {
+  max-height: 65vh;
+  overflow: auto;
+  font-size: 0.85rem;
+  background: var(--bg);
+  padding: 0.5rem;
+  border-radius: 4px;
+}
+.prompt-block, .output-block {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  margin: 0;
+}
+.critique-block {
+  margin-top: 0.75rem;
+  padding: 0.5rem;
+  background: var(--bg-surface);
+  border-left: 3px solid var(--yellow);
+  border-radius: 3px;
+}
+.turn { margin: 0.4rem 0; }
+.turn-assistant { padding: 0.4rem; background: var(--bg-surface); border-radius: 3px; }
+.turn-tool-result, .turn-tool-use, .turn-mcp { background: var(--bg-surface); padding: 0.3rem 0.5rem; border-radius: 3px; }
+.turn-tool-result pre, .turn-tool-use pre, .turn-mcp pre {
+  white-space: pre-wrap; word-break: break-word; max-height: 30vh; overflow: auto; margin: 0.3rem 0 0 0;
+}
+.turn-compaction { color: var(--text-dim); text-align: center; padding: 0.5rem; font-style: italic; }
+.mcp-badge {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 0.65rem;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  margin-right: 0.3rem;
+}
+.view-transcript-link { color: var(--accent); font-weight: 500; font-size: 0.85rem; margin-left: 0.5rem; }
+.block-text { white-space: pre-wrap; }
+
+/* Plan-review state badges */
+.badge-state[data-state="awaiting_plan_approval"] {
+  background: var(--yellow);
+  color: var(--bg);
+}
+.badge-state[data-state="replanning"] {
+  background: var(--orange);
+  color: var(--bg);
+}
+.card-pill {
+  font-size: 0.7rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  font-weight: 500;
+}
+.card-pill-plan { background: var(--yellow); color: var(--bg); }
+.card-pill-pr { background: var(--cyan); color: var(--bg); }
+/* Legacy alias — older commits referenced this class name */
+.card-plan-badge { background: var(--yellow); color: var(--bg); font-size: 0.7rem; padding: 0.05rem 0.4rem; border-radius: 3px; font-weight: 500; }
+
+/* ============================================================ */
+/* UI polish pass — advanced options, dialogs, transcript, etc. */
+/* ============================================================ */
+
+/* Advanced options in New Task dialog */
+.advanced-options {
+  margin-top: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-surface);
+}
+.advanced-options[open] {
+  padding-bottom: 0.75rem;
+}
+.advanced-options summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  font-weight: 500;
+  padding: 0.1rem 0;
+  user-select: none;
+}
+.advanced-options summary:hover {
+  color: var(--text);
+}
+.advanced-options > label,
+.advanced-options > .checkbox-label {
+  display: block;
+  margin-top: 0.75rem;
+}
+.checkbox-label {
+  display: flex !important;
+  align-items: flex-start;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+.checkbox-label input[type="checkbox"] {
+  margin-top: 0.2rem;
+  flex-shrink: 0;
+}
+.checkbox-label .checkbox-text {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+.checkbox-label .checkbox-text small {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  margin-top: 0.2rem;
+  font-weight: normal;
+}
+
+.dialog-blurb {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+/* Plan review panel header + stepper */
+.plan-review-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.plan-review-stepper {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  margin: 0.25rem 0 0.5rem;
+}
+.step-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.step-dot:hover:not(.future) {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+.step-dot.current {
+  background: var(--yellow);
+  color: var(--bg);
+  border-color: var(--yellow);
+}
+.step-dot.future {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Prior critique callout */
+.prior-critique {
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--bg-surface);
+  border-left: 3px solid var(--yellow);
+  border-radius: 3px;
+}
+.prior-critique-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.prior-critique-body {
+  font-size: 0.9rem;
+  color: var(--text);
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
+/* Critique input + counter */
+.critique-wrapper {
+  position: relative;
+}
+.critique-counter {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.4rem;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  pointer-events: none;
+  background: var(--bg);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+}
+.critique-counter.at-limit {
+  color: var(--red);
+  font-weight: 600;
+}
+
+/* Transcript viewer polish */
+.pane-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.25rem 0 0.5rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+}
+.copy-btn {
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  padding: 0.2rem 0.55rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.copy-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+.copy-btn.copied {
+  background: var(--green);
+  color: var(--bg);
+  border-color: var(--green);
+}
+.transcript-filter {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.3rem 0.5rem;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+.transcript-filter-count {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.turn-icon {
+  display: inline-block;
+  width: 1.2em;
+  text-align: center;
+  opacity: 0.85;
+}
+.turn-preview {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.8rem;
+  margin-left: 0.4rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.turn details summary {
+  cursor: pointer;
+  padding: 0.25rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.turn details summary .copy-btn {
+  margin-left: auto;
+}
+
+/* Button working state + spinner */
+.btn-working {
+  opacity: 0.85;
+  cursor: progress !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+button:disabled:not(.btn-working) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.spinner {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* In-flight task pulse — used on cards and badges to signal "running now" */
+.running-pulse {
+  position: relative;
+}
+.running-pulse::after {
+  content: "";
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  width: 0.55rem;
+  height: 0.55rem;
+  background: var(--orange);
+  border-radius: 50%;
+  box-shadow: 0 0 0 0 var(--orange);
+  animation: pulse 1.6s ease-out infinite;
+}
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(251, 146, 60, 0.55); }
+  70%  { box-shadow: 0 0 0 10px rgba(251, 146, 60, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(251, 146, 60, 0); }
+}
+
+/* Live state banner inside task detail, when state is actively running */
+.live-state-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--orange-dim);
+  color: var(--orange);
+  border-radius: 4px;
+  font-size: 0.85rem;
+  margin-top: 0.5rem;
+}
+.live-state-banner .dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  background: var(--orange);
+  border-radius: 50%;
+  flex-shrink: 0;
+  animation: pulse 1.6s ease-out infinite;
+}
+
+/* Subtask status indicators (done / running / pending) */
+.subtask-status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.subtask-item[data-subtask-status="done"] .subtask-status-icon {
+  background: var(--green);
+  color: var(--bg);
+}
+.subtask-item[data-subtask-status="done"] .subtask-status-icon::before {
+  content: "✓";
+}
+.subtask-item[data-subtask-status="running"] .subtask-status-icon {
+  background: var(--orange);
+  color: var(--bg);
+  animation: pulse 1.6s ease-out infinite;
+}
+.subtask-item[data-subtask-status="running"] .subtask-status-icon::before {
+  content: "●";
+}
+.subtask-item[data-subtask-status="pending"] .subtask-status-icon {
+  background: var(--bg);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+.subtask-item[data-subtask-status="pending"] .subtask-status-icon::before {
+  content: "○";
+}
+.subtask-item[data-subtask-status="done"] {
+  opacity: 0.75;
+}
+.subtask-item[data-subtask-status="running"] {
+  border-left: 3px solid var(--orange);
+  padding-left: calc(0.75rem - 3px);
+}
+
+/* Global "N running" header badge */
+.running-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: var(--orange-dim);
+  color: var(--orange);
+  padding: 0.15rem 0.55rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.running-badge[hidden] { display: none; }
+.running-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--orange);
+  animation: pulse 1.6s ease-out infinite;
+}
+
+/* Rendered plan markdown — shared by Plan Review Panel and transcript Plan tab. */
+.plan-review-markdown {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.9rem 1.1rem;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.plan-review-markdown h1,
+.plan-review-markdown h2,
+.plan-review-markdown h3 {
+  margin: 0.9rem 0 0.4rem 0;
+  line-height: 1.3;
+}
+.plan-review-markdown h1 { font-size: 1.05rem; margin-top: 0; color: var(--text); }
+.plan-review-markdown h2 {
+  font-size: 0.95rem;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.25rem;
+}
+.plan-review-markdown h3 {
+  font-size: 0.9rem;
+  color: var(--text);
+}
+.plan-review-markdown p {
+  margin: 0.35rem 0;
+  color: var(--text-muted);
+}
+.plan-review-markdown ul {
+  margin: 0.25rem 0 0.5rem 0;
+  padding-left: 1.25rem;
+}
+.plan-review-markdown li { margin: 0.15rem 0; }
+.plan-review-markdown li ul { margin-top: 0.2rem; }
+.plan-review-markdown code {
+  background: var(--bg);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  color: var(--text);
+}
+.plan-review-markdown strong { color: var(--text); }
+.plan-review-markdown em { color: var(--text-muted); }
+
+.plan-tab-pane {
+  background: transparent;
+  border: none;
+  padding: 0.25rem 0.25rem 1rem 0.25rem;
+}
+
+/* Collapsible "raw structured view" of subtasks, shown below the markdown plan
+   on the plan-review page. */
+.raw-subtasks > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.1rem 0;
+}
+.raw-subtasks > summary::-webkit-details-marker { display: none; }
+.raw-subtasks > summary::before {
+  content: "▸";
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+.raw-subtasks[open] > summary::before { content: "▾"; }
+.raw-subtasks-hint {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }

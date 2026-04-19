@@ -10,6 +10,8 @@ export interface AgentTask {
   environment: Record<string, string>;
   skillFiles: string[];
   metadata?: Record<string, unknown>;
+  /** Per-run model override. When unset, executor uses its configured default. */
+  model?: string;
 }
 
 export interface ToolStats {
@@ -18,6 +20,18 @@ export interface ToolStats {
   bashCount: number;
   searchCount: number;
   iterations: number;
+}
+
+export type AgentTranscriptTurn =
+  | { kind: "assistant"; content: unknown[] }
+  | { kind: "tool_result"; toolUseId: string; content: string }
+  | { kind: "compaction"; droppedTurns: number }
+  | { kind: "error"; name: string; message: string; stack?: string };
+
+export interface AgentTranscript {
+  systemPrompt: string;
+  userPrompt: string;
+  turns: AgentTranscriptTurn[];
 }
 
 export interface AgentResult {
@@ -33,6 +47,8 @@ export interface AgentResult {
     estimatedCost?: number;
     toolStats?: ToolStats;
   };
+  /** Captured by SDK executor. Claude Code returns undefined. */
+  transcript?: AgentTranscript;
 }
 
 export interface AgentExecutor {

@@ -1,15 +1,29 @@
 import type { TaskStage } from "../types/core";
 
 const allowedTransitions: Record<TaskStage, TaskStage[]> = {
-  received: ["assessing", "failed"],
-  assessing: ["planning", "failed"],
-  planning: ["executing", "failed"],
-  executing: ["reviewing", "reworking", "failed"],
-  reviewing: ["reworking", "pr_created", "failed"],
-  reworking: ["executing", "failed"],
-  pr_created: ["awaiting_approval", "reworking", "failed"],
+  received: ["assessing", "failed", "awaiting_intervention"],
+  assessing: ["planning", "failed", "awaiting_intervention"],
+  planning: ["awaiting_plan_approval", "executing", "failed", "awaiting_intervention"],
+  awaiting_plan_approval: ["executing", "replanning", "failed"],
+  replanning: ["awaiting_plan_approval", "failed", "awaiting_intervention"],
+  executing: ["reviewing", "reworking", "failed", "awaiting_intervention"],
+  reviewing: ["reworking", "pr_created", "failed", "awaiting_intervention"],
+  reworking: ["executing", "failed", "awaiting_intervention"],
+  pr_created: ["awaiting_approval", "reworking", "failed", "awaiting_intervention"],
   awaiting_approval: ["documenting", "reworking", "failed"],
-  documenting: ["completed", "failed"],
+  documenting: ["completed", "failed", "awaiting_intervention"],
+  // From awaiting_intervention the operator can cancel (-> failed) or retry,
+  // re-entering whichever stage was paused. Listing all re-entry targets keeps
+  // retry logic in one place rather than special-casing each caller.
+  awaiting_intervention: [
+    "failed",
+    "planning",
+    "replanning",
+    "executing",
+    "reviewing",
+    "reworking",
+    "documenting"
+  ],
   completed: [],
   failed: []
 };

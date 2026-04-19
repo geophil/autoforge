@@ -20,6 +20,14 @@ const CancelSchema = z.object({
   reason: z.string().min(1).default("Cancelled by operator.")
 });
 
+const CritiqueSchema = z.object({
+  critique: z.string().min(1).max(4000)
+});
+
+const RetrySchema = z.object({
+  fromStage: z.enum(["planning", "executing"]).optional()
+});
+
 export function createApprovalRoutes(service: OrchestratorService, events: LiveEventHub): Hono {
   const app = new Hono();
 
@@ -47,6 +55,69 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
     const task = await service.cancelTask(ctx.req.param("id"), reason);
     events.publish({ type: "task.updated", data: task });
     return ctx.json(task);
+  });
+
+  app.post("/:id/approve-plan", async (ctx) => {
+    try {
+      const task = await service.approvePlan(ctx.req.param("id"));
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot approve plan:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      throw err;
+    }
+  });
+
+  app.post("/:id/retry", async (ctx) => {
+    let fromStage: "planning" | "executing" | undefined;
+    try {
+      const body = RetrySchema.parse(await ctx.req.json().catch(() => ({})));
+      fromStage = body.fromStage;
+    } catch (err) {
+      return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    try {
+      const task = await service.retryFromIntervention(ctx.req.param("id"), { fromStage });
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot retry:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      if (msg.startsWith("Retry from stage")) {
+        return ctx.json({ error: "unsupported_stage", message: msg }, 400);
+      }
+      return ctx.json({ error: "retry_failed", message: msg }, 400);
+    }
+  });
+
+  app.post("/:id/critique-plan", async (ctx) => {
+    let body: { critique: string };
+    try {
+      body = CritiqueSchema.parse(await ctx.req.json());
+    } catch (err) {
+      return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    try {
+      const task = await service.critiquePlan(ctx.req.param("id"), body.critique);
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Match the orchestrator's specific iteration-limit phrasing to avoid
+      // false positives from unrelated "limit" words (e.g. "rate limit").
+      if (msg.includes("iteration limit")) {
+        return ctx.json({ error: "iteration_limit_reached", message: msg }, 409);
+      }
+      if (msg.startsWith("Cannot critique plan:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      return ctx.json({ error: "critique_failed", message: msg }, 400);
+    }
   });
 
   return app;

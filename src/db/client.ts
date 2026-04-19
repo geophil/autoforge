@@ -1,9 +1,10 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import type { AutoforgeMessage } from "../nats/messages";
 import type { AgentType, PipelineTask, PlanSubtask, ReviewFinding, TaskStage, Tier } from "../types/core";
+import type { AgentTranscriptInput, AgentTranscriptMeta, AgentTranscriptRow } from "../types/transcripts";
 import { applyEventProjection } from "./projections";
 
 export class DbClient {
@@ -91,6 +92,84 @@ export class DbClient {
             : undefined
       });
     }
+  }
+
+  insertTranscript(input: AgentTranscriptInput): string {
+    const id = randomUUID();
+    this.sqlite.query(`
+      INSERT INTO agent_transcripts (
+        id, task_id, stage, attempt, created_at, executor_used, model,
+        system_prompt, user_prompt, transcript, output, critique,
+        token_input, token_output, elapsed_seconds
+      ) VALUES (
+        $id, $task_id, $stage, $attempt, $created_at, $executor_used, $model,
+        $system_prompt, $user_prompt, $transcript, $output, $critique,
+        $token_input, $token_output, $elapsed_seconds
+      )
+    `).run({
+      $id: id,
+      $task_id: input.taskId,
+      $stage: input.stage,
+      $attempt: input.attempt,
+      $created_at: new Date().toISOString(),
+      $executor_used: input.executorUsed,
+      $model: input.model,
+      $system_prompt: input.systemPrompt,
+      $user_prompt: input.userPrompt,
+      $transcript: input.transcript,
+      $output: input.output,
+      $critique: input.critique,
+      $token_input: input.tokenInput,
+      $token_output: input.tokenOutput,
+      $elapsed_seconds: input.elapsedSeconds
+    });
+    return id;
+  }
+
+  listTranscriptsByTask(taskId: string): AgentTranscriptMeta[] {
+    const rows = this.sqlite.query(`
+      SELECT id, task_id, stage, attempt, created_at, executor_used, model,
+             token_input, token_output, elapsed_seconds
+      FROM agent_transcripts
+      WHERE task_id = ?
+      ORDER BY attempt ASC
+    `).all(taskId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      taskId: String(r.task_id),
+      stage: String(r.stage),
+      attempt: Number(r.attempt),
+      createdAt: String(r.created_at),
+      executorUsed: String(r.executor_used),
+      model: r.model === null ? null : String(r.model),
+      tokenInput: r.token_input === null ? null : Number(r.token_input),
+      tokenOutput: r.token_output === null ? null : Number(r.token_output),
+      elapsedSeconds: r.elapsed_seconds === null ? null : Number(r.elapsed_seconds)
+    }));
+  }
+
+  getTranscript(id: string): AgentTranscriptRow | null {
+    const row = this.sqlite.query(
+      "SELECT * FROM agent_transcripts WHERE id = ?"
+    ).get(id) as Record<string, unknown> | null;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      taskId: String(row.task_id),
+      stage: String(row.stage),
+      attempt: Number(row.attempt),
+      createdAt: String(row.created_at),
+      executorUsed: String(row.executor_used),
+      model: row.model === null ? null : String(row.model),
+      systemPrompt: String(row.system_prompt),
+      userPrompt: String(row.user_prompt),
+      transcript: String(row.transcript),
+      output: row.output === null ? null : String(row.output),
+      critique: row.critique === null ? null : String(row.critique),
+      tokenInput: row.token_input === null ? null : Number(row.token_input),
+      tokenOutput: row.token_output === null ? null : Number(row.token_output),
+      elapsedSeconds: row.elapsed_seconds === null ? null : Number(row.elapsed_seconds)
+    };
   }
 
   listTasks(): PipelineTask[] {

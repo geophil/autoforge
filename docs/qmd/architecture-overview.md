@@ -68,11 +68,20 @@ Human → HTTP POST /api/meta
    d. recordEvent("created")
    e. executor.execute({
         type: "planner",
+        model: plannerModel(tier),                  ← tier-aware planner model
         systemPrompt: personas.resolve("planner"),  ← persona injected
         skillFiles: skills.skillsForAgent("planner"),
-        environment: { QMD_MCP_URL }               ← knowledge base access
-      }) → PlanSubtask[] (each with optional agentType)
-   f. for each subtask:
+        environment: { QMD_MCP_URL }                ← knowledge base access
+      }) → PlanSubtask[] + AgentTranscript (captured turn-by-turn)
+        db.insertTranscript({ taskId, stage: "planner", attempt, turns, ... })
+   f. if pausePolicy(tier, opts.reviewPlan):
+        transition to "awaiting_plan_approval" → return
+        Human inspects plan + transcript via dashboard Plan Review Panel.
+        On approve  → continue at step g.
+        On critique → re-run planner with original prompt + prior plan + critique
+                      (up to PLANNER_MAX_ITERATIONS revisions, default 3),
+                      append a new agent_transcripts row, stay at (f).
+   g. for each subtask:
         executor.execute({
           type: subtask.agentType ?? "coder",
           systemPrompt: personas.resolve(agentType),  ← specialist persona
@@ -81,11 +90,11 @@ Human → HTTP POST /api/meta
         worktrees.commit(branch, message)
         recordEvent("subtask_done", { persona_version_id, skill_version_ids, token_usage })
       (loop up to 3x if reviewer finds CRITICAL/MAJOR; EXPRESS skips reviewer)
-   g. runAuthenticatedTests(worktreePath)
-   h. recordEvent("test_results", { passRate })
-   i. evaluatePrGate(passRate, reviewScore, findings)
-   j. createPullRequest(branch, description, findings)
-   k. recordEvent("state.awaiting_approval")
+   h. runAuthenticatedTests(worktreePath)
+   i. recordEvent("test_results", { passRate })
+   j. evaluatePrGate(passRate, reviewScore, findings)
+   k. createPullRequest(branch, description, findings)
+   l. recordEvent("state.awaiting_approval")
 3. Return task { state: "awaiting_approval", prUrl }
 
 4. Human reviews PR on GitHub

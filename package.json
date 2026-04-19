@@ -12,6 +12,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.87.0",
     "@hono/node-server": "latest",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "hono": "latest",
     "nats": "latest",
     "uuid": "latest",

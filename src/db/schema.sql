@@ -159,3 +159,26 @@ WHERE e.agent IN ('planner', 'coder', 'reviewer', 'doc')
   AND t.state IN ('completed', 'failed')
   AND json_extract(e.payload, '$.persona_version_id') IS NOT NULL
 GROUP BY json_extract(e.payload, '$.persona_version_id'), e.agent;
+
+-- Agent transcripts (planner stage in v1; reserves room for other stages).
+-- One row per planner attempt. Holds composed system prompt, user prompt,
+-- turn-by-turn transcript JSONL, and parsed output.
+CREATE TABLE IF NOT EXISTS agent_transcripts (
+  id              TEXT PRIMARY KEY,
+  task_id         TEXT NOT NULL,
+  stage           TEXT NOT NULL,
+  attempt         INTEGER NOT NULL,
+  created_at      TEXT NOT NULL,
+  executor_used   TEXT NOT NULL,
+  model           TEXT,
+  system_prompt   TEXT NOT NULL,
+  user_prompt     TEXT NOT NULL,
+  transcript      TEXT NOT NULL,
+  output          TEXT,
+  critique        TEXT,
+  token_input     INTEGER,
+  token_output    INTEGER,
+  elapsed_seconds REAL,
+  UNIQUE(task_id, stage, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_transcripts_task ON agent_transcripts(task_id, stage, attempt);
