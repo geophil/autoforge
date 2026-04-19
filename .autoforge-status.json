@@ -1,8 +1,26 @@
 {
-  "status": "DONE",
-  "artifacts": [
-    "src/web/public/dashboard.js",
-    "src/web/public/index.html",
-    "src/web/public/styles.css"
-  ]
+  "status": "DONE_WITH_CONCERNS",
+  "artifacts": [],
+  "output": {
+    "findings": [
+      {
+        "severity": "CRITICAL",
+        "category": "correctness",
+        "description": "tests/unit/task-archive-routes.test.ts line 20 uses `plan: []` but PipelineTask defines the field as `planSubtasks: PlanSubtask[]`. This causes `bun run lint` (tsc --noEmit) to exit with code 2. The spec criterion 'Type check / build command passes' is not met.",
+        "filePath": "tests/unit/task-archive-routes.test.ts"
+      },
+      {
+        "severity": "MAJOR",
+        "category": "spec_compliance",
+        "description": "README.md has no 'Archiving tasks' section. The spec explicitly requires a one-paragraph section describing the UI (archive/restore/delete buttons) and the archive endpoints (POST /archive, POST /unarchive, DELETE /:id). The criterion is entirely unmet.",
+        "filePath": "README.md"
+      },
+      {
+        "severity": "MINOR",
+        "category": "spec_compliance",
+        "description": "projections.ts has no comment documenting that `archived_at` is projection state (not event-sourced) and that rebuildProjectionsFromEvents() therefore leaves it as NULL for all tasks. The spec explicitly asks for this comment.",
+        "filePath": "src/db/projections.ts"
+      }
+    ]
+  }
 }
