@@ -1,4 +1,8 @@
 {
   "status": "DONE",
-  "artifacts": ["src/web/routes/tasks.ts", "tests/unit/task-archive-routes.test.ts"]
+  "artifacts": [
+    "src/web/public/dashboard.js",
+    "src/web/public/index.html",
+    "src/web/public/styles.css"
+  ]
 }
