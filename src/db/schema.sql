@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   iteration   INTEGER NOT NULL DEFAULT 0,
   pr_url      TEXT,
   created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
+  updated_at  TEXT NOT NULL,
+  archived_at TEXT
 );
 
 -- Subtasks within a task

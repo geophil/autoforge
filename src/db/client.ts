@@ -19,6 +19,12 @@ export class DbClient {
   initSchema(schemaPath: string): void {
     const schema = readFileSync(schemaPath, "utf8");
     this.sqlite.exec(schema);
+    // Idempotent migration: add archived_at to tasks if it was not yet present
+    // (handles existing databases created before this column was added to schema.sql).
+    const taskCols = this.sqlite.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!taskCols.some((c) => c.name === "archived_at")) {
+      this.sqlite.exec("ALTER TABLE tasks ADD COLUMN archived_at TEXT");
+    }
   }
 
   appendEvent(message: AutoforgeMessage, opts?: { resumable?: boolean; executorUsed?: string; contextEnvelopeHash?: string }): void {
@@ -185,7 +191,8 @@ export class DbClient {
       iteration: Number(row.iteration),
       prUrl: row.pr_url ? String(row.pr_url) : undefined,
       createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at)
+      updatedAt: String(row.updated_at),
+      archivedAt: row.archived_at ? String(row.archived_at) : undefined
     }));
   }
 
@@ -205,7 +212,8 @@ export class DbClient {
       iteration: Number(row.iteration),
       prUrl: row.pr_url ? String(row.pr_url) : undefined,
       createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at)
+      updatedAt: String(row.updated_at),
+      archivedAt: row.archived_at ? String(row.archived_at) : undefined
     };
   }
 

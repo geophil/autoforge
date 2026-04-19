@@ -84,4 +84,5 @@ export interface PipelineTask {
   prUrl?: string;
   createdAt: string;
   updatedAt: string;
+  archivedAt?: string;
 }
