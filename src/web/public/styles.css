@@ -1312,6 +1312,61 @@ button:disabled:not(.btn-working) {
   padding: 0.25rem 0.25rem 1rem 0.25rem;
 }
 
+/* Active / Archived tab toggle inside the Tasks view */
+.tasks-tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+}
+
+.tasks-tab-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 500;
+  transition: all 0.15s;
+}
+
+.tasks-tab-btn:hover {
+  color: var(--text);
+  background: var(--bg-surface-hover);
+}
+
+.tasks-tab-btn.active {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+/* Ghost/icon action buttons on task cards (archive, restore, delete) */
+.task-card-action-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.8rem;
+  line-height: 1;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.task-card-action-btn:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+  background: var(--bg-surface-hover);
+}
+
+.task-card-delete-btn:hover {
+  color: var(--red);
+  border-color: var(--red);
+  background: var(--red-dim);
+}
+
 /* Collapsible "raw structured view" of subtasks, shown below the markdown plan
    on the plan-review page. */
 .raw-subtasks > summary {

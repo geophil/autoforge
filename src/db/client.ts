@@ -19,6 +19,12 @@ export class DbClient {
   initSchema(schemaPath: string): void {
     const schema = readFileSync(schemaPath, "utf8");
     this.sqlite.exec(schema);
+    // Idempotent migration: add archived_at to tasks if it was not yet present
+    // (handles existing databases created before this column was added to schema.sql).
+    const taskCols = this.sqlite.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!taskCols.some((c) => c.name === "archived_at")) {
+      this.sqlite.exec("ALTER TABLE tasks ADD COLUMN archived_at TEXT");
+    }
   }
 
   appendEvent(message: AutoforgeMessage, opts?: { resumable?: boolean; executorUsed?: string; contextEnvelopeHash?: string }): void {
@@ -172,8 +178,14 @@ export class DbClient {
     };
   }
 
-  listTasks(): PipelineTask[] {
-    const rows = this.sqlite.query("SELECT * FROM tasks ORDER BY created_at DESC").all() as Array<Record<string, unknown>>;
+  listTasks(opts?: { includeArchived?: boolean; onlyArchived?: boolean }): PipelineTask[] {
+    let whereClause = " WHERE archived_at IS NULL";
+    if (opts?.onlyArchived) {
+      whereClause = " WHERE archived_at IS NOT NULL";
+    } else if (opts?.includeArchived) {
+      whereClause = "";
+    }
+    const rows = this.sqlite.query(`SELECT * FROM tasks${whereClause} ORDER BY created_at DESC`).all() as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: String(row.id),
       projectId: String(row.project_id),
@@ -185,7 +197,8 @@ export class DbClient {
       iteration: Number(row.iteration),
       prUrl: row.pr_url ? String(row.pr_url) : undefined,
       createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at)
+      updatedAt: String(row.updated_at),
+      archivedAt: row.archived_at ? String(row.archived_at) : undefined
     }));
   }
 
@@ -205,7 +218,8 @@ export class DbClient {
       iteration: Number(row.iteration),
       prUrl: row.pr_url ? String(row.pr_url) : undefined,
       createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at)
+      updatedAt: String(row.updated_at),
+      archivedAt: row.archived_at ? String(row.archived_at) : undefined
     };
   }
 
@@ -384,6 +398,34 @@ export class DbClient {
         }
       }
     }
+  }
+
+  archiveTask(taskId: string): void {
+    const row = this.sqlite.query("SELECT id FROM tasks WHERE id = ?").get(taskId);
+    if (!row) throw new Error(`Task not found: ${taskId}`);
+    const now = new Date().toISOString();
+    this.sqlite.query("UPDATE tasks SET archived_at = ?, updated_at = ? WHERE id = ?").run(now, now, taskId);
+  }
+
+  unarchiveTask(taskId: string): void {
+    const row = this.sqlite.query("SELECT id FROM tasks WHERE id = ?").get(taskId);
+    if (!row) throw new Error(`Task not found: ${taskId}`);
+    const now = new Date().toISOString();
+    this.sqlite.query("UPDATE tasks SET archived_at = NULL, updated_at = ? WHERE id = ?").run(now, taskId);
+  }
+
+  deleteTaskPermanently(taskId: string): void {
+    const row = this.sqlite.query("SELECT id, archived_at FROM tasks WHERE id = ?").get(taskId) as { id: string; archived_at: string | null } | null;
+    if (!row) throw new Error(`Task not found: ${taskId}`);
+    if (!row.archived_at) throw new Error(`Task must be archived before permanent deletion: ${taskId}`);
+    this.sqlite.transaction(() => {
+      this.sqlite.query("DELETE FROM subtasks WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM review_findings WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM events WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM agent_transcripts WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM routing_calibration WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM tasks WHERE id = ?").run(taskId);
+    })();
   }
 
   metricsForProject(projectId: string): Record<string, number> {

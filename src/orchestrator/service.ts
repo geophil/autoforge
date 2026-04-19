@@ -54,12 +54,64 @@ export class OrchestratorService {
     this.personas = new PersonaRegistry(deps.db, resolve(process.cwd(), "src/personas"));
   }
 
-  listTasks(): PipelineTask[] {
-    return this.deps.db.listTasks();
+  listTasks(opts?: { includeArchived?: boolean; onlyArchived?: boolean }): PipelineTask[] {
+    return this.deps.db.listTasks(opts);
   }
 
   getTask(taskId: string): PipelineTask | null {
     return this.deps.db.getTask(taskId);
+  }
+
+  async archiveTask(taskId: string): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    const terminalStates: TaskStage[] = ["completed", "failed"];
+    if (!terminalStates.includes(task.state)) {
+      throw new Error(`Cannot archive task ${taskId}: must be in a terminal state (completed or failed), current state: '${task.state}'`);
+    }
+    this.cleanupWorktree(taskId);
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "task_archived",
+      status: "done",
+      payload: { taskId },
+      budgetSeconds: 60
+    });
+    this.deps.db.archiveTask(taskId);
+    return this.requireTask(taskId);
+  }
+
+  async unarchiveTask(taskId: string): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "task_unarchived",
+      status: "done",
+      payload: { taskId },
+      budgetSeconds: 60
+    });
+    this.deps.db.unarchiveTask(taskId);
+    return this.requireTask(taskId);
+  }
+
+  async deleteTaskPermanently(taskId: string): Promise<void> {
+    const task = this.requireTask(taskId);
+    if (!task.archivedAt) {
+      throw new Error(`Cannot delete task ${taskId}: task must be archived before permanent deletion`);
+    }
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "task_deleted",
+      status: "done",
+      payload: { taskId },
+      budgetSeconds: 60
+    });
+    this.deps.db.deleteTaskPermanently(taskId);
   }
 
   async submitTask(

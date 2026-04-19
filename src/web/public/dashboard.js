@@ -4,6 +4,7 @@ const API = "";
 let tasks = [];
 let currentTaskId = null;
 let plannerMaxIterations = 3;
+let taskListTab = 'active'; // 'active' | 'archived'
 
 // --- DOM refs ---
 const badge = document.getElementById("connection-badge");
@@ -14,6 +15,15 @@ const metricsGrid = document.getElementById("metrics-grid");
 // --- Navigation ---
 document.querySelectorAll(".nav-btn").forEach((btn) => {
   btn.addEventListener("click", () => showView(btn.dataset.view));
+});
+
+document.querySelectorAll(".tasks-tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    taskListTab = btn.dataset.tab;
+    document.querySelectorAll(".tasks-tab-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    refreshTasks();
+  });
 });
 
 function showView(name) {
@@ -55,6 +65,11 @@ function connectSSE() {
     if (currentTaskId) refreshTaskDetail(currentTaskId);
   });
 
+  es.addEventListener("task.deleted", () => {
+    markLive();
+    refreshTasks();
+  });
+
   es.onerror = () => {
     badge.textContent = "disconnected";
     badge.className = "connection-badge disconnected";
@@ -64,7 +79,10 @@ function connectSSE() {
 // --- Tasks ---
 async function refreshTasks() {
   try {
-    const res = await fetch(`${API}/api/tasks`);
+    const url = taskListTab === 'archived'
+      ? `${API}/api/tasks?archived=true`
+      : `${API}/api/tasks`;
+    const res = await fetch(url);
     tasks = await res.json();
     renderTaskList();
   } catch {
@@ -79,7 +97,10 @@ const RUNNING_STATES = new Set([
 
 function renderTaskList() {
   if (tasks.length === 0) {
-    taskList.innerHTML = `<div class="empty-state">No tasks yet. Submit one to get started.</div>`;
+    const msg = taskListTab === 'archived'
+      ? 'No archived tasks.'
+      : 'No tasks yet. Submit one to get started.';
+    taskList.innerHTML = `<div class="empty-state">${msg}</div>`;
     return;
   }
 
@@ -92,10 +113,16 @@ function renderTaskList() {
     runningBadge.hidden = runningCount === 0;
   }
 
+  const isArchivedView = taskListTab === 'archived';
+
   taskList.innerHTML = tasks
     .map(
       (t) => {
         const isRunning = RUNNING_STATES.has(t.state);
+        const actionBtns = isArchivedView
+          ? `<button class="task-card-action-btn" title="Restore task" onclick="unarchiveTask('${t.id}', event)">↩</button>
+             <button class="task-card-action-btn task-card-delete-btn" title="Delete permanently" onclick="deleteTask('${t.id}', event)">⊗</button>`
+          : `<button class="task-card-action-btn" title="Archive task" onclick="archiveTask('${t.id}', event)">⊡</button>`;
         return `
     <div class="task-card ${isRunning ? "running-pulse" : ""}" data-id="${t.id}">
       <div class="task-card-body">
@@ -111,6 +138,7 @@ function renderTaskList() {
       <div class="task-card-right">
         <span class="badge badge-tier">${t.tier}</span>
         <span class="badge badge-state" data-state="${t.state}">${formatState(t.state)}</span>
+        ${actionBtns}
       </div>
     </div>`;
       }
@@ -777,6 +805,43 @@ async function retryTask(taskId, fromStage, btnEl) {
   });
 }
 
+async function archiveTask(taskId, event) {
+  event.stopPropagation();
+  try {
+    const res = await fetch(`${API}/api/tasks/${taskId}/archive`, { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    toast('Task archived.', 'success');
+    refreshTasks();
+  } catch (err) {
+    toast(`Archive failed: ${err.message}`, 'error');
+  }
+}
+
+async function unarchiveTask(taskId, event) {
+  event.stopPropagation();
+  try {
+    const res = await fetch(`${API}/api/tasks/${taskId}/unarchive`, { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    toast('Task restored.', 'success');
+    refreshTasks();
+  } catch (err) {
+    toast(`Restore failed: ${err.message}`, 'error');
+  }
+}
+
+async function deleteTask(taskId, event) {
+  event.stopPropagation();
+  if (!confirm('Permanently delete this task? This cannot be undone.')) return;
+  try {
+    const res = await fetch(`${API}/api/tasks/${taskId}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(await res.text());
+    toast('Task deleted.', 'success');
+    refreshTasks();
+  } catch (err) {
+    toast(`Delete failed: ${err.message}`, 'error');
+  }
+}
+
 // Make actions available from inline onclick handlers
 window.approveTask = approveTask;
 window.rejectTask = rejectTask;
@@ -784,6 +849,9 @@ window.cancelTask = cancelTask;
 window.approvePlan = approvePlan;
 window.critiquePlan = critiquePlan;
 window.retryTask = retryTask;
+window.archiveTask = archiveTask;
+window.unarchiveTask = unarchiveTask;
+window.deleteTask = deleteTask;
 window.openTask = (taskId) => {
   currentTaskId = taskId;
   refreshTaskDetail(taskId);
