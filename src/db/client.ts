@@ -178,8 +178,14 @@ export class DbClient {
     };
   }
 
-  listTasks(): PipelineTask[] {
-    const rows = this.sqlite.query("SELECT * FROM tasks ORDER BY created_at DESC").all() as Array<Record<string, unknown>>;
+  listTasks(opts?: { includeArchived?: boolean; onlyArchived?: boolean }): PipelineTask[] {
+    let whereClause = " WHERE archived_at IS NULL";
+    if (opts?.onlyArchived) {
+      whereClause = " WHERE archived_at IS NOT NULL";
+    } else if (opts?.includeArchived) {
+      whereClause = "";
+    }
+    const rows = this.sqlite.query(`SELECT * FROM tasks${whereClause} ORDER BY created_at DESC`).all() as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: String(row.id),
       projectId: String(row.project_id),

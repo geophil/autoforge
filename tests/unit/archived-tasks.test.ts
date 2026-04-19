@@ -98,7 +98,7 @@ describe("DbClient.listTasks — archivedAt field", () => {
       )
       .run("t-archived", "proj-1", "desc", "completed", "STANDARD", "{}", "[]", 0, "2026-04-19T00:00:00Z", "2026-04-19T00:00:00Z", "2026-04-19T12:00:00Z");
 
-    const tasks = db.listTasks();
+    const tasks = db.listTasks({ includeArchived: true });
     const task = tasks.find((t) => t.id === "t-archived");
     expect(task).toBeDefined();
     expect(task!.archivedAt).toBe("2026-04-19T12:00:00Z");

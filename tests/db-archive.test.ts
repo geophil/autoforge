@@ -84,7 +84,7 @@ describe("DbClient.archiveTask", () => {
     const db = freshDb();
     insertTask(db, "task-2");
     db.archiveTask("task-2");
-    const tasks = db.listTasks();
+    const tasks = db.listTasks({ includeArchived: true });
     const task = tasks.find((t) => t.id === "task-2");
     expect(task).toBeDefined();
     expect(task!.archivedAt).toBeDefined();
