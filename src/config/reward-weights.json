@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "weights": {
+    "correctness": 0.2,
+    "simplicity": 0.2,
+    "alignment": 0.2,
+    "fidelity": 0.2,
+    "efficiency": 0.2
+  }
+}

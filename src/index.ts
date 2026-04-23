@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { resolve } from "node:path";
 import { loadEnv } from "./config/env";
+import { getRewardWeights } from "./config/reward";
 import { DbClient } from "./db/client";
 import { createExecutors } from "./executors/factory";
 import { WorktreeManager } from "./git/worktrees";
@@ -14,6 +15,7 @@ const db = new DbClient(env.DATABASE_PATH);
 const schemaPath = resolve(import.meta.dir, "./db/schema.sql");
 const migrationsPath = resolve(import.meta.dir, "./db/migrations");
 db.initSchema(schemaPath, migrationsPath);
+getRewardWeights();
 
 // NATS connection is optional — system runs without it (SQLite-only mode).
 const nats = new NatsClient(env.NATS_URL);

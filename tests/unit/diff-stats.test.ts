@@ -3,7 +3,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeDiffStats } from "../../src/orchestrator/diff-stats";
+import { computeDiffStats, computeIterationDiff } from "../../src/orchestrator/diff-stats";
 
 function initRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "diff-stats-test-"));
@@ -69,6 +69,35 @@ describe("computeDiffStats", () => {
     expect(stats!.lines_deleted).toBe(2);
     expect(stats!.test_files_changed).toBe(0);
 
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("computeIterationDiff", () => {
+  test("returns the per-iteration delta between two commit refs", () => {
+    const dir = initRepo();
+    writeFileSync(join(dir, "iter0.ts"), "a\nb\n");
+    execSync("git add -A", { cwd: dir });
+    execSync("git commit -q -m iter0", { cwd: dir });
+    const iter0Ref = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+
+    writeFileSync(join(dir, "iter1.ts"), "x\ny\nz\n");
+    execSync("git add -A", { cwd: dir });
+    execSync("git commit -q -m iter1", { cwd: dir });
+    const iter1Ref = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+
+    const delta = computeIterationDiff(dir, iter0Ref, iter1Ref);
+    expect(delta).not.toBeNull();
+    expect(delta!.files_changed).toBe(1);
+    expect(delta!.lines_added).toBe(3);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns null when refs are invalid", () => {
+    const dir = initRepo();
+    const delta = computeIterationDiff(dir, "bogus1", "bogus2");
+    expect(delta).toBeNull();
     rmSync(dir, { recursive: true, force: true });
   });
 });

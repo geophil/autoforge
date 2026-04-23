@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join as pathJoin } from "node:path";
 import type { AppEnv } from "../config/env";
 import { assessComplexity, routeTier } from "../assessment/tier";
 import { type AutoforgeMessage } from "../nats/messages";
-import type { AgentExecutor } from "../executors/interface";
+import type { AgentExecutor, ToolStats } from "../executors/interface";
 import type { DbClient } from "../db/client";
 import type { NatsClient } from "../nats/client";
 import type { AgentType, PipelineTask, PlanSubtask, RejectionFeedback, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
 import { assertTransition } from "./state-machine";
-import { computeDiffStats } from "./diff-stats";
+import { computeDiffStats, computeIterationDiff } from "./diff-stats";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
@@ -217,6 +218,16 @@ export class OrchestratorService {
   ): Promise<PlanSubtask[]> {
     const plannerExecutor = this.routeExecutor(tier, "planner");
     const userPrompt = this.buildPlannerPrompt(description, tier, attempt, priorPlan, critique);
+    const plannerPersonaId = this.personas.snapshotId("planner");
+    const plannerSkillIds = this.skills.snapshotIds("planner");
+
+    this.emitVariantSelected({
+      taskId,
+      projectId,
+      agentType: "planner",
+      selectedVariantId: plannerPersonaId,
+      budgetSeconds: this.budgetForTier(tier, "planner")
+    });
 
     const plannerResult = await plannerExecutor.execute({
       id: taskId,
@@ -230,9 +241,6 @@ export class OrchestratorService {
       metadata: { description, tier, attempt },
       model: this.plannerModel(tier)
     });
-
-    const plannerPersonaId = this.personas.snapshotId("planner");
-    const plannerSkillIds = this.skills.snapshotIds("planner");
 
     // Persist transcript before we do anything else — even on failure we want
     // the full I/O (including the `error` turn captured by the SDK executor)
@@ -267,7 +275,8 @@ export class OrchestratorService {
       // Use live task state so the pause emits a valid transition whether
       // the caller is submitTask (planning), critiquePlan (replanning), or
       // retryFromIntervention (planning, but with attempt > 0).
-      const currentStage = this.requireTask(taskId).state;
+      const currentTask = this.requireTask(taskId);
+      const currentStage = currentTask.state;
       this.pauseForIntervention({
         taskId,
         projectId,
@@ -280,8 +289,11 @@ export class OrchestratorService {
           model: this.plannerModel(tier),
           persona_version_id: plannerPersonaId,
           skill_version_ids: plannerSkillIds,
+          tool_stats: plannerResult.metrics.toolStats ?? null,
+          planner_fallback: false,
           transcript_id: transcriptId,
           attempt,
+          iteration: currentTask.iteration,
           budget_seconds: this.budgetForTier(tier, "planner"),
           elapsed_seconds: plannerResult.metrics.elapsedSeconds,
           token_input: plannerResult.metrics.tokenInput ?? 0,
@@ -456,6 +468,13 @@ export class OrchestratorService {
       const docSkillIds = this.skills.snapshotIds("doc");
 
       const docExecutor = this.routeExecutor(task.tier, "doc");
+      this.emitVariantSelected({
+        taskId,
+        projectId: task.projectId,
+        agentType: "doc",
+        selectedVariantId: docPersonaId,
+        budgetSeconds: this.budgetForTier(task.tier, "doc")
+      });
       const docResult = await docExecutor.execute({
         id: `${taskId}-doc`,
         type: "doc",
@@ -522,7 +541,7 @@ export class OrchestratorService {
       agent: "orchestrator",
       type: "failure_analysis",
       status: "failed",
-      payload: {
+      payload: this.failureAnalysisPayload({
         stage_failed: "awaiting_approval",
         failure_reason: `Rejected by reviewer: ${feedback.reason}`,
         failure_category: "rejected",
@@ -531,7 +550,7 @@ export class OrchestratorService {
         planner_fallback: oldTask.planSubtasks.length === 1 &&
           oldTask.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
         iteration: oldTask.iteration
-      },
+      }),
       budgetSeconds: 60
     });
     this.transition(taskId, oldTask.projectId, "awaiting_approval", "failed", {
@@ -590,7 +609,7 @@ export class OrchestratorService {
       agent: "orchestrator",
       type: "failure_analysis",
       status: "failed",
-      payload: {
+      payload: this.failureAnalysisPayload({
         stage_failed: task.state,
         failure_reason: reason,
         failure_category: "cancelled",
@@ -598,7 +617,7 @@ export class OrchestratorService {
           task.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
         budget_seconds: this.budgetForTier(task.tier, "coder"),
         iteration: task.iteration
-      },
+      }),
       budgetSeconds: 60
     });
 
@@ -737,7 +756,7 @@ export class OrchestratorService {
           agent: "orchestrator",
           type: "failure_analysis",
           status: "failed",
-          payload: {
+          payload: this.failureAnalysisPayload({
             stage_failed: task.state,
             failure_reason: `Task stuck in '${task.state}' for more than ${Math.round((now - updatedAt) / 60000)} minutes`,
             failure_category: "stalled",
@@ -746,7 +765,7 @@ export class OrchestratorService {
             budget_seconds: this.budgetForTier(task.tier, "coder"),
             elapsed_ms: now - updatedAt,
             iteration: task.iteration
-          },
+          }),
           budgetSeconds: 60
         });
 
@@ -802,6 +821,14 @@ export class OrchestratorService {
     const metaPersonaId = this.personas.snapshotId("meta");
     const metaSkillIds = this.skills.snapshotIds("meta");
     const metaExecutor = this.routeExecutor("STANDARD", "meta");
+
+    this.emitVariantSelected({
+      taskId: metaTaskId,
+      projectId,
+      agentType: "meta",
+      selectedVariantId: metaPersonaId,
+      budgetSeconds: 600
+    });
 
     const metaResult = await metaExecutor.execute({
       id: metaTaskId,
@@ -920,6 +947,12 @@ export class OrchestratorService {
   ): Promise<void> {
     let iteration = startingIteration;
     let unresolvedFindings: ReviewFinding[] = [];
+    let lastReviewerFailureForensics: {
+      executor_used: string | null;
+      persona_version_id: string | null;
+      skill_version_ids: string[];
+      tool_stats: ToolStats | null;
+    } | null = null;
 
     while (true) {
       const currentState = this.requireTask(taskId).state;
@@ -927,11 +960,21 @@ export class OrchestratorService {
         this.transition(taskId, projectId, currentState, "executing", { iteration });
       }
 
+      this.captureIterationDiff(taskId, worktreePath, iteration);
+
       for (const subtask of planSubtasks) {
         const subtaskAgentType = subtask.agentType ?? "coder";
         const subtaskPersonaId = this.personas.snapshotId(subtaskAgentType);
         const subtaskSkillIds = this.skills.snapshotIds(subtaskAgentType);
         const coderExecutor = this.routeExecutor(tier, subtaskAgentType);
+
+        this.emitVariantSelected({
+          taskId,
+          projectId,
+          agentType: subtaskAgentType,
+          selectedVariantId: subtaskPersonaId,
+          budgetSeconds: this.budgetForTier(tier, "coder")
+        });
 
         const coderResult = await coderExecutor.execute({
           id: subtask.id,
@@ -1007,6 +1050,14 @@ export class OrchestratorService {
       const reviewerSkillIds = this.skills.snapshotIds("reviewer");
       const reviewerExecutor = this.routeExecutor(tier, "reviewer");
 
+      this.emitVariantSelected({
+        taskId,
+        projectId,
+        agentType: "reviewer",
+        selectedVariantId: reviewerPersonaId,
+        budgetSeconds: this.budgetForTier(tier, "reviewer")
+      });
+
       const reviewResult = await reviewerExecutor.execute({
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
@@ -1018,6 +1069,37 @@ export class OrchestratorService {
         skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description }
       });
+
+      const reviewerFailureForensics = {
+        executor_used: reviewerExecutor.name,
+        persona_version_id: reviewerPersonaId,
+        skill_version_ids: reviewerSkillIds,
+        tool_stats: reviewResult.metrics.toolStats ?? null
+      };
+      lastReviewerFailureForensics = reviewerFailureForensics;
+
+      if (!isSuccess(reviewResult.status)) {
+        const failureCategory = reviewResult.status === "TIMEOUT" ? "executor_timeout" : "reviewer_failed";
+        this.pauseForIntervention({
+          taskId,
+          projectId,
+          fromStage: "reviewing",
+          failureCategory,
+          failureReason: reviewResult.blockReason ?? `reviewer returned ${reviewResult.status}`,
+          forensics: {
+            agent: "reviewer",
+            ...reviewerFailureForensics,
+            planner_fallback: planSubtasks.length === 1 &&
+              planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
+            budget_seconds: this.budgetForTier(tier, "reviewer"),
+            elapsed_seconds: reviewResult.metrics.elapsedSeconds,
+            token_input: reviewResult.metrics.tokenInput ?? 0,
+            token_output: reviewResult.metrics.tokenOutput ?? 0,
+            status: reviewResult.status,
+            iteration
+          }
+        });
+      }
 
       unresolvedFindings = parseFindings(taskId, reviewResult.output);
 
@@ -1066,6 +1148,10 @@ export class OrchestratorService {
           failureCategory: "rework_limit",
           failureReason: "Exceeded rework iteration limit (3 rounds of CRITICAL/MAJOR findings)",
           forensics: {
+            executor_used: reviewerExecutor.name,
+            persona_version_id: reviewerPersonaId,
+            skill_version_ids: reviewerSkillIds,
+            tool_stats: reviewResult.metrics.toolStats ?? null,
             planner_fallback: planSubtasks.length === 1 &&
               planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
             budget_seconds: this.budgetForTier(tier, "coder"),
@@ -1119,6 +1205,7 @@ export class OrchestratorService {
         failureCategory: "pr_gate",
         failureReason: gate.reason ?? "PR gate rejected task",
         forensics: {
+          ...(lastReviewerFailureForensics ?? {}),
           test_pass_rate: testResult.passRate,
           review_score: reviewScore,
           unresolved_findings: unresolvedFindings.length,
@@ -1186,13 +1273,13 @@ export class OrchestratorService {
       agent: "orchestrator",
       type: "failure_analysis",
       status: "failed",
-      payload: {
+      payload: this.failureAnalysisPayload({
+        ...forensics,
         stage_failed: fromStage,
         failure_reason: failureReason,
         failure_category: failureCategory,
-        awaiting_intervention: true,
-        ...forensics
-      },
+        awaiting_intervention: true
+      }),
       budgetSeconds: 60
     });
     this.transition(taskId, projectId, fromStage, "awaiting_intervention", {
@@ -1201,6 +1288,44 @@ export class OrchestratorService {
       failure_reason: failureReason
     });
     throw new StageFailedError(taskId, fromStage, failureReason);
+  }
+
+  private failureAnalysisPayload(payload: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...payload,
+      executor_used: payload.executor_used ?? null,
+      persona_version_id: payload.persona_version_id ?? null,
+      skill_version_ids: Array.isArray(payload.skill_version_ids)
+        ? payload.skill_version_ids
+        : [],
+      tool_stats: normalizeToolStats(payload.tool_stats as ToolStats | Record<string, unknown> | null | undefined)
+    };
+  }
+
+  private emitVariantSelected(input: {
+    taskId: string;
+    projectId: string;
+    agentType: AgentType;
+    selectedVariantId: string;
+    budgetSeconds: number;
+  }): void {
+    this.recordEvent({
+      taskId: input.taskId,
+      projectId: input.projectId,
+      agent: "orchestrator",
+      type: "variant_selected",
+      status: "done",
+      payload: {
+        agent_type: input.agentType,
+        selected_variant_id: input.selectedVariantId,
+        selected_variant_specialty: null,
+        eligible_variant_ids: [input.selectedVariantId],
+        selection_rationale: "only_eligible",
+        shadow_variant_ids: [],
+        injected_lesson_ids: []
+      },
+      budgetSeconds: input.budgetSeconds
+    });
   }
 
   private recordEvent(input: {
@@ -1304,6 +1429,7 @@ export class OrchestratorService {
       const branch = `autoforge/${taskId}`;
       this.deps.worktrees.remove({ branch, path: worktreePath });
     }
+    this.cleanupIterationTags(taskId);
   }
 
   private captureTaskDiffStats(taskId: string): void {
@@ -1323,6 +1449,92 @@ export class OrchestratorService {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[diff-stats] Failed for task ${taskId}: ${message}`);
+    }
+  }
+
+  private captureIterationDiff(taskId: string, worktreePath: string, iteration: number): void {
+    try {
+      this.ensureIterationTag(taskId, worktreePath, iteration);
+      if (iteration === 0) {
+        return;
+      }
+
+      const fromRef = this.iterationTagName(taskId, iteration - 1);
+      const toRef = this.iterationTagName(taskId, iteration);
+      const fromCommit = this.resolveGitRef(worktreePath, fromRef);
+      const toCommit = this.resolveGitRef(worktreePath, toRef);
+      if (!fromCommit || !toCommit || fromCommit === toCommit) {
+        return;
+      }
+
+      const delta = computeIterationDiff(worktreePath, fromRef, toRef);
+      if (!delta) {
+        console.warn(
+          `[iteration-diff] Skipping diff for task ${taskId} iteration ${iteration - 1}->${iteration}: git diff failed`
+        );
+        return;
+      }
+
+      this.deps.db.insertTaskIterationDiff(taskId, iteration - 1, iteration, delta);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[iteration-diff] Skipped for task ${taskId}: ${message}`);
+    }
+  }
+
+  private ensureIterationTag(taskId: string, worktreePath: string, iteration: number): void {
+    const tagName = this.iterationTagName(taskId, iteration);
+    if (this.resolveGitRef(worktreePath, tagName)) {
+      return;
+    }
+    execSync(`git tag ${tagName}`, {
+      cwd: worktreePath,
+      stdio: ["ignore", "ignore", "ignore"]
+    });
+  }
+
+  private iterationTagName(taskId: string, iteration: number): string {
+    return `autoforge/iter-${taskId}-${iteration}`;
+  }
+
+  private cleanupIterationTags(taskId: string): void {
+    try {
+      const tagPattern = `autoforge/iter-${taskId}-*`;
+      const tags = execSync(`git tag --list "${tagPattern}"`, {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      })
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+
+      for (const tag of tags) {
+        try {
+          execSync(`git tag -d ${tag}`, {
+            cwd: process.cwd(),
+            stdio: ["ignore", "ignore", "pipe"]
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.warn(`[iteration-diff] Failed to delete tag ${tag}: ${message}`);
+        }
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[iteration-diff] Failed to enumerate iteration tags for task ${taskId}: ${message}`);
+    }
+  }
+
+  private resolveGitRef(worktreePath: string, ref: string): string | null {
+    try {
+      return execSync(`git rev-parse --verify ${ref}`, {
+        cwd: worktreePath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim();
+    } catch {
+      return null;
     }
   }
 
@@ -1466,4 +1678,21 @@ function buildDocPrompt(description: string, subtasks: PlanSubtask[]): string {
 
 function isSuccess(status: SubtaskReportStatus | "FAILED" | "TIMEOUT"): boolean {
   return status === "DONE" || status === "DONE_WITH_CONCERNS";
+}
+
+function normalizeToolStats(
+  toolStats: ToolStats | Record<string, unknown> | null | undefined
+): Record<string, unknown> | null {
+  if (!toolStats || typeof toolStats !== "object") {
+    return null;
+  }
+
+  const stats = toolStats as Partial<ToolStats> & Record<string, unknown>;
+  return {
+    read_count: Number(stats.readCount ?? stats.read_count ?? 0),
+    write_count: Number(stats.writeCount ?? stats.write_count ?? 0),
+    bash_count: Number(stats.bashCount ?? stats.bash_count ?? 0),
+    search_count: Number(stats.searchCount ?? stats.search_count ?? 0),
+    iterations: Number(stats.iterations ?? 0)
+  };
 }

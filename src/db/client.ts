@@ -156,6 +156,32 @@ export class DbClient {
     });
   }
 
+  insertTaskIterationDiff(taskId: string, fromIter: number, toIter: number, stats: {
+    files_changed: number;
+    lines_added: number;
+    lines_deleted: number;
+    test_files_changed: number;
+    diff_summary: string | null;
+  }): void {
+    this.sqlite.query(`
+      INSERT OR REPLACE INTO task_iteration_diffs
+        (task_id, from_iteration, to_iteration, files_changed, lines_added,
+         lines_deleted, test_files_changed, diff_summary)
+      VALUES
+        ($task_id, $from_iter, $to_iter, $files_changed, $lines_added,
+         $lines_deleted, $test_files_changed, $diff_summary)
+    `).run({
+      $task_id: taskId,
+      $from_iter: fromIter,
+      $to_iter: toIter,
+      $files_changed: stats.files_changed,
+      $lines_added: stats.lines_added,
+      $lines_deleted: stats.lines_deleted,
+      $test_files_changed: stats.test_files_changed,
+      $diff_summary: stats.diff_summary
+    });
+  }
+
   rebuildProjectionsFromEvents(): void {
     this.sqlite.transaction(() => {
       this.sqlite.exec("PRAGMA defer_foreign_keys = ON;");

@@ -9,7 +9,12 @@ describe("awaiting_intervention: planner failures surface with forensics", () =>
         status: "FAILED",
         artifacts: [],
         blockReason: "synthetic model rejection (404)",
-        metrics: { elapsedSeconds: 0.3, tokenInput: 0, tokenOutput: 0 }
+        metrics: {
+          elapsedSeconds: 0.3,
+          tokenInput: 0,
+          tokenOutput: 0,
+          toolStats: { readCount: 8, writeCount: 1, bashCount: 0, searchCount: 5, iterations: 11 }
+        }
       })
     });
 
@@ -26,6 +31,18 @@ describe("awaiting_intervention: planner failures surface with forensics", () =>
     expect(failure!.payload.stage_failed).toBe("planning");
     expect(failure!.payload.agent).toBe("planner");
     expect(failure!.payload.executor_used).toBeDefined();
+    expect(failure!.payload.persona_version_id).toBeDefined();
+    expect(failure!.payload.skill_version_ids).toBeDefined();
+    expect(failure!.payload.planner_fallback).toBe(false);
+    expect(failure!.payload.iteration).toBe(0);
+    expect("tool_stats" in failure!.payload).toBe(true);
+    expect(failure!.payload.tool_stats).toEqual({
+      read_count: 8,
+      write_count: 1,
+      bash_count: 0,
+      search_count: 5,
+      iterations: 11
+    });
     expect(failure!.payload.transcript_id).toBeDefined();
   });
 
@@ -87,7 +104,13 @@ describe("awaiting_intervention: coder failures surface with forensics", () => {
     expect(failure).toBeDefined();
     expect(failure!.payload.failure_category).toBe("executor_timeout");
     expect(failure!.payload.awaiting_intervention).toBe(true);
-    expect(failure!.payload.tool_stats).toMatchObject({ readCount: 12, writeCount: 0 });
+    expect(failure!.payload.tool_stats).toEqual({
+      read_count: 12,
+      write_count: 0,
+      bash_count: 1,
+      search_count: 3,
+      iterations: 20
+    });
     expect(failure!.payload.elapsed_seconds).toBe(720);
     expect(failure!.payload.budget_seconds).toBeDefined();
   });
@@ -109,6 +132,133 @@ describe("awaiting_intervention: coder failures surface with forensics", () => {
     const failure = events.find((e) => e.type === "failure_analysis" && e.payload.stage_failed === "executing");
     expect(failure!.payload.failure_category).toBe("coder_failed");
     expect(failure!.payload.failure_reason).toContain("Invalid MCP configuration");
+  });
+});
+
+describe("awaiting_intervention: reviewer failures surface with forensics", () => {
+  test("reviewer TIMEOUT pauses task in awaiting_intervention with provenance and snake_case tool stats", async () => {
+    const { service, db, cleanup } = createTestService({
+      reviewer: async () => ({
+        status: "TIMEOUT",
+        artifacts: [],
+        metrics: {
+          elapsedSeconds: 180,
+          tokenInput: 1500,
+          tokenOutput: 40,
+          toolStats: {
+            readCount: 7,
+            writeCount: 0,
+            bashCount: 1,
+            searchCount: 2,
+            iterations: 4
+          }
+        }
+      })
+    });
+
+    try {
+      const task = await service.submitTask("autoforge", "STANDARD reviewer timeout task", { reviewPlan: false });
+      expect(task.state).toBe("awaiting_intervention");
+
+      const events = db.listEvents(task.id);
+      const failure = events.find((e) => e.type === "failure_analysis" && e.payload.stage_failed === "reviewing");
+      expect(failure).toBeDefined();
+      expect(failure!.payload.failure_category).toBe("executor_timeout");
+      expect(failure!.payload.executor_used).toBeDefined();
+      expect(failure!.payload.persona_version_id).toBeDefined();
+      expect(failure!.payload.skill_version_ids).toBeDefined();
+      expect(failure!.payload.planner_fallback).toBe(false);
+      expect(failure!.payload.iteration).toBe(0);
+      expect(failure!.payload.tool_stats).toEqual({
+        read_count: 7,
+        write_count: 0,
+        bash_count: 1,
+        search_count: 2,
+        iterations: 4
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("reviewer FAILED pauses task in awaiting_intervention and is categorized reviewer_failed", async () => {
+    const { service, db, cleanup } = createTestService({
+      reviewer: async () => ({
+        status: "FAILED",
+        artifacts: [],
+        blockReason: "review toolchain crashed",
+        metrics: { elapsedSeconds: 0.4 }
+      })
+    });
+
+    try {
+      const task = await service.submitTask("autoforge", "STANDARD reviewer failed task", { reviewPlan: false });
+      expect(task.state).toBe("awaiting_intervention");
+
+      const events = db.listEvents(task.id);
+      const failure = events.find((e) => e.type === "failure_analysis" && e.payload.stage_failed === "reviewing");
+      expect(failure).toBeDefined();
+      expect(failure!.payload.failure_category).toBe("reviewer_failed");
+      expect(failure!.payload.failure_reason).toContain("review toolchain crashed");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("rework_limit includes reviewer provenance and snake_case tool stats", async () => {
+    let reviewerCalls = 0;
+    const { service, db, cleanup } = createTestService({
+      reviewer: async () => {
+        reviewerCalls += 1;
+        return {
+          status: "DONE_WITH_CONCERNS",
+          artifacts: [],
+          output: {
+            findings: [
+              {
+                id: `finding-${reviewerCalls}`,
+                severity: "MAJOR",
+                category: "correctness",
+                description: "Needs another rework pass.",
+                resolved: false
+              }
+            ]
+          },
+          metrics: {
+            elapsedSeconds: 0.25,
+            toolStats: {
+              readCount: 9,
+              writeCount: 0,
+              bashCount: 2,
+              searchCount: 4,
+              iterations: 6
+            }
+          }
+        };
+      }
+    });
+
+    try {
+      const task = await service.submitTask("autoforge", "STANDARD reviewer rework limit task", { reviewPlan: false });
+      expect(task.state).toBe("awaiting_intervention");
+
+      const events = db.listEvents(task.id);
+      const failure = events.find((e) => e.type === "failure_analysis" && e.payload.failure_category === "rework_limit");
+      expect(failure).toBeDefined();
+      expect(failure!.payload.stage_failed).toBe("reviewing");
+      expect(failure!.payload.executor_used).toBeDefined();
+      expect(failure!.payload.persona_version_id).toBeDefined();
+      expect(failure!.payload.skill_version_ids).toBeDefined();
+      expect(failure!.payload.tool_stats).toEqual({
+        read_count: 9,
+        write_count: 0,
+        bash_count: 2,
+        search_count: 4,
+        iterations: 6
+      });
+    } finally {
+      cleanup();
+    }
   });
 });
 

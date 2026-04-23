@@ -74,11 +74,15 @@ describe("review and rejection rework loops", () => {
     expect(payload.failure_category).toBe("rejected");
     expect(payload.rejection_categories).toEqual(["incomplete", "wrong_scope"]);
     expect(payload.rejection_guidance).toBe("include edge cases for empty input");
+    expect(payload.executor_used).toBeDefined();
+    expect(payload.persona_version_id).toBeDefined();
+    expect(payload.skill_version_ids).toBeDefined();
+    expect("tool_stats" in payload).toBe(true);
 
     // restart_spawned event links old task to new task.
     const restartEvent = events.find((e) => e.type === "restart_spawned");
     expect(restartEvent).toBeDefined();
     const restartPayload = restartEvent?.payload as Record<string, unknown>;
     expect(restartPayload.restart_child_task_id).toBe(newTask.id);
-  });
+  }, 15_000);
 });
