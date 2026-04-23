@@ -11,7 +11,9 @@ import { createWebServer } from "./web/server";
 
 const env = loadEnv();
 const db = new DbClient(env.DATABASE_PATH);
-db.initSchema(resolve(import.meta.dir, "./db/schema.sql"));
+const schemaPath = resolve(import.meta.dir, "./db/schema.sql");
+const migrationsPath = resolve(import.meta.dir, "./db/migrations");
+db.initSchema(schemaPath, migrationsPath);
 
 // NATS connection is optional — system runs without it (SQLite-only mode).
 const nats = new NatsClient(env.NATS_URL);

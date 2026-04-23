@@ -9,6 +9,7 @@ import type { DbClient } from "../db/client";
 import type { NatsClient } from "../nats/client";
 import type { AgentType, PipelineTask, PlanSubtask, RejectionFeedback, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
 import { assertTransition } from "./state-machine";
+import { computeDiffStats } from "./diff-stats";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
@@ -68,6 +69,7 @@ export class OrchestratorService {
     if (!terminalStates.includes(task.state)) {
       throw new Error(`Cannot archive task ${taskId}: must be in a terminal state (completed or failed), current state: '${task.state}'`);
     }
+    this.captureTaskDiffStats(taskId);
     this.cleanupWorktree(taskId);
     this.recordEvent({
       taskId,
@@ -179,6 +181,7 @@ export class OrchestratorService {
         // Leave worktree intact so the operator can inspect or retry.
         return this.requireTask(taskId);
       }
+      this.captureTaskDiffStats(taskId);
       this.cleanupWorktree(taskId);
       throw err;
     }
@@ -243,6 +246,7 @@ export class OrchestratorService {
       taskId,
       stage: "planner",
       attempt,
+      personaVersionId: plannerPersonaId,
       executorUsed: plannerExecutor.name,
       model: this.plannerModel(tier),
       systemPrompt: transcript?.systemPrompt ?? this.personas.resolve("planner"),
@@ -371,6 +375,7 @@ export class OrchestratorService {
       if (err instanceof StageFailedError) {
         return this.requireTask(taskId);
       }
+      this.captureTaskDiffStats(taskId);
       this.cleanupWorktree(taskId);
       throw err;
     }
@@ -492,6 +497,7 @@ export class OrchestratorService {
     }
 
     this.transition(taskId, task.projectId, "documenting", "completed", {});
+    this.captureTaskDiffStats(taskId);
     this.cleanupWorktree(taskId);
     return this.requireTask(taskId);
   }
@@ -532,6 +538,7 @@ export class OrchestratorService {
       reason: `rejected: ${feedback.reason}`,
       iteration: oldTask.iteration
     });
+    this.captureTaskDiffStats(taskId);
     this.cleanupWorktree(taskId);
 
     // Spawn a fresh task from current HEAD with the operator's feedback
@@ -596,6 +603,7 @@ export class OrchestratorService {
     });
 
     this.transition(taskId, task.projectId, task.state, "failed", { reason: `cancelled: ${reason}`, iteration: task.iteration });
+    this.captureTaskDiffStats(taskId);
     this.cleanupWorktree(taskId);
     return this.requireTask(taskId);
   }
@@ -755,6 +763,7 @@ export class OrchestratorService {
           ).run(new Date().toISOString(), task.id);
         }
 
+        this.captureTaskDiffStats(task.id);
         this.cleanupWorktree(task.id);
       }
     }
@@ -826,6 +835,7 @@ export class OrchestratorService {
     });
 
     if (!isSuccess(metaResult.status)) {
+      this.captureTaskDiffStats(metaTaskId);
       this.cleanupWorktree(metaTaskId);
       return { experimentId: null, status: metaResult.status };
     }
@@ -835,6 +845,7 @@ export class OrchestratorService {
     const metaMeta = metaOutput?.meta as Record<string, unknown> | undefined;
 
     if (!metaMeta?.target_asset || !metaMeta?.hypothesis) {
+      this.captureTaskDiffStats(metaTaskId);
       this.cleanupWorktree(metaTaskId);
       return { experimentId: null, status: "DONE_WITH_CONCERNS" };
     }
@@ -857,6 +868,7 @@ export class OrchestratorService {
     }
 
     if (!proposedContent) {
+      this.captureTaskDiffStats(metaTaskId);
       this.cleanupWorktree(metaTaskId);
       return { experimentId: null, status: "DONE_WITH_CONCERNS" };
     }
@@ -883,6 +895,7 @@ export class OrchestratorService {
       budgetSeconds: 60
     });
 
+    this.captureTaskDiffStats(metaTaskId);
     this.cleanupWorktree(metaTaskId);
     return { experimentId, status: "DONE" };
   }
@@ -1290,6 +1303,26 @@ export class OrchestratorService {
     if (worktreePath) {
       const branch = `autoforge/${taskId}`;
       this.deps.worktrees.remove({ branch, path: worktreePath });
+    }
+  }
+
+  private captureTaskDiffStats(taskId: string): void {
+    try {
+      const worktree = this.deps.worktrees.get(taskId);
+      if (!worktree?.baseRef) {
+        return;
+      }
+
+      const stats = computeDiffStats(worktree.path, worktree.baseRef);
+      if (!stats) {
+        console.warn(`[diff-stats] Skipping diff stats for task ${taskId}: git diff failed`);
+        return;
+      }
+
+      this.deps.db.insertTaskDiffStats(taskId, stats);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[diff-stats] Failed for task ${taskId}: ${message}`);
     }
   }
 

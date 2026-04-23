@@ -9,6 +9,9 @@ import { DbClient } from "../../src/db/client";
 import type { OrchestratorService } from "../../src/orchestrator/service";
 import type { PipelineTask } from "../../src/types/core";
 
+const schemaPath = resolve(process.cwd(), "src/db/schema.sql");
+const migrationsPath = resolve(process.cwd(), "src/db/migrations");
+
 function makeTask(overrides: Partial<PipelineTask> = {}): PipelineTask {
   return {
     id: "task-1",
@@ -17,7 +20,7 @@ function makeTask(overrides: Partial<PipelineTask> = {}): PipelineTask {
     state: "completed",
     tier: "STANDARD",
     assessment: {} as any,
-    plan: [],
+    planSubtasks: [],
     iteration: 0,
     createdAt: "2026-04-19T00:00:00Z",
     updatedAt: "2026-04-19T00:00:00Z",
@@ -50,7 +53,7 @@ describe("POST /tasks/:id/archive", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "autoforge-archive-routes-"));
     db = new DbClient(join(tempDir, "test.db"));
-    db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+    db.initSchema(schemaPath, migrationsPath);
   });
 
   afterEach(() => {
@@ -120,7 +123,7 @@ describe("POST /tasks/:id/unarchive", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "autoforge-unarchive-routes-"));
     db = new DbClient(join(tempDir, "test.db"));
-    db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+    db.initSchema(schemaPath, migrationsPath);
   });
 
   afterEach(() => {
@@ -178,7 +181,7 @@ describe("DELETE /tasks/:id", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "autoforge-delete-routes-"));
     db = new DbClient(join(tempDir, "test.db"));
-    db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+    db.initSchema(schemaPath, migrationsPath);
   });
 
   afterEach(() => {
@@ -247,7 +250,7 @@ describe("GET /tasks — archive filtering", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "autoforge-list-routes-"));
     db = new DbClient(join(tempDir, "test.db"));
-    db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+    db.initSchema(schemaPath, migrationsPath);
   });
 
   afterEach(() => {

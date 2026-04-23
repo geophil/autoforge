@@ -11,7 +11,10 @@ import { createTranscriptsRoutes } from "../../src/web/routes/transcripts";
 function freshDb(): DbClient {
   const dir = mkdtempSync(join(tmpdir(), "transcripts-test-"));
   const db = new DbClient(join(dir, `${randomUUID()}.sqlite`));
-  db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+  db.initSchema(
+    resolve(process.cwd(), "src/db/schema.sql"),
+    resolve(process.cwd(), "src/db/migrations")
+  );
   return db;
 }
 
@@ -38,6 +41,16 @@ describe("agent_transcripts schema", () => {
     expect(names).toContain("token_output");
     expect(names).toContain("elapsed_seconds");
   });
+
+  test("freshDb bootstraps the full runtime schema including numbered migrations", () => {
+    const db = freshDb();
+    const cols = db.sqlite
+      .query("PRAGMA table_info(experiments)")
+      .all() as Array<{ name: string }>;
+
+    expect(cols.map((col) => col.name)).toContain("operation");
+    expect(cols.map((col) => col.name)).toContain("evidence");
+  });
 });
 
 describe("DbClient transcripts methods", () => {
@@ -53,6 +66,7 @@ describe("DbClient transcripts methods", () => {
       taskId: "task-1",
       stage: "planner",
       attempt: 0,
+      personaVersionId: "persona-planner-v1",
       executorUsed: "anthropic-sdk",
       model: "claude-opus-4",
       systemPrompt: "you are the planner",
@@ -70,6 +84,7 @@ describe("DbClient transcripts methods", () => {
     expect(row!.taskId).toBe("task-1");
     expect(row!.stage).toBe("planner");
     expect(row!.attempt).toBe(0);
+    expect(row!.personaVersionId).toBe("persona-planner-v1");
     expect(row!.systemPrompt).toBe("you are the planner");
     expect(row!.tokenInput).toBe(1234);
   });
@@ -84,12 +99,14 @@ describe("DbClient transcripts methods", () => {
 
     db.insertTranscript({
       taskId: "task-2", stage: "planner", attempt: 1,
+      personaVersionId: "persona-planner-v2",
       executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
       transcript: "", output: null, critique: "fix it",
       tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
     });
     db.insertTranscript({
       taskId: "task-2", stage: "planner", attempt: 0,
+      personaVersionId: "persona-planner-v1",
       executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
       transcript: "", output: null, critique: null,
       tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
@@ -99,6 +116,7 @@ describe("DbClient transcripts methods", () => {
     expect(list).toHaveLength(2);
     expect(list[0].attempt).toBe(0);
     expect(list[1].attempt).toBe(1);
+    expect(list[0].personaVersionId).toBe("persona-planner-v1");
     expect((list[0] as Partial<AgentTranscriptRow>).systemPrompt).toBeUndefined();
     expect((list[0] as Partial<AgentTranscriptRow>).transcript).toBeUndefined();
   });
@@ -113,12 +131,14 @@ describe("DbClient transcripts methods", () => {
 
     db.insertTranscript({
       taskId: "task-3", stage: "planner", attempt: 0,
+      personaVersionId: "persona-planner-v1",
       executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
       transcript: "", output: null, critique: null,
       tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
     });
     expect(() => db.insertTranscript({
       taskId: "task-3", stage: "planner", attempt: 0,
+      personaVersionId: "persona-planner-v1",
       executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
       transcript: "", output: null, critique: null,
       tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
@@ -134,6 +154,7 @@ describe("transcripts API", () => {
     ).run("t-api", "proj", "desc", "planning", "STANDARD", "{}", "[]", 0, "2026-04-16T00:00:00Z", "2026-04-16T00:00:00Z");
     db.insertTranscript({
       taskId: "t-api", stage: "planner", attempt: 0,
+      personaVersionId: "persona-planner-api",
       executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
       transcript: "", output: null, critique: null,
       tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
@@ -146,5 +167,6 @@ describe("transcripts API", () => {
     const body = await res.json();
     expect(body).toHaveLength(1);
     expect(body[0].attempt).toBe(0);
+    expect(body[0].personaVersionId).toBe("persona-planner-api");
   });
 });

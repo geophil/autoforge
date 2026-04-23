@@ -120,6 +120,12 @@ CREATE TABLE IF NOT EXISTS routing_calibration (
   created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Tracks which numbered migration files have been applied on top of the base schema.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  migration_file TEXT PRIMARY KEY,
+  applied_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Outcome summary per completed/failed task.
 -- Aggregates token cost, timing, findings, and first-pass success from events + findings.
 CREATE VIEW IF NOT EXISTS task_outcomes AS

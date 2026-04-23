@@ -28,7 +28,10 @@ export function createTestService(handlers: Handlers = {}): TestService {
   const baseDir = realpathSync(mkdtempSync(join(tmpdir(), "autoforge-test-")));
   const dbPath = join(baseDir, `${randomUUID()}.sqlite`);
   const db = new DbClient(dbPath);
-  db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+  db.initSchema(
+    resolve(process.cwd(), "src/db/schema.sql"),
+    resolve(process.cwd(), "src/db/migrations")
+  );
 
   const env = loadEnv({
     NODE_ENV: "test",

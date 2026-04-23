@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execSync, spawnSync } from "node:child_process";
@@ -6,7 +6,10 @@ import { execSync, spawnSync } from "node:child_process";
 export interface WorktreeRef {
   branch: string;
   path: string;
+  baseRef?: string;
 }
+
+const METADATA_FILE = ".autoforge-worktree.json";
 
 export class WorktreeManager {
   constructor(private readonly rootDir: string) {
@@ -21,6 +24,7 @@ export class WorktreeManager {
   create(taskId: string): WorktreeRef {
     const branch = `autoforge/${taskId}`;
     const path = join(this.rootDir, `${taskId}-${randomUUID().slice(0, 8)}`);
+    const baseRef = this.currentHead();
 
     if (this.isGitRepo()) {
       // Ensure branch exists from current HEAD.
@@ -37,7 +41,9 @@ export class WorktreeManager {
     }
 
     this.installDependencies(path);
-    return { branch, path };
+    const ref = { branch, path, baseRef };
+    this.writeMetadata(ref);
+    return ref;
   }
 
   /**
@@ -65,6 +71,32 @@ export class WorktreeManager {
       const entries = readdirSync(this.rootDir);
       const match = entries.find((e) => e.startsWith(taskId));
       return match ? join(this.rootDir, match) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  get(taskId: string): WorktreeRef | null {
+    const path = this.findWorktreePath(taskId);
+    if (!path) {
+      return null;
+    }
+
+    const metadataPath = join(path, METADATA_FILE);
+    if (!existsSync(metadataPath)) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(readFileSync(metadataPath, "utf8")) as Partial<WorktreeRef>;
+      if (!parsed.branch || !parsed.path || !parsed.baseRef) {
+        return null;
+      }
+      return {
+        branch: parsed.branch,
+        path: parsed.path,
+        baseRef: parsed.baseRef
+      };
     } catch {
       return null;
     }
@@ -116,6 +148,26 @@ export class WorktreeManager {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private currentHead(): string {
+    if (!this.isGitRepo()) {
+      return "HEAD";
+    }
+
+    try {
+      return execSync("git rev-parse HEAD", { encoding: "utf8" }).trim();
+    } catch {
+      return "HEAD";
+    }
+  }
+
+  private writeMetadata(worktree: WorktreeRef): void {
+    try {
+      writeFileSync(join(worktree.path, METADATA_FILE), JSON.stringify(worktree, null, 2));
+    } catch {
+      // Best-effort metadata: missing file only means downstream diff capture skips.
     }
   }
 }

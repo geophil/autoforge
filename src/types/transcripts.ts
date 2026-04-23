@@ -2,6 +2,7 @@ export interface AgentTranscriptInput {
   taskId: string;
   stage: string;
   attempt: number;
+  personaVersionId: string | null;
   executorUsed: string;
   model: string | null;
   systemPrompt: string;
@@ -24,6 +25,7 @@ export interface AgentTranscriptMeta {
   taskId: string;
   stage: string;
   attempt: number;
+  personaVersionId: string | null;
   createdAt: string;
   executorUsed: string;
   model: string | null;

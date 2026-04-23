@@ -3,10 +3,14 @@ import { createTestService } from "../helpers/create-service";
 
 describe("plan-review pause", () => {
   test("STANDARD task pauses at awaiting_plan_approval after planner", async () => {
-    const { service } = createTestService();
+    const { service, db } = createTestService();
     const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
     expect(task.state).toBe("awaiting_plan_approval");
     expect(task.planSubtasks.length).toBeGreaterThan(0);
+
+    const transcripts = db.listTranscriptsByTask(task.id);
+    expect(transcripts).toHaveLength(1);
+    expect(transcripts[0].personaVersionId).toBeTruthy();
   });
 
   test("EXPRESS task does not pause; runs through to awaiting_approval", async () => {

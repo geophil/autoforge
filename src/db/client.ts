@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import type { AutoforgeMessage } from "../nats/messages";
@@ -14,9 +14,10 @@ export class DbClient {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.sqlite = new Database(dbPath, { create: true });
     this.sqlite.exec("PRAGMA journal_mode = WAL;");
+    this.sqlite.exec("PRAGMA foreign_keys = ON;");
   }
 
-  initSchema(schemaPath: string): void {
+  initSchema(schemaPath: string, migrationsDir?: string): void {
     const schema = readFileSync(schemaPath, "utf8");
     this.sqlite.exec(schema);
     // Idempotent migration: add archived_at to tasks if it was not yet present
@@ -24,6 +25,64 @@ export class DbClient {
     const taskCols = this.sqlite.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     if (!taskCols.some((c) => c.name === "archived_at")) {
       this.sqlite.exec("ALTER TABLE tasks ADD COLUMN archived_at TEXT");
+    }
+    this.applyPendingMigrations(migrationsDir);
+  }
+
+  private applyPendingMigrations(migrationsDir?: string): void {
+    if (!migrationsDir || !existsSync(migrationsDir)) {
+      return;
+    }
+
+    const appliedMigrations = new Set(
+      (this.sqlite.query("SELECT migration_file FROM schema_migrations").all() as Array<{ migration_file: string }>)
+        .map((row) => row.migration_file)
+    );
+
+    const migrationFiles = readdirSync(migrationsDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".sql"))
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+
+    for (const migrationFile of migrationFiles) {
+      if (appliedMigrations.has(migrationFile)) {
+        continue;
+      }
+
+      this.applyMigrationFile(migrationsDir, migrationFile);
+      appliedMigrations.add(migrationFile);
+    }
+  }
+
+  private applyMigrationFile(migrationsDir: string, migrationFile: string): void {
+    const sql = readFileSync(join(migrationsDir, migrationFile), "utf8");
+    try {
+      this.sqlite.transaction(() => {
+        this.sqlite.exec(sql);
+        this.sqlite
+          .query("INSERT INTO schema_migrations (migration_file) VALUES (?)")
+          .run(migrationFile);
+      })();
+      this.runPostMigrationHooks(migrationFile);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to apply migration ${migrationFile}: ${message}`, { cause: error });
+    }
+  }
+
+  private runPostMigrationHooks(migrationFile: string): void {
+    if (migrationFile !== "003_transcripts_variant.sql") {
+      return;
+    }
+
+    const row = this.sqlite
+      .query("SELECT COUNT(*) AS count FROM agent_transcripts WHERE persona_version_id IS NULL")
+      .get() as { count: number };
+
+    if (row.count > 0) {
+      console.warn(
+        `[${migrationFile}] ${row.count} agent_transcripts rows remain unmapped with NULL persona_version_id after backfill`
+      );
     }
   }
 
@@ -69,46 +128,78 @@ export class DbClient {
     return this.sqlite.transaction(fn)();
   }
 
-  rebuildProjectionsFromEvents(): void {
-    this.sqlite.exec("DELETE FROM review_findings; DELETE FROM subtasks; DELETE FROM tasks;");
-    const events = this.sqlite
-      .query("SELECT payload, id, task_id, project_id, timestamp, agent, event_type, status, budget_seconds, elapsed_seconds, token_input, token_output, estimated_cost FROM events ORDER BY timestamp ASC")
-      .all() as Array<Record<string, unknown>>;
+  insertTaskDiffStats(taskId: string, stats: {
+    files_changed: number;
+    files_added: number;
+    files_modified: number;
+    files_deleted: number;
+    lines_added: number;
+    lines_deleted: number;
+    test_files_changed: number;
+  }): void {
+    this.sqlite.query(`
+      INSERT OR REPLACE INTO task_diff_stats
+        (task_id, files_changed, files_added, files_modified, files_deleted,
+         lines_added, lines_deleted, test_files_changed)
+      VALUES
+        ($task_id, $files_changed, $files_added, $files_modified, $files_deleted,
+         $lines_added, $lines_deleted, $test_files_changed)
+    `).run({
+      $task_id: taskId,
+      $files_changed: stats.files_changed,
+      $files_added: stats.files_added,
+      $files_modified: stats.files_modified,
+      $files_deleted: stats.files_deleted,
+      $lines_added: stats.lines_added,
+      $lines_deleted: stats.lines_deleted,
+      $test_files_changed: stats.test_files_changed
+    });
+  }
 
-    for (const event of events) {
-      const payload = JSON.parse(String(event.payload));
-      this.applyEvent({
-        id: String(event.id),
-        taskId: String(event.task_id),
-        projectId: String(event.project_id),
-        timestamp: String(event.timestamp),
-        agent: event.agent as AutoforgeMessage["agent"],
-        type: String(event.event_type),
-        status: event.status as AutoforgeMessage["status"],
-        payload,
-        budgetSeconds: Number(event.budget_seconds),
-        elapsedSeconds: event.elapsed_seconds ? Number(event.elapsed_seconds) : undefined,
-        tokenUsage:
-          event.token_input !== null && event.token_output !== null && event.estimated_cost !== null
-            ? {
-                input: Number(event.token_input),
-                output: Number(event.token_output),
-                estimatedCost: Number(event.estimated_cost)
-              }
-            : undefined
-      });
-    }
+  rebuildProjectionsFromEvents(): void {
+    this.sqlite.transaction(() => {
+      this.sqlite.exec("PRAGMA defer_foreign_keys = ON;");
+      this.sqlite.exec("DELETE FROM review_findings; DELETE FROM subtasks; DELETE FROM tasks;");
+
+      const events = this.sqlite
+        .query("SELECT payload, id, task_id, project_id, timestamp, agent, event_type, status, budget_seconds, elapsed_seconds, token_input, token_output, estimated_cost FROM events ORDER BY timestamp ASC")
+        .all() as Array<Record<string, unknown>>;
+
+      for (const event of events) {
+        const payload = JSON.parse(String(event.payload));
+        this.applyEvent({
+          id: String(event.id),
+          taskId: String(event.task_id),
+          projectId: String(event.project_id),
+          timestamp: String(event.timestamp),
+          agent: event.agent as AutoforgeMessage["agent"],
+          type: String(event.event_type),
+          status: event.status as AutoforgeMessage["status"],
+          payload,
+          budgetSeconds: Number(event.budget_seconds),
+          elapsedSeconds: event.elapsed_seconds ? Number(event.elapsed_seconds) : undefined,
+          tokenUsage:
+            event.token_input !== null && event.token_output !== null && event.estimated_cost !== null
+              ? {
+                  input: Number(event.token_input),
+                  output: Number(event.token_output),
+                  estimatedCost: Number(event.estimated_cost)
+                }
+              : undefined
+        });
+      }
+    })();
   }
 
   insertTranscript(input: AgentTranscriptInput): string {
     const id = randomUUID();
     this.sqlite.query(`
       INSERT INTO agent_transcripts (
-        id, task_id, stage, attempt, created_at, executor_used, model,
+        id, task_id, stage, attempt, persona_version_id, created_at, executor_used, model,
         system_prompt, user_prompt, transcript, output, critique,
         token_input, token_output, elapsed_seconds
       ) VALUES (
-        $id, $task_id, $stage, $attempt, $created_at, $executor_used, $model,
+        $id, $task_id, $stage, $attempt, $persona_version_id, $created_at, $executor_used, $model,
         $system_prompt, $user_prompt, $transcript, $output, $critique,
         $token_input, $token_output, $elapsed_seconds
       )
@@ -117,6 +208,7 @@ export class DbClient {
       $task_id: input.taskId,
       $stage: input.stage,
       $attempt: input.attempt,
+      $persona_version_id: input.personaVersionId,
       $created_at: new Date().toISOString(),
       $executor_used: input.executorUsed,
       $model: input.model,
@@ -134,7 +226,7 @@ export class DbClient {
 
   listTranscriptsByTask(taskId: string): AgentTranscriptMeta[] {
     const rows = this.sqlite.query(`
-      SELECT id, task_id, stage, attempt, created_at, executor_used, model,
+      SELECT id, task_id, stage, attempt, persona_version_id, created_at, executor_used, model,
              token_input, token_output, elapsed_seconds
       FROM agent_transcripts
       WHERE task_id = ?
@@ -145,6 +237,7 @@ export class DbClient {
       taskId: String(r.task_id),
       stage: String(r.stage),
       attempt: Number(r.attempt),
+      personaVersionId: r.persona_version_id === null ? null : String(r.persona_version_id),
       createdAt: String(r.created_at),
       executorUsed: String(r.executor_used),
       model: r.model === null ? null : String(r.model),
@@ -164,6 +257,7 @@ export class DbClient {
       taskId: String(row.task_id),
       stage: String(row.stage),
       attempt: Number(row.attempt),
+      personaVersionId: row.persona_version_id === null ? null : String(row.persona_version_id),
       createdAt: String(row.created_at),
       executorUsed: String(row.executor_used),
       model: row.model === null ? null : String(row.model),
@@ -282,10 +376,38 @@ export class DbClient {
     return row?.content ?? null;
   }
 
+  // Post-migration, status/traffic_share are authoritative. Runtime write paths use
+  // `active` for the currently live row; `baseline` remains reserved for legacy backfill.
+  private demoteLiveSkillVersions(skillName: string, excludeId?: string): void {
+    if (excludeId) {
+      this.sqlite.query(`
+        UPDATE skill_versions
+        SET status = 'demoted', traffic_share = 0.0
+        WHERE skill_name = ?
+          AND (status IN ('baseline', 'active') OR is_active = 1)
+          AND id != ?
+      `).run(skillName, excludeId);
+      return;
+    }
+
+    this.sqlite.query(`
+      UPDATE skill_versions
+      SET status = 'demoted', traffic_share = 0.0
+      WHERE skill_name = ?
+        AND (status IN ('baseline', 'active') OR is_active = 1)
+    `).run(skillName);
+  }
+
+  private promoteSkillVersion(id: string, liveStatus: "active" | "baseline" = "active"): void {
+    this.sqlite
+      .query("UPDATE skill_versions SET status = ?, traffic_share = 1.0 WHERE id = ?")
+      .run(liveStatus, id);
+  }
+
   /**
    * Upsert a prompt asset (persona or skill) into skill_versions by content hash.
    * If a row with the same skill_name and version (hash) already exists, return its id.
-   * Otherwise insert a new row and mark it active (deactivating previous active rows).
+   * Otherwise insert a new row and mark it live (demoting previous live rows).
    * Returns the id of the canonical row for this content.
    */
   upsertPromptAsset(skillName: string, content: string): string {
@@ -300,10 +422,9 @@ export class DbClient {
     const now = new Date().toISOString();
 
     this.sqlite.transaction(() => {
-      // Deactivate previous active versions for this asset.
-      this.sqlite.query("UPDATE skill_versions SET is_active = 0 WHERE skill_name = ? AND is_active = 1").run(skillName);
+      this.demoteLiveSkillVersions(skillName);
       this.sqlite.query(
-        "INSERT INTO skill_versions (id, skill_name, version, content, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)"
+        "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share, created_at) VALUES (?, ?, ?, ?, 'active', 1.0, ?)"
       ).run(id, skillName, version, content, now);
     })();
 
@@ -353,12 +474,16 @@ export class DbClient {
    */
   activateProposedVersion(experimentId: string, skillName: string, content: string): string {
     const versionId = this.upsertPromptAsset(skillName, content);
-    this.sqlite.query(
-      "UPDATE skill_versions SET experiment_id = ? WHERE id = ?"
-    ).run(experimentId, versionId);
-    this.sqlite.query(
-      "UPDATE experiments SET status = 'active' WHERE id = ?"
-    ).run(experimentId);
+    this.sqlite.transaction(() => {
+      this.sqlite.query(
+        "UPDATE skill_versions SET experiment_id = ? WHERE id = ?"
+      ).run(experimentId, versionId);
+      this.demoteLiveSkillVersions(skillName, versionId);
+      this.promoteSkillVersion(versionId, "active");
+      this.sqlite.query(
+        "UPDATE experiments SET status = 'active' WHERE id = ?"
+      ).run(experimentId);
+    })();
     return versionId;
   }
 
@@ -369,35 +494,38 @@ export class DbClient {
   concludeExperiment(experimentId: string, metricAfter: number, keep: boolean): void {
     const status = keep ? "keep" : "discard";
     const now = new Date().toISOString();
-    this.sqlite.query(
-      "UPDATE experiments SET metric_after = ?, status = ?, completed_at = ? WHERE id = ?"
-    ).run(metricAfter, status, now, experimentId);
+    this.sqlite.transaction(() => {
+      this.sqlite.query(
+        "UPDATE experiments SET metric_after = ?, status = ?, completed_at = ? WHERE id = ?"
+      ).run(metricAfter, status, now, experimentId);
 
-    if (!keep) {
-      // Deactivate the experimental version and reactivate the most recent seed/kept version.
-      const exp = this.sqlite.query(
-        "SELECT skill_modified FROM experiments WHERE id = ?"
-      ).get(experimentId) as { skill_modified: string } | null;
+      if (!keep) {
+        // Deactivate the experimental version and reactivate the most recent seed/kept version.
+        const exp = this.sqlite.query(
+          "SELECT skill_modified FROM experiments WHERE id = ?"
+        ).get(experimentId) as { skill_modified: string } | null;
 
-      if (exp) {
-        const skillName = exp.skill_modified;
-        // Deactivate the experimental version.
-        this.sqlite.query(
-          "UPDATE skill_versions SET is_active = 0 WHERE skill_name = ? AND experiment_id = ?"
-        ).run(skillName, experimentId);
-        // Reactivate the most recent non-experimental or kept version.
-        const prev = this.sqlite.query(`
-          SELECT id FROM skill_versions
-          WHERE skill_name = ? AND (experiment_id IS NULL OR experiment_id IN (
-            SELECT id FROM experiments WHERE skill_modified = ? AND status = 'keep'
-          ))
-          ORDER BY created_at DESC LIMIT 1
-        `).get(skillName, skillName) as { id: string } | null;
-        if (prev) {
-          this.sqlite.query("UPDATE skill_versions SET is_active = 1 WHERE id = ?").run(prev.id);
+        if (exp) {
+          const skillName = exp.skill_modified;
+          this.sqlite.query(
+            "UPDATE skill_versions SET status = 'demoted', traffic_share = 0.0 WHERE skill_name = ? AND experiment_id = ?"
+          ).run(skillName, experimentId);
+          const prev = this.sqlite.query(`
+            SELECT id FROM skill_versions
+            WHERE skill_name = ? AND (experiment_id IS NULL OR experiment_id IN (
+              SELECT id FROM experiments WHERE skill_modified = ? AND status = 'keep'
+            ))
+            ORDER BY created_at DESC, id DESC LIMIT 1
+          `).get(skillName, skillName) as { id: string } | null;
+          if (prev) {
+            this.demoteLiveSkillVersions(skillName, prev.id);
+            this.promoteSkillVersion(prev.id, "active");
+          } else {
+            this.demoteLiveSkillVersions(skillName);
+          }
         }
       }
-    }
+    })();
   }
 
   archiveTask(taskId: string): void {
@@ -424,6 +552,8 @@ export class DbClient {
       this.sqlite.query("DELETE FROM events WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM agent_transcripts WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM routing_calibration WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM task_iteration_diffs WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM task_diff_stats WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM tasks WHERE id = ?").run(taskId);
     })();
   }

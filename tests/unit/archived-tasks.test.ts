@@ -8,7 +8,10 @@ import { DbClient } from "../../src/db/client";
 function freshDb(): DbClient {
   const dir = mkdtempSync(join(tmpdir(), "archived-tasks-test-"));
   const db = new DbClient(join(dir, `${randomUUID()}.sqlite`));
-  db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+  db.initSchema(
+    resolve(process.cwd(), "src/db/schema.sql"),
+    resolve(process.cwd(), "src/db/migrations")
+  );
   return db;
 }
 
@@ -60,7 +63,10 @@ describe("tasks schema — archived_at column", () => {
     expect(colsBefore.map((c) => c.name)).not.toContain("archived_at");
 
     // initSchema should not throw even though table already exists
-    expect(() => db.initSchema(resolve(process.cwd(), "src/db/schema.sql"))).not.toThrow();
+    expect(() => db.initSchema(
+      resolve(process.cwd(), "src/db/schema.sql"),
+      resolve(process.cwd(), "src/db/migrations")
+    )).not.toThrow();
 
     // archived_at should now be present
     const colsAfter = db.sqlite
@@ -71,7 +77,10 @@ describe("tasks schema — archived_at column", () => {
 
   test("initSchema is idempotent — calling twice does not throw", () => {
     const db = freshDb();
-    expect(() => db.initSchema(resolve(process.cwd(), "src/db/schema.sql"))).not.toThrow();
+    expect(() => db.initSchema(
+      resolve(process.cwd(), "src/db/schema.sql"),
+      resolve(process.cwd(), "src/db/migrations")
+    )).not.toThrow();
   });
 });
 

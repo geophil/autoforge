@@ -12,7 +12,10 @@ describe("GET /api/tasks/:id/events", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "autoforge-events-test-"));
     db = new DbClient(join(tempDir, "test.db"));
-    db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+    db.initSchema(
+      resolve(process.cwd(), "src/db/schema.sql"),
+      resolve(process.cwd(), "src/db/migrations")
+    );
   });
 
   afterEach(() => {

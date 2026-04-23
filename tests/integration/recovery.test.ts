@@ -11,7 +11,10 @@ describe("event-sourced recovery", () => {
     expect(created.state).toBe("awaiting_approval");
 
     const restartedDb = new DbClient(dbPath);
-    restartedDb.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+    restartedDb.initSchema(
+      resolve(process.cwd(), "src/db/schema.sql"),
+      resolve(process.cwd(), "src/db/migrations")
+    );
     const recovery = new RecoveryService(restartedDb);
     recovery.recover();
 

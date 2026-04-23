@@ -8,7 +8,10 @@ import { DbClient } from "../src/db/client";
 function freshDb(): DbClient {
   const dir = mkdtempSync(join(tmpdir(), "db-archive-test-"));
   const db = new DbClient(join(dir, `${randomUUID()}.sqlite`));
-  db.initSchema(resolve(process.cwd(), "src/db/schema.sql"));
+  db.initSchema(
+    resolve(process.cwd(), "src/db/schema.sql"),
+    resolve(process.cwd(), "src/db/migrations")
+  );
   return db;
 }
 
@@ -66,6 +69,39 @@ function insertRoutingCalibration(db: DbClient, calId: string, taskId: string): 
       "INSERT INTO routing_calibration (id, task_id, tier_assigned) VALUES (?,?,?)"
     )
     .run(calId, taskId, "STANDARD");
+}
+
+function insertTaskDiffStats(db: DbClient, taskId: string): void {
+  db.sqlite
+    .query(
+      `INSERT INTO task_diff_stats (
+        task_id,
+        files_changed,
+        files_added,
+        files_modified,
+        files_deleted,
+        lines_added,
+        lines_deleted,
+        test_files_changed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(taskId, 3, 1, 2, 0, 10, 4, 1);
+}
+
+function insertTaskIterationDiff(db: DbClient, taskId: string, fromIteration: number, toIteration: number): void {
+  db.sqlite
+    .query(
+      `INSERT INTO task_iteration_diffs (
+        task_id,
+        from_iteration,
+        to_iteration,
+        files_changed,
+        lines_added,
+        lines_deleted,
+        test_files_changed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(taskId, fromIteration, toIteration, 2, 5, 1, 1);
 }
 
 describe("DbClient.archiveTask", () => {
@@ -154,5 +190,42 @@ describe("DbClient.deleteTaskPermanently", () => {
   test("throws a descriptive error when taskId does not exist", () => {
     const db = freshDb();
     expect(() => db.deleteTaskPermanently("nonexistent-id")).toThrow(/not found/i);
+  });
+
+  test("deletes task_diff_stats and task_iteration_diffs before removing the archived task", () => {
+    const db = freshDb();
+    insertArchivedTask(db, "task-6");
+    insertTaskDiffStats(db, "task-6");
+    insertTaskIterationDiff(db, "task-6", 0, 1);
+
+    expect(() => db.deleteTaskPermanently("task-6")).not.toThrow();
+
+    expect(db.getTask("task-6")).toBeNull();
+    const diffStats = db.sqlite.query("SELECT * FROM task_diff_stats WHERE task_id = ?").all("task-6");
+    expect(diffStats).toHaveLength(0);
+    const iterationDiffs = db.sqlite.query("SELECT * FROM task_iteration_diffs WHERE task_id = ?").all("task-6");
+    expect(iterationDiffs).toHaveLength(0);
+  });
+});
+
+describe("DbClient.rebuildProjectionsFromEvents", () => {
+  test("rebuilds tasks from events without deleting durable observability rows", () => {
+    const db = freshDb();
+    insertTask(db, "task-rebuild");
+    insertEvent(db, "evt-rebuild", "task-rebuild");
+    insertSubtask(db, "sub-rebuild", "task-rebuild");
+    insertReviewFinding(db, "finding-rebuild", "task-rebuild");
+    insertRoutingCalibration(db, "cal-rebuild", "task-rebuild");
+    insertTaskDiffStats(db, "task-rebuild");
+    insertTaskIterationDiff(db, "task-rebuild", 0, 1);
+
+    expect(() => db.rebuildProjectionsFromEvents()).not.toThrow();
+
+    expect(db.getTask("task-rebuild")).not.toBeNull();
+    expect(db.sqlite.query("SELECT * FROM subtasks").all()).toHaveLength(0);
+    expect(db.sqlite.query("SELECT * FROM review_findings").all()).toHaveLength(0);
+    expect(db.sqlite.query("SELECT * FROM routing_calibration WHERE task_id = ?").all("task-rebuild")).toHaveLength(1);
+    expect(db.sqlite.query("SELECT * FROM task_diff_stats WHERE task_id = ?").all("task-rebuild")).toHaveLength(1);
+    expect(db.sqlite.query("SELECT * FROM task_iteration_diffs WHERE task_id = ?").all("task-rebuild")).toHaveLength(1);
   });
 });
