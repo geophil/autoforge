@@ -70,7 +70,7 @@ describe("retrieveLessonsForDispatch", () => {
     const c = seedLesson(db, "vCoder", "coder", "react hooks");
 
     const lessons = await retrieveLessonsForDispatch(
-      "vCoder", "coder", "Styling a React component with CSS modules", 5, 2000, db
+      db, "vCoder", "coder", "Styling a React component with CSS modules", 5, 2000
     );
     // 'a' matches 3 keywords, 'c' matches 1, 'b' matches 0.
     expect(lessons.map((l) => l.id)).toEqual([a, c]);
@@ -80,7 +80,7 @@ describe("retrieveLessonsForDispatch", () => {
     const db = freshDb();
     for (let i = 0; i < 5; i++) seedLesson(db, "vCoder", "coder", "react styling css");
     const lessons = await retrieveLessonsForDispatch(
-      "vCoder", "coder", "react styling", 2, 9999, db
+      db, "vCoder", "coder", "react styling", 2, 9999
     );
     expect(lessons).toHaveLength(2);
   });
@@ -89,7 +89,7 @@ describe("retrieveLessonsForDispatch", () => {
     const db = freshDb();
     seedLesson(db, "vCoder", "coder", "database migration");
     const lessons = await retrieveLessonsForDispatch(
-      "vCoder", "coder", "Add a dark-mode toggle", 5, 9999, db
+      db, "vCoder", "coder", "Add a dark-mode toggle", 5, 9999
     );
     expect(lessons).toEqual([]);
   });
@@ -101,8 +101,65 @@ describe("retrieveLessonsForDispatch", () => {
     seedLesson(db, "vCoder", "coder", "react", bigBody);
     seedLesson(db, "vCoder", "coder", "react", bigBody);
     const lessons = await retrieveLessonsForDispatch(
-      "vCoder", "coder", "react styling", 5, 800, db
+      db, "vCoder", "coder", "react styling", 5, 800
     );
-    expect(lessons.length).toBeLessThanOrEqual(2);
+    expect(lessons).toHaveLength(1);
+  });
+
+  test("returns [] when variantId is unknown (lineage root null)", async () => {
+    const db = freshDb();
+    const lessons = await retrieveLessonsForDispatch(
+      db, "nonexistent-variant", "coder", "any description", 5, 1500
+    );
+    expect(lessons).toEqual([]);
+  });
+
+  test("returns [] for an empty task description", async () => {
+    const db = freshDb();
+    seedLesson(db, "vCoder", "coder", "react styling");
+    const lessons = await retrieveLessonsForDispatch(
+      db, "vCoder", "coder", "", 5, 1500
+    );
+    expect(lessons).toEqual([]);
+  });
+
+  test("lessons with null retrieval_keywords score zero overlap and are excluded", async () => {
+    const db = freshDb();
+    // Seed a variant + task manually (can't use seedLesson because it always passes keywords).
+    db.sqlite.query(
+      `INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share)
+       VALUES ('vK', 'persona:coder', '1', 'c', 'baseline', 1.0)`
+    ).run();
+    db.sqlite.query(
+      `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
+       VALUES ('tk', 'p', 'd', 'completed', 'STANDARD', '{}', '[]', 0, datetime('now'), datetime('now'))`
+    ).run();
+    db.insertLesson({
+      agentType: "coder",
+      lineageRootId: "vK",
+      sourceTaskId: "tk",
+      sourceVariantId: "vK",
+      triggerPattern: "p",
+      body: "TRIGGER\nOBSERVATION\nPRINCIPLE\nEVIDENCE",
+      outcomeKind: "corrective"
+      // retrievalKeywords omitted => null
+    });
+    const lessons = await retrieveLessonsForDispatch(
+      db, "vK", "coder", "any keywords here", 5, 1500
+    );
+    expect(lessons).toEqual([]);
+  });
+
+  test("lesson whose token cost exactly equals remaining budget is admitted (strict > guard)", async () => {
+    const db = freshDb();
+    // approxTokens = ceil(length / 4). A body of length 40 costs 10 tokens.
+    // Seed two such lessons; with budget 20 both fit exactly.
+    const bodyLen40 = "x".repeat(40);
+    seedLesson(db, "vE", "coder", "react", bodyLen40);
+    seedLesson(db, "vE", "coder", "react", bodyLen40);
+    const lessons = await retrieveLessonsForDispatch(
+      db, "vE", "coder", "react", 5, 20
+    );
+    expect(lessons).toHaveLength(2);
   });
 });

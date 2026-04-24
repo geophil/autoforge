@@ -39,12 +39,12 @@ export function extractKeywords(text: string, maxTerms = 20): string[] {
  * resolves lineage itself — we choose the latter for caller convenience.
  */
 export async function retrieveLessonsForDispatch(
+  db: DbClient,
   variantId: string,
   agentType: string,
   taskDescription: string,
   maxLessons = 5,
-  maxTokens = 1500,
-  db: DbClient
+  maxTokens = 1500
 ): Promise<RetrievedLesson[]> {
   const lineageRootId = db.resolveLineageRoot(variantId);
   if (!lineageRootId) return [];
@@ -81,7 +81,7 @@ export async function retrieveLessonsForDispatch(
       id: row.id,
       body: row.body,
       trigger_pattern: row.trigger_pattern,
-      outcome_kind: row.outcome_kind as "corrective" | "reinforcing"
+      outcome_kind: row.outcome_kind
     });
   }
   return out;
