@@ -72,7 +72,6 @@ export class OrchestratorService {
       throw new Error(`Cannot archive task ${taskId}: must be in a terminal state (completed or failed), current state: '${task.state}'`);
     }
     this.captureTaskDiffStats(taskId);
-    await this.reflectOnTask(taskId);
     this.cleanupWorktree(taskId);
     this.recordEvent({
       taskId,

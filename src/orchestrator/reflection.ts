@@ -3,6 +3,7 @@ import type { AgentExecutor } from "../executors/interface";
 import type { PersonaRegistry } from "../personas/registry";
 import type { SkillRegistry } from "../skills/registry";
 import type { AgentType, PipelineTask } from "../types/core";
+import type { AgentTranscriptRow } from "../types/transcripts";
 import { REFLECTION_CONFIG } from "../config/reflection";
 
 /**
@@ -191,6 +192,14 @@ function buildReflectorPrompt(
   fa: Record<string, unknown> | null
 ): string {
   const transcripts = deps.db.listTranscriptsByTask(task.id);
+  const fullTranscripts = transcripts
+    .map((meta) => {
+      const full = deps.db.getTranscript(meta.id);
+      return full
+        ? { stage: meta.stage, attempt: meta.attempt, text: transcriptToText(full) }
+        : null;
+    })
+    .filter((t): t is { stage: string; attempt: number; text: string } => t !== null);
   const findings = deps.db.listFindings(task.id);
   const diffStats = deps.db.sqlite
     .query("SELECT * FROM task_diff_stats WHERE task_id = ?")
@@ -213,8 +222,8 @@ function buildReflectorPrompt(
     task.description,
     ``,
     `## Transcripts`,
-    ...transcripts.map(
-      (t) => `### ${t.stage} (attempt ${t.attempt})\n${truncate("")}`
+    ...fullTranscripts.map(
+      (t) => `### ${t.stage} (attempt ${t.attempt})\n${truncate(t.text)}`
     ),
     ``,
     `## Findings`,
@@ -302,4 +311,62 @@ function safeJsonParse(input: string): unknown {
   } catch {
     return null;
   }
+}
+
+/**
+ * Render an AgentTranscriptRow into a human-readable string suitable for
+ * passing to the reflector. The `transcript` column is stored as JSONL —
+ * one JSON-encoded AgentTranscriptTurn per line (see service.ts where it is
+ * produced, and executors/interface.ts for the turn union). We expand each
+ * turn into a small readable block, including the initial user prompt for
+ * context. Overall truncation is applied by the caller.
+ */
+function transcriptToText(row: AgentTranscriptRow): string {
+  const parts: string[] = [];
+  if (row.userPrompt) {
+    parts.push(`[user]\n${row.userPrompt}`);
+  }
+  const lines = row.transcript ? row.transcript.split("\n").filter((l) => l.length > 0) : [];
+  for (const line of lines) {
+    const turn = safeJsonParse(line) as Record<string, unknown> | null;
+    if (!turn || typeof turn.kind !== "string") continue;
+    switch (turn.kind) {
+      case "assistant": {
+        const content = Array.isArray(turn.content) ? turn.content : [];
+        const rendered: string[] = [];
+        for (const block of content as Array<Record<string, unknown>>) {
+          if (block && typeof block === "object") {
+            if (block.type === "text" && typeof block.text === "string") {
+              rendered.push(block.text);
+            } else if (block.type === "tool_use") {
+              const name = typeof block.name === "string" ? block.name : "?";
+              const input = block.input ? JSON.stringify(block.input) : "";
+              rendered.push(`[tool_use ${name}${input ? ` ${input}` : ""}]`);
+            }
+          }
+        }
+        if (rendered.length > 0) parts.push(`[assistant]\n${rendered.join("\n")}`);
+        break;
+      }
+      case "tool_result": {
+        const content = typeof turn.content === "string" ? turn.content : "";
+        parts.push(`[tool_result]\n${content}`);
+        break;
+      }
+      case "compaction": {
+        parts.push(`[compaction dropped=${turn.droppedTurns ?? "?"}]`);
+        break;
+      }
+      case "error": {
+        const name = typeof turn.name === "string" ? turn.name : "Error";
+        const message = typeof turn.message === "string" ? turn.message : "";
+        parts.push(`[error ${name}]\n${message}`);
+        break;
+      }
+    }
+  }
+  if (row.output) {
+    parts.push(`[output]\n${row.output}`);
+  }
+  return parts.join("\n\n");
 }
