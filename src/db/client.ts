@@ -7,6 +7,37 @@ import type { AgentType, PipelineTask, PlanSubtask, ReviewFinding, TaskStage, Ti
 import type { AgentTranscriptInput, AgentTranscriptMeta, AgentTranscriptRow } from "../types/transcripts";
 import { applyEventProjection } from "./projections";
 
+export interface LessonInsert {
+  agentType: string;
+  lineageRootId: string;
+  sourceTaskId: string;
+  sourceVariantId: string;
+  triggerPattern: string;
+  failureCategory?: string | null;
+  findingCategories?: string[] | null;
+  body: string;
+  outcomeKind: "corrective" | "reinforcing";
+  retrievalKeywords?: string | null;
+}
+
+export interface LessonRow {
+  id: string;
+  agent_type: string;
+  lineage_root_id: string;
+  source_task_id: string;
+  source_variant_id: string;
+  trigger_pattern: string;
+  failure_category: string | null;
+  finding_categories: string | null;
+  body: string;
+  outcome_kind: "corrective" | "reinforcing";
+  retrieval_keywords: string | null;
+  status: "active" | "superseded" | "retired";
+  superseded_by: string | null;
+  created_at: string;
+  retired_at: string | null;
+}
+
 export class DbClient {
   readonly sqlite: Database;
 
@@ -180,6 +211,107 @@ export class DbClient {
       $test_files_changed: stats.test_files_changed,
       $diff_summary: stats.diff_summary
     });
+  }
+
+  insertLesson(input: LessonInsert): string {
+    const id = randomUUID();
+    this.sqlite.query(`
+      INSERT INTO lessons
+        (id, agent_type, lineage_root_id, source_task_id, source_variant_id,
+         trigger_pattern, failure_category, finding_categories, body,
+         outcome_kind, retrieval_keywords)
+      VALUES
+        ($id, $agent_type, $lineage_root_id, $source_task_id, $source_variant_id,
+         $trigger_pattern, $failure_category, $finding_categories, $body,
+         $outcome_kind, $retrieval_keywords)
+    `).run({
+      $id: id,
+      $agent_type: input.agentType,
+      $lineage_root_id: input.lineageRootId,
+      $source_task_id: input.sourceTaskId,
+      $source_variant_id: input.sourceVariantId,
+      $trigger_pattern: input.triggerPattern,
+      $failure_category: input.failureCategory ?? null,
+      $finding_categories: input.findingCategories
+        ? JSON.stringify(input.findingCategories)
+        : null,
+      $body: input.body,
+      $outcome_kind: input.outcomeKind,
+      $retrieval_keywords: input.retrievalKeywords ?? null
+    });
+    return id;
+  }
+
+  resolveLineageRoot(variantId: string): string | null {
+    // Walk parent_version_id chain. Cycle-safe via a visited set with a depth cap.
+    const seen = new Set<string>();
+    let current: string | null = variantId;
+    for (let depth = 0; depth < 50 && current !== null; depth++) {
+      if (seen.has(current)) {
+        return current;
+      }
+      seen.add(current);
+      const row = this.sqlite
+        .query("SELECT parent_version_id FROM skill_versions WHERE id = ?")
+        .get(current) as { parent_version_id: string | null } | undefined;
+      if (!row) return depth === 0 ? null : current;
+      if (row.parent_version_id === null) return current;
+      current = row.parent_version_id;
+    }
+    return current;
+  }
+
+  retrieveActiveLessonsByLineage(
+    lineageRootId: string,
+    agentType: string,
+    limit = 20
+  ): LessonRow[] {
+    return this.sqlite.query(`
+      SELECT * FROM lessons
+      WHERE lineage_root_id = $lineage_root_id
+        AND agent_type = $agent_type
+        AND status = 'active'
+      ORDER BY created_at DESC
+      LIMIT $limit
+    `).all({
+      $lineage_root_id: lineageRootId,
+      $agent_type: agentType,
+      $limit: limit
+    }) as LessonRow[];
+  }
+
+  supersedeLessons(oldIds: string[], newLessonId: string): void {
+    if (oldIds.length === 0) return;
+    const stmt = this.sqlite.query(`
+      UPDATE lessons
+         SET status = 'superseded',
+             superseded_by = $new_id,
+             retired_at = datetime('now')
+       WHERE id = $id AND status = 'active'
+    `);
+    this.sqlite.transaction(() => {
+      for (const id of oldIds) {
+        stmt.run({ $new_id: newLessonId, $id: id });
+      }
+    })();
+  }
+
+  retireLessons(ids: string[]): string[] {
+    if (ids.length === 0) return [];
+    const transitioned: string[] = [];
+    const stmt = this.sqlite.query(`
+      UPDATE lessons
+         SET status = 'retired',
+             retired_at = datetime('now')
+       WHERE id = $id AND status = 'active'
+    `);
+    this.sqlite.transaction(() => {
+      for (const id of ids) {
+        const info = stmt.run({ $id: id });
+        if (info.changes === 1) transitioned.push(id);
+      }
+    })();
+    return transitioned;
   }
 
   rebuildProjectionsFromEvents(): void {
@@ -616,6 +748,7 @@ export class DbClient {
       this.sqlite.query("DELETE FROM routing_calibration WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM task_iteration_diffs WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM task_diff_stats WHERE task_id = ?").run(taskId);
+      this.sqlite.query("DELETE FROM lessons WHERE source_task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM tasks WHERE id = ?").run(taskId);
     })();
   }
