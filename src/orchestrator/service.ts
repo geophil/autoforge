@@ -11,6 +11,7 @@ import type { NatsClient } from "../nats/client";
 import type { AgentType, PipelineTask, PlanSubtask, RejectionFeedback, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
 import { assertTransition } from "./state-machine";
 import { computeDiffStats, computeIterationDiff } from "./diff-stats";
+import { reflectOnTask, type ReflectionResult } from "./reflection";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
@@ -71,6 +72,7 @@ export class OrchestratorService {
       throw new Error(`Cannot archive task ${taskId}: must be in a terminal state (completed or failed), current state: '${task.state}'`);
     }
     this.captureTaskDiffStats(taskId);
+    await this.reflectOnTask(taskId);
     this.cleanupWorktree(taskId);
     this.recordEvent({
       taskId,
@@ -183,6 +185,7 @@ export class OrchestratorService {
         return this.requireTask(taskId);
       }
       this.captureTaskDiffStats(taskId);
+      await this.reflectOnTask(taskId);
       this.cleanupWorktree(taskId);
       throw err;
     }
@@ -388,6 +391,7 @@ export class OrchestratorService {
         return this.requireTask(taskId);
       }
       this.captureTaskDiffStats(taskId);
+      await this.reflectOnTask(taskId);
       this.cleanupWorktree(taskId);
       throw err;
     }
@@ -517,6 +521,7 @@ export class OrchestratorService {
 
     this.transition(taskId, task.projectId, "documenting", "completed", {});
     this.captureTaskDiffStats(taskId);
+    await this.reflectOnTask(taskId);
     this.cleanupWorktree(taskId);
     return this.requireTask(taskId);
   }
@@ -558,6 +563,7 @@ export class OrchestratorService {
       iteration: oldTask.iteration
     });
     this.captureTaskDiffStats(taskId);
+    await this.reflectOnTask(taskId);
     this.cleanupWorktree(taskId);
 
     // Spawn a fresh task from current HEAD with the operator's feedback
@@ -613,6 +619,7 @@ export class OrchestratorService {
         stage_failed: task.state,
         failure_reason: reason,
         failure_category: "cancelled",
+        cancel_reason: reason,
         planner_fallback: task.planSubtasks.length === 1 &&
           task.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
         budget_seconds: this.budgetForTier(task.tier, "coder"),
@@ -623,8 +630,35 @@ export class OrchestratorService {
 
     this.transition(taskId, task.projectId, task.state, "failed", { reason: `cancelled: ${reason}`, iteration: task.iteration });
     this.captureTaskDiffStats(taskId);
+    await this.reflectOnTask(taskId);
     this.cleanupWorktree(taskId);
     return this.requireTask(taskId);
+  }
+
+  /**
+   * Run the reflector synchronously for a terminal task. Called by the
+   * orchestrator immediately after captureTaskDiffStats on every non-meta
+   * terminal transition. Also exposed publicly for tests and operators.
+   */
+  async reflectOnTask(taskId: string): Promise<ReflectionResult> {
+    const worktree = this.deps.worktrees.get(taskId);
+    return reflectOnTask(taskId, {
+      db: this.deps.db,
+      executor: this.routeExecutor("EXPRESS", "reflector"),
+      personas: this.personas,
+      skills: this.skills,
+      workingDirectory: worktree?.path ?? process.cwd(),
+      recordEvent: (e) =>
+        this.recordEvent({
+          taskId: e.taskId,
+          projectId: e.projectId,
+          agent: e.agent as AutoforgeMessage["agent"],
+          type: e.type,
+          status: e.status as AutoforgeMessage["status"],
+          payload: e.payload,
+          budgetSeconds: e.budgetSeconds
+        })
+    });
   }
 
   /**
@@ -727,7 +761,7 @@ export class OrchestratorService {
    * On startup, find tasks stuck in non-terminal states beyond their staleness
    * threshold and auto-fail them with a failure_analysis event.
    */
-  sweepStaleTasks(): void {
+  async sweepStaleTasks(): Promise<void> {
     const nonTerminalStates = [
       "received", "assessing", "planning", "replanning",
       "executing", "reviewing", "reworking", "pr_created", "documenting"
@@ -783,6 +817,7 @@ export class OrchestratorService {
         }
 
         this.captureTaskDiffStats(task.id);
+        await this.reflectOnTask(task.id);
         this.cleanupWorktree(task.id);
       }
     }

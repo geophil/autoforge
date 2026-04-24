@@ -37,7 +37,7 @@ const service = new OrchestratorService({
 
 // Mark any tasks that were stuck in non-terminal states (e.g. from a crashed
 // previous run or a timed-out executor) as failed with a failure_analysis event.
-service.sweepStaleTasks();
+await service.sweepStaleTasks();
 
 const app = createWebServer(service, db, env);
 

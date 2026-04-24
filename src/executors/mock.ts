@@ -37,6 +37,10 @@ export class MockExecutor implements AgentExecutor {
       return this.result("DONE", { artifacts: ["README.md"] });
     }
 
+    if (task.type === "reflector") {
+      return this.result("DONE", { lesson: { skip: true, reason: "mock-executor" } });
+    }
+
     return this.result("DONE");
   }
 
