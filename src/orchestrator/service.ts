@@ -890,136 +890,140 @@ export class OrchestratorService {
   ): Promise<{ experimentId: string | null; status: string; reason?: string }> {
     const metaTaskId = randomUUID();
     const worktree = this.deps.worktrees.create(metaTaskId);
-    const dbPath = this.deps.env.DATABASE_PATH;
 
-    const focusHint = focus ? `\n\nFocus on improving: ${focus}` : "";
-    const prompt = [
-      `## Meta Task`,
-      `Analyze agent performance and propose one targeted improvement to a persona or skill.`,
-      `Database path: ${dbPath}`,
-      `Working directory: ${worktree.path}${focusHint}`,
-      `\nQuery agent_performance and experiments tables to identify the weakest asset and what has already been tried.`,
-      `Propose a single targeted change. Write the proposed content to a file and report via .autoforge-status.json.`
-    ].join("\n");
+    try {
+      const dbPath = this.deps.env.DATABASE_PATH;
 
-    this.recordEvent({
-      taskId: metaTaskId,
-      projectId,
-      agent: "meta",
-      type: "meta_started",
-      status: "in_progress",
-      payload: { focus: focus ?? "auto", dbPath },
-      budgetSeconds: 600
-    });
+      const focusHint = focus ? `\n\nFocus on improving: ${focus}` : "";
+      const prompt = [
+        `## Meta Task`,
+        `Analyze agent performance and propose one targeted improvement to a persona or skill.`,
+        `Database path: ${dbPath}`,
+        `Working directory: ${worktree.path}${focusHint}`,
+        `\nQuery agent_performance and experiments tables to identify the weakest asset and what has already been tried.`,
+        `Propose a single targeted change. Write the proposed content to a file and report via .autoforge-status.json.`
+      ].join("\n");
 
-    const metaPersonaId = this.personas.snapshotId("meta");
-    const metaSkillIds = this.skills.snapshotIds("meta");
-    const metaExecutor = this.routeExecutor("STANDARD", "meta");
-
-    this.emitVariantSelected({
-      taskId: metaTaskId,
-      projectId,
-      agentType: "meta",
-      selectedVariantId: metaPersonaId,
-      budgetSeconds: 600
-    });
-
-    const metaResult = await metaExecutor.execute({
-      id: metaTaskId,
-      type: "meta",
-      systemPrompt: this.personas.resolve("meta"),
-      prompt,
-      workingDirectory: worktree.path,
-      budgetSeconds: 600,
-      environment: {},
-      skillFiles: this.skills.skillsForAgent("meta"),
-      metadata: { projectId, focus }
-    });
-
-    this.recordEvent({
-      taskId: metaTaskId,
-      projectId,
-      agent: "meta",
-      type: "meta_done",
-      status: metaResult.status === "DONE" ? "done" : "done_with_concerns",
-      payload: { artifacts: metaResult.artifacts, concerns: metaResult.concerns },
-      budgetSeconds: 600,
-      elapsedSeconds: metaResult.metrics.elapsedSeconds,
-      tokenUsage: metaResult.metrics.tokenInput !== undefined ? {
-        input: metaResult.metrics.tokenInput,
-        output: metaResult.metrics.tokenOutput ?? 0,
-        estimatedCost: metaResult.metrics.estimatedCost
-      } : undefined,
-      executorUsed: metaExecutor.name,
-      personaVersionId: metaPersonaId,
-      skillVersionIds: metaSkillIds
-    });
-
-    if (metaResult.status !== "DONE") {
-      this.captureTaskDiffStats(metaTaskId);
-      this.cleanupWorktree(metaTaskId);
-      return { experimentId: null, status: metaResult.status };
-    }
-
-    const validation = validateMetaOutput(metaResult.output);
-    if (!validation.ok || !validation.value) {
-      const reason = validation.error ?? "invalid";
       this.recordEvent({
         taskId: metaTaskId,
         projectId,
         agent: "meta",
-        type: "meta_rejected",
-        status: "done_with_concerns",
-        payload: { reason },
-        budgetSeconds: 60
+        type: "meta_started",
+        status: "in_progress",
+        payload: { focus: focus ?? "auto", dbPath },
+        budgetSeconds: 600
       });
-      this.captureTaskDiffStats(metaTaskId);
-      this.cleanupWorktree(metaTaskId);
-      return { experimentId: null, status: "DONE_WITH_CONCERNS", reason };
-    }
 
-    const operation = validation.value.operation;
-    const handleResult = handleMetaOperation({
-      db: this.deps.db,
-      operation,
-      metaTaskId,
-      worktreePath: worktree.path,
-      projectId
-    });
+      const metaPersonaId = this.personas.snapshotId("meta");
+      const metaSkillIds = this.skills.snapshotIds("meta");
+      const metaExecutor = this.routeExecutor("STANDARD", "meta");
 
-    if (!handleResult.ok) {
-      const reason = handleResult.reason ?? "handler_failed";
+      this.emitVariantSelected({
+        taskId: metaTaskId,
+        projectId,
+        agentType: "meta",
+        selectedVariantId: metaPersonaId,
+        budgetSeconds: 600
+      });
+
+      const metaResult = await metaExecutor.execute({
+        id: metaTaskId,
+        type: "meta",
+        systemPrompt: this.personas.resolve("meta"),
+        prompt,
+        workingDirectory: worktree.path,
+        budgetSeconds: 600,
+        environment: {},
+        skillFiles: this.skills.skillsForAgent("meta"),
+        metadata: { projectId, focus }
+      });
+
       this.recordEvent({
         taskId: metaTaskId,
         projectId,
         agent: "meta",
-        type: "meta_rejected",
-        status: "done_with_concerns",
-        payload: { reason: `handler:${reason}`, operation_kind: operation.kind },
+        type: "meta_done",
+        status: metaResult.status === "DONE" ? "done" : "done_with_concerns",
+        payload: { artifacts: metaResult.artifacts, concerns: metaResult.concerns },
+        budgetSeconds: 600,
+        elapsedSeconds: metaResult.metrics.elapsedSeconds,
+        tokenUsage: metaResult.metrics.tokenInput !== undefined ? {
+          input: metaResult.metrics.tokenInput,
+          output: metaResult.metrics.tokenOutput ?? 0,
+          estimatedCost: metaResult.metrics.estimatedCost
+        } : undefined,
+        executorUsed: metaExecutor.name,
+        personaVersionId: metaPersonaId,
+        skillVersionIds: metaSkillIds
+      });
+
+      if (metaResult.status !== "DONE") {
+        return { experimentId: null, status: metaResult.status };
+      }
+
+      const validation = validateMetaOutput(metaResult.output);
+      if (!validation.ok || !validation.value) {
+        const reason = validation.error ?? "invalid";
+        this.recordEvent({
+          taskId: metaTaskId,
+          projectId,
+          agent: "orchestrator",
+          type: "meta_rejected",
+          status: "done_with_concerns",
+          payload: { reason },
+          budgetSeconds: 60
+        });
+        return { experimentId: null, status: "DONE_WITH_CONCERNS", reason };
+      }
+
+      const operation = validation.value.operation;
+      const handleResult = handleMetaOperation({
+        db: this.deps.db,
+        operation,
+        metaTaskId,
+        worktreePath: worktree.path,
+        projectId
+      });
+
+      if (!handleResult.ok) {
+        const reason = handleResult.reason ?? "handler_failed";
+        this.recordEvent({
+          taskId: metaTaskId,
+          projectId,
+          agent: "orchestrator",
+          type: "meta_rejected",
+          status: "done_with_concerns",
+          payload: { reason: `handler:${reason}`, operation_kind: operation.kind },
+          budgetSeconds: 60
+        });
+        return { experimentId: null, status: "DONE_WITH_CONCERNS", reason };
+      }
+
+      this.recordEvent({
+        taskId: metaTaskId,
+        projectId,
+        agent: "orchestrator",
+        type: "experiment_proposed",
+        status: "done",
+        payload: {
+          experiment_id: handleResult.experimentId,
+          operation_kind: operation.kind,
+          candidate_variant_id: handleResult.candidateVariantId ?? null
+        },
         budgetSeconds: 60
       });
+
+      return { experimentId: handleResult.experimentId ?? null, status: "DONE" };
+    } finally {
       this.captureTaskDiffStats(metaTaskId);
-      this.cleanupWorktree(metaTaskId);
-      return { experimentId: null, status: "DONE_WITH_CONCERNS", reason };
+      try {
+        this.cleanupWorktree(metaTaskId);
+      } catch (cleanupErr) {
+        console.warn(
+          `[meta] cleanupWorktree threw for ${metaTaskId}: ${(cleanupErr as Error).message ?? cleanupErr}`
+        );
+      }
     }
-
-    this.recordEvent({
-      taskId: metaTaskId,
-      projectId,
-      agent: "meta",
-      type: "experiment_proposed",
-      status: "done",
-      payload: {
-        experiment_id: handleResult.experimentId,
-        operation_kind: operation.kind,
-        candidate_variant_id: handleResult.candidateVariantId ?? null
-      },
-      budgetSeconds: 60
-    });
-
-    this.captureTaskDiffStats(metaTaskId);
-    this.cleanupWorktree(metaTaskId);
-    return { experimentId: handleResult.experimentId!, status: "DONE" };
   }
 
   /**

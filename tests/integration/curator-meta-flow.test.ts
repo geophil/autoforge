@@ -103,4 +103,17 @@ describe("curator meta flow", () => {
       cleanup();
     }
   });
+
+  test("executor exception still runs cleanup; caller sees the exception propagate", async () => {
+    const { service, cleanup } = createTestService({
+      meta: async () => {
+        throw new Error("executor blew up");
+      }
+    });
+    try {
+      await expect(service.submitMetaTask("autoforge", "x")).rejects.toThrow("executor blew up");
+    } finally {
+      cleanup();
+    }
+  });
 });
