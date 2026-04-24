@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, relative, resolve } from "node:path";
 import type { DbClient } from "../db/client";
 import type { MetaOperation } from "../schemas/meta-output";
 
@@ -34,7 +34,17 @@ export function handleMetaOperation(ctx: MetaOperationContext): MetaOperationRes
 }
 
 function readProposedContent(worktreePath: string, fileName: string): string | null {
-  const p = resolve(worktreePath, fileName);
+  // Reject anything that's not already a basename (no slashes, no '..').
+  // `proposed_content_file` originates from the meta persona's status JSON,
+  // so treat it as adversarial — prevent path traversal / absolute escapes.
+  const safe = basename(fileName);
+  if (safe !== fileName || safe.length === 0) return null;
+
+  const resolvedWorktree = resolve(worktreePath);
+  const p = resolve(resolvedWorktree, safe);
+  const rel = relative(resolvedWorktree, p);
+  if (rel === "" || rel.startsWith("..") || rel.includes("/")) return null;
+
   if (!existsSync(p)) return null;
   try { return readFileSync(p, "utf8"); } catch { return null; }
 }
@@ -42,6 +52,10 @@ function readProposedContent(worktreePath: string, fileName: string): string | n
 function applyRetireLessons(ctx: MetaOperationContext): string[] {
   const list = (ctx.operation.retire_lessons ?? []).map((e) => e.id);
   return ctx.db.retireLessons(list);
+}
+
+function pendingRetireLessonIds(ctx: MetaOperationContext): string[] {
+  return (ctx.operation.retire_lessons ?? []).map((e) => e.id);
 }
 
 function handleEdit(ctx: MetaOperationContext): MetaOperationResult {
@@ -114,7 +128,7 @@ function handleFork(ctx: MetaOperationContext): MetaOperationResult {
         ...op.evidence,
         specialty: op.specialty,
         parent_variant_id: parent.id,
-        retired_lessons: applyRetireLessons(ctx)
+        pending_retire_lessons: pendingRetireLessonIds(ctx)
       },
       status: "proposed",
       proposedContent: content
@@ -146,7 +160,7 @@ function handleMerge(ctx: MetaOperationContext): MetaOperationResult {
       evidence: {
         ...op.evidence,
         merge_source_variant_id: op.merge_source_variant_id,
-        retired_lessons: applyRetireLessons(ctx)
+        pending_retire_lessons: pendingRetireLessonIds(ctx)
       },
       status: "proposed"
     });

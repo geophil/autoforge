@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DbClient } from "../../src/db/client";
 import { handleMetaOperation } from "../../src/orchestrator/meta-operations";
@@ -207,5 +207,87 @@ describe("handleMetaOperation — retire_lessons side effect", () => {
 
     const row = db.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(l1) as { status: string };
     expect(row.status).toBe("retired");
+  });
+});
+
+describe("handleMetaOperation — proposed_content_file path traversal", () => {
+  test("rejects edit with '../' in proposed_content_file", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder");
+    const worktree = makeWorktreeWithProposal("# legit");
+    const decoyDir = mkdtempSync(join(tmpdir(), "decoy-"));
+    writeFileSync(join(decoyDir, "secret.md"), "# secret");
+    const rel = relative(worktree, join(decoyDir, "secret.md"));
+
+    const op: MetaOperation = {
+      kind: "edit",
+      target_variant_id: "vBase",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"] },
+      proposed_content_file: rel
+    };
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt", worktreePath: worktree, projectId: "p"
+    });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("proposed_content_empty");
+  });
+
+  test("rejects edit with absolute proposed_content_file", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder");
+    const worktree = makeWorktreeWithProposal("# legit");
+
+    const op: MetaOperation = {
+      kind: "edit",
+      target_variant_id: "vBase",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"] },
+      proposed_content_file: "/etc/passwd"
+    };
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt", worktreePath: worktree, projectId: "p"
+    });
+    expect(res.ok).toBe(false);
+  });
+});
+
+describe("handleMetaOperation — proposed ops defer retire_lessons", () => {
+  test("fork stores retire_lessons as pending, does not retire them yet", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    db.sqlite.query(
+      `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
+       VALUES ('t1','p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))`
+    ).run();
+    const lessonId = db.insertLesson({
+      agentType: "coder", lineageRootId: "vBase", sourceTaskId: "t1",
+      sourceVariantId: "vBase", triggerPattern: "p", body: "b", outcomeKind: "corrective"
+    });
+    const worktree = makeWorktreeWithProposal("# Forked");
+
+    const op: MetaOperation = {
+      kind: "fork",
+      parent_variant_id: "vBase",
+      specialty: "frontend",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"] },
+      proposed_content_file: "proposed-persona.md",
+      retire_lessons: [{ id: lessonId, reason: "superseded" }]
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt", worktreePath: worktree, projectId: "p"
+    });
+    expect(res.ok).toBe(true);
+
+    const lessonRow = db.sqlite.query("SELECT status FROM lessons WHERE id = ?")
+      .get(lessonId) as { status: string };
+    expect(lessonRow.status).toBe("active");
+
+    const exp = db.sqlite.query("SELECT evidence FROM experiments WHERE id = ?")
+      .get(res.experimentId as string) as { evidence: string };
+    const parsed = JSON.parse(exp.evidence) as Record<string, unknown>;
+    expect(parsed.pending_retire_lessons).toEqual([lessonId]);
   });
 });
