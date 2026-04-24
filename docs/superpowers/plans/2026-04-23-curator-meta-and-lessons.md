@@ -1709,12 +1709,12 @@ private async loadLessonsForDispatch(
 ): Promise<{ block: string; ids: string[] }> {
   const { retrieval } = REFLECTION_CONFIG;
   const lessons = await retrieveLessonsForDispatch(
+    this.deps.db,
     variantId,
     agentType,
     taskDescription,
     retrieval.maxLessons,
-    retrieval.maxTokens,
-    this.deps.db
+    retrieval.maxTokens
   );
   if (lessons.length === 0) return { block: "", ids: [] };
   const parts = ["# Lessons from past tasks in this lineage", ""];
