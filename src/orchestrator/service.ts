@@ -20,6 +20,8 @@ import { PersonaRegistry } from "../personas/registry";
 import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
 import type { ExecutorSet } from "../executors/factory";
+import { validateMetaOutput } from "../schemas/meta-output";
+import { handleMetaOperation } from "./meta-operations";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -874,11 +876,18 @@ export class OrchestratorService {
   }
 
   /**
-   * Run a meta agent session to analyze performance and propose an improvement
-   * to a persona or skill. Returns an experiment id that can be used to track
-   * and conclude the experiment after observing canary task outcomes.
+   * Run a meta agent session to analyze performance and propose a structured
+   * improvement operation (edit/fork/merge/promote/demote/retire). The meta
+   * output is Zod-validated against `MetaOutputSchema` and dispatched through
+   * `handleMetaOperation`. Unlike the legacy path, edit candidates land with
+   * status='candidate' and traffic_share=0 — Spec C's dispatch policy is
+   * responsible for any subsequent activation. Meta tasks are excluded from
+   * `reflectOnTask` per Spec B §4.1.
    */
-  async submitMetaTask(projectId: string, focus?: string): Promise<{ experimentId: string | null; status: string }> {
+  async submitMetaTask(
+    projectId: string,
+    focus?: string
+  ): Promise<{ experimentId: string | null; status: string; reason?: string }> {
     const metaTaskId = randomUUID();
     const worktree = this.deps.worktrees.create(metaTaskId);
     const dbPath = this.deps.env.DATABASE_PATH;
@@ -946,70 +955,71 @@ export class OrchestratorService {
       skillVersionIds: metaSkillIds
     });
 
-    if (!isSuccess(metaResult.status)) {
+    if (metaResult.status !== "DONE") {
       this.captureTaskDiffStats(metaTaskId);
       this.cleanupWorktree(metaTaskId);
       return { experimentId: null, status: metaResult.status };
     }
 
-    // Read the meta output — expects a "meta" key in the status file output.
-    const metaOutput = metaResult.output as Record<string, unknown> | undefined;
-    const metaMeta = metaOutput?.meta as Record<string, unknown> | undefined;
-
-    if (!metaMeta?.target_asset || !metaMeta?.hypothesis) {
+    const validation = validateMetaOutput(metaResult.output);
+    if (!validation.ok || !validation.value) {
+      const reason = validation.error ?? "invalid";
+      this.recordEvent({
+        taskId: metaTaskId,
+        projectId,
+        agent: "meta",
+        type: "meta_rejected",
+        status: "done_with_concerns",
+        payload: { reason },
+        budgetSeconds: 60
+      });
       this.captureTaskDiffStats(metaTaskId);
       this.cleanupWorktree(metaTaskId);
-      return { experimentId: null, status: "DONE_WITH_CONCERNS" };
+      return { experimentId: null, status: "DONE_WITH_CONCERNS", reason };
     }
 
-    const targetAsset = String(metaMeta.target_asset);
-    const hypothesis = String(metaMeta.hypothesis);
-    const metricName = String(metaMeta.metric_name ?? "first_pass_rate");
-    const metricBefore = Number(metaMeta.metric_before ?? 0);
-    const changeDescription = String(metaMeta.hypothesis);
-    const agentAffected = targetAsset.replace(/^(persona|skill):/, "");
-    const proposedFile = String(metaMeta.proposed_content_file ?? "");
-
-    // Read the proposed content from the working directory.
-    let proposedContent = "";
-    if (proposedFile) {
-      const proposedPath = pathJoin(worktree.path, proposedFile);
-      if (existsSync(proposedPath)) {
-        proposedContent = readFileSync(proposedPath, "utf8").trim();
-      }
-    }
-
-    if (!proposedContent) {
-      this.captureTaskDiffStats(metaTaskId);
-      this.cleanupWorktree(metaTaskId);
-      return { experimentId: null, status: "DONE_WITH_CONCERNS" };
-    }
-
-    // Create experiment and activate the proposed version.
-    const experimentId = this.deps.db.createExperiment({
-      hypothesis,
-      skillModified: targetAsset,
-      agentAffected,
-      changeDescription,
-      metricName,
-      metricBefore
+    const operation = validation.value.operation;
+    const handleResult = handleMetaOperation({
+      db: this.deps.db,
+      operation,
+      metaTaskId,
+      worktreePath: worktree.path,
+      projectId
     });
 
-    this.deps.db.activateProposedVersion(experimentId, targetAsset, proposedContent);
+    if (!handleResult.ok) {
+      const reason = handleResult.reason ?? "handler_failed";
+      this.recordEvent({
+        taskId: metaTaskId,
+        projectId,
+        agent: "meta",
+        type: "meta_rejected",
+        status: "done_with_concerns",
+        payload: { reason: `handler:${reason}`, operation_kind: operation.kind },
+        budgetSeconds: 60
+      });
+      this.captureTaskDiffStats(metaTaskId);
+      this.cleanupWorktree(metaTaskId);
+      return { experimentId: null, status: "DONE_WITH_CONCERNS", reason };
+    }
 
     this.recordEvent({
       taskId: metaTaskId,
       projectId,
       agent: "meta",
-      type: "experiment_activated",
+      type: "experiment_proposed",
       status: "done",
-      payload: { experimentId, targetAsset, hypothesis, metricName, metricBefore },
+      payload: {
+        experiment_id: handleResult.experimentId,
+        operation_kind: operation.kind,
+        candidate_variant_id: handleResult.candidateVariantId ?? null
+      },
       budgetSeconds: 60
     });
 
     this.captureTaskDiffStats(metaTaskId);
     this.cleanupWorktree(metaTaskId);
-    return { experimentId, status: "DONE" };
+    return { experimentId: handleResult.experimentId!, status: "DONE" };
   }
 
   /**
