@@ -12,6 +12,15 @@ export interface AgentTask {
   metadata?: Record<string, unknown>;
   /** Per-run model override. When unset, executor uses its configured default. */
   model?: string;
+  /**
+   * Optional pre-rendered lessons block to inject between the persona and the
+   * `# Skills` section (Spec B §5.4). When present and non-empty, executors
+   * splice it verbatim into the system prompt; when absent, empty, or
+   * whitespace-only, no lesson section is emitted. The orchestrator is
+   * responsible for assembly and token-budgeting via
+   * `retrieveLessonsForDispatch`.
+   */
+  lessons?: string;
 }
 
 export interface ToolStats {

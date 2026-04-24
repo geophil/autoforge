@@ -12,6 +12,8 @@ import type { AgentType, PipelineTask, PlanSubtask, RejectionFeedback, ReviewFin
 import { assertTransition } from "./state-machine";
 import { computeDiffStats, computeIterationDiff } from "./diff-stats";
 import { reflectOnTask, type ReflectionResult } from "./reflection";
+import { retrieveLessonsForDispatch } from "./lessons";
+import { REFLECTION_CONFIG } from "../config/reflection";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
@@ -230,12 +232,15 @@ export class OrchestratorService {
     const plannerPersonaId = this.personas.snapshotId("planner");
     const plannerSkillIds = this.skills.snapshotIds("planner");
 
+    const plannerLessons = await this.loadLessonsForDispatch(plannerPersonaId, "planner", description);
+
     this.emitVariantSelected({
       taskId,
       projectId,
       agentType: "planner",
       selectedVariantId: plannerPersonaId,
-      budgetSeconds: this.budgetForTier(tier, "planner")
+      budgetSeconds: this.budgetForTier(tier, "planner"),
+      injectedLessonIds: plannerLessons.ids
     });
 
     const plannerResult = await plannerExecutor.execute({
@@ -248,7 +253,8 @@ export class OrchestratorService {
       environment: this.agentEnvironment(),
       skillFiles: this.skills.skillsForAgent("planner"),
       metadata: { description, tier, attempt },
-      model: this.plannerModel(tier)
+      model: this.plannerModel(tier),
+      lessons: plannerLessons.block || undefined
     });
 
     // Persist transcript before we do anything else — even on failure we want
@@ -485,12 +491,14 @@ export class OrchestratorService {
       const docSkillIds = this.skills.snapshotIds("doc");
 
       const docExecutor = this.routeExecutor(task.tier, "doc");
+      const docLessons = await this.loadLessonsForDispatch(docPersonaId, "doc", task.description);
       this.emitVariantSelected({
         taskId,
         projectId: task.projectId,
         agentType: "doc",
         selectedVariantId: docPersonaId,
-        budgetSeconds: this.budgetForTier(task.tier, "doc")
+        budgetSeconds: this.budgetForTier(task.tier, "doc"),
+        injectedLessonIds: docLessons.ids
       });
       const docResult = await docExecutor.execute({
         id: `${taskId}-doc`,
@@ -501,7 +509,8 @@ export class OrchestratorService {
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("doc"),
-        metadata: { taskId, description: task.description }
+        metadata: { taskId, description: task.description },
+        lessons: docLessons.block || undefined
       });
 
       this.recordEvent({
@@ -1044,12 +1053,17 @@ export class OrchestratorService {
         const subtaskSkillIds = this.skills.snapshotIds(subtaskAgentType);
         const coderExecutor = this.routeExecutor(tier, subtaskAgentType);
 
+        // Lessons are scoped to task granularity (Spec B §5) — retrieve against
+        // the top-level task description, not the per-subtask description.
+        const coderLessons = await this.loadLessonsForDispatch(subtaskPersonaId, subtaskAgentType, description);
+
         this.emitVariantSelected({
           taskId,
           projectId,
           agentType: subtaskAgentType,
           selectedVariantId: subtaskPersonaId,
-          budgetSeconds: this.budgetForTier(tier, "coder")
+          budgetSeconds: this.budgetForTier(tier, "coder"),
+          injectedLessonIds: coderLessons.ids
         });
 
         const coderResult = await coderExecutor.execute({
@@ -1061,7 +1075,8 @@ export class OrchestratorService {
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
-          metadata: { taskId, subtask, description }
+          metadata: { taskId, subtask, description },
+          lessons: coderLessons.block || undefined
         });
 
         if (!isSuccess(coderResult.status)) {
@@ -1126,12 +1141,15 @@ export class OrchestratorService {
       const reviewerSkillIds = this.skills.snapshotIds("reviewer");
       const reviewerExecutor = this.routeExecutor(tier, "reviewer");
 
+      const reviewerLessons = await this.loadLessonsForDispatch(reviewerPersonaId, "reviewer", description);
+
       this.emitVariantSelected({
         taskId,
         projectId,
         agentType: "reviewer",
         selectedVariantId: reviewerPersonaId,
-        budgetSeconds: this.budgetForTier(tier, "reviewer")
+        budgetSeconds: this.budgetForTier(tier, "reviewer"),
+        injectedLessonIds: reviewerLessons.ids
       });
 
       const reviewResult = await reviewerExecutor.execute({
@@ -1143,7 +1161,8 @@ export class OrchestratorService {
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("reviewer"),
-        metadata: { taskId, iteration, description }
+        metadata: { taskId, iteration, description },
+        lessons: reviewerLessons.block || undefined
       });
 
       const reviewerFailureForensics = {
@@ -1416,6 +1435,7 @@ export class OrchestratorService {
     agentType: AgentType;
     selectedVariantId: string;
     budgetSeconds: number;
+    injectedLessonIds?: string[];
   }): void {
     this.recordEvent({
       taskId: input.taskId,
@@ -1430,10 +1450,49 @@ export class OrchestratorService {
         eligible_variant_ids: [input.selectedVariantId],
         selection_rationale: "only_eligible",
         shadow_variant_ids: [],
-        injected_lesson_ids: []
+        injected_lesson_ids: input.injectedLessonIds ?? []
       },
       budgetSeconds: input.budgetSeconds
     });
+  }
+
+  /**
+   * Retrieve lineage lessons for a dispatch and render them into a system-prompt
+   * block (Spec B §5). Returns both the pre-rendered block (for AgentTask.lessons)
+   * and the selected ids (for `variant_selected.injected_lesson_ids`). Retrieval
+   * failures degrade to an empty injection — per spec, a transient DB or retrieval
+   * fault must never abort a dispatch.
+   */
+  private async loadLessonsForDispatch(
+    variantId: string,
+    agentType: AgentType,
+    taskDescription: string
+  ): Promise<{ block: string; ids: string[] }> {
+    try {
+      const { retrieval } = REFLECTION_CONFIG;
+      const lessons = await retrieveLessonsForDispatch(
+        this.deps.db,
+        variantId,
+        agentType,
+        taskDescription,
+        retrieval.maxLessons,
+        retrieval.maxTokens
+      );
+      if (lessons.length === 0) return { block: "", ids: [] };
+      const parts: string[] = ["# Lessons from past tasks in this lineage", ""];
+      for (const l of lessons) {
+        parts.push(`## Lesson ${l.id} (${l.outcome_kind})`);
+        parts.push(`TRIGGER: ${l.trigger_pattern}`);
+        parts.push(l.body);
+        parts.push("");
+      }
+      return { block: parts.join("\n").trimEnd(), ids: lessons.map((l) => l.id) };
+    } catch (err) {
+      console.warn(
+        `[lessons] retrieval failed for variant=${variantId} agent=${agentType}: ${(err as Error).message ?? err}`
+      );
+      return { block: "", ids: [] };
+    }
   }
 
   private recordEvent(input: {

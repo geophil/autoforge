@@ -605,6 +605,13 @@ function buildSystemPrompt(task: AgentTask): string {
 
   sections.push(task.systemPrompt);
 
+  // Spec B §5.4: lessons block slots between the persona and the `# Skills`
+  // section. Trim so whitespace-only injections don't leave a stray blank
+  // section in the final prompt.
+  if (task.lessons && task.lessons.trim().length > 0) {
+    sections.push(task.lessons.trim());
+  }
+
   const skillContents = loadSkillFiles(task.skillFiles);
   if (skillContents) {
     sections.push(`# Skills\n\n${skillContents}`);
@@ -663,4 +670,12 @@ function readStatusFile(workingDirectory: string): AgentStatusFile | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Test-only escape hatch that exposes the internal prompt composer so unit
+ * tests can assert section ordering without instantiating the SDK client.
+ */
+export function buildSystemPromptForTest(task: AgentTask): string {
+  return buildSystemPrompt(task);
 }

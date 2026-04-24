@@ -119,6 +119,12 @@ function buildPrompt(task: AgentTask): string {
     sections.push(task.systemPrompt);
   }
 
+  // Spec B §5.4: injected lineage lessons sit between persona and skills so
+  // the agent reads them before picking up tool/skill guidance.
+  if (task.lessons && task.lessons.trim().length > 0) {
+    sections.push(task.lessons.trim());
+  }
+
   const skillContents = loadSkillFiles(task.skillFiles);
   if (skillContents) {
     sections.push(`# Skills\n\n${skillContents}`);
