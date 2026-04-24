@@ -33,33 +33,39 @@ describe("orchestrator-owned failure_analysis auto-enrichment (Spec A review Mi1
     }
   });
 
-  test("rejectTask (after awaiting_approval) also carries enriched provenance", async () => {
-    const { service, db, cleanup } = createTestService();
-    try {
-      const task = await service.submitTask(
-        "autoforge",
-        "Add a second endpoint",
-        { reviewPlan: false }
-      );
-      expect(task.state).toBe("awaiting_approval");
+  test(
+    "rejectTask (after awaiting_approval) also carries enriched provenance",
+    async () => {
+      const { service, db, cleanup } = createTestService();
+      try {
+        const task = await service.submitTask(
+          "autoforge",
+          "Add a second endpoint",
+          { reviewPlan: false }
+        );
+        expect(task.state).toBe("awaiting_approval");
 
-      await service.rejectTask(task.id, {
-        reason: "needs a different direction",
-        categories: ["wrong_scope"]
-      });
+        await service.rejectTask(task.id, {
+          reason: "needs a different direction",
+          categories: ["wrong_scope"]
+        });
 
-      // After rejectTask, the original task is failed and a fresh one spawned.
-      const fa = db.sqlite.query(
-        `SELECT payload FROM events
-          WHERE task_id = ? AND event_type = 'failure_analysis'
-          ORDER BY timestamp DESC LIMIT 1`
-      ).get(task.id) as { payload: string };
+        const fa = db.sqlite.query(
+          `SELECT payload FROM events
+            WHERE task_id = ? AND event_type = 'failure_analysis'
+            ORDER BY timestamp DESC LIMIT 1`
+        ).get(task.id) as { payload: string };
 
-      const parsed = JSON.parse(fa.payload) as Record<string, unknown>;
-      expect(parsed.failure_category).toBe("rejected");
-      expect(parsed.persona_version_id).toBeString();
-    } finally {
-      cleanup();
-    }
-  });
+        const parsed = JSON.parse(fa.payload) as Record<string, unknown>;
+        expect(parsed.failure_category).toBe("rejected");
+        expect(parsed.persona_version_id).toBeString();
+      } finally {
+        cleanup();
+      }
+    },
+    // rejectTask spawns a restart task that drives through the full pipeline
+    // (planner + coder + reviewer + doc); wall time under full-suite load sits
+    // close to Bun's 5s default. 15s gives comfortable headroom.
+    15000
+  );
 });
