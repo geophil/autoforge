@@ -216,6 +216,31 @@ export async function reflectOnTask(
       },
       budgetSeconds: REFLECTION_CONFIG.budgetSeconds
     });
+
+    // Supersession side-effect (Spec B §6.4 — reflector-owned transition).
+    // If the reflector emitted `supersedes: [<id>, ...]` at the top level of
+    // its output (alongside `lesson`, NOT inside it), transition those
+    // existing active lessons to status='superseded' with superseded_by
+    // pointing at the new lesson. This is distinct from the curator meta's
+    // `retire_lessons` operation, which marks lessons retired without a
+    // replacement.
+    const supersedesRaw = (result.output as Record<string, unknown>).supersedes;
+    if (Array.isArray(supersedesRaw) && supersedesRaw.length > 0) {
+      const idList = supersedesRaw.filter((x): x is string => typeof x === "string");
+      if (idList.length > 0) {
+        deps.db.supersedeLessons(idList, id);
+        deps.recordEvent({
+          taskId,
+          projectId: task.projectId,
+          type: "lessons_superseded",
+          agent: "reflector",
+          status: "done",
+          payload: { new_lesson_id: id, superseded_ids: idList },
+          budgetSeconds: REFLECTION_CONFIG.budgetSeconds
+        });
+      }
+    }
+
     return { lessonId: id, skipped: false };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

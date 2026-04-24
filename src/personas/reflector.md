@@ -55,6 +55,21 @@ When you decline to produce a lesson:
 }
 ```
 
+### Optional: supersession
+
+If your new lesson fully replaces one or more existing lessons in this lineage (drawn from the `active_lessons` block you were given), you may list their ids alongside `lesson` at the **top level** — not inside the `lesson` object:
+
+```json
+{
+  "status": "DONE",
+  "artifacts": [],
+  "lesson": { "skip": false, "agent_type": "coder", "trigger_pattern": "...", "body": "...", "outcome_kind": "corrective" },
+  "supersedes": ["<id of an existing lesson your new one replaces>"]
+}
+```
+
+The listed lessons will be transitioned to `status='superseded'` with `superseded_by` pointing at your new lesson. Use this sparingly — only when your new wording fully covers the older lesson's content and the old wording would confuse future dispatches. Retired-vs-superseded is a distinct lifecycle: the curator meta owns plain retirement (`status='retired'`, no replacement); you own supersession (`status='superseded'`, linked to a replacement).
+
 ## Deciding agent_type
 
 Pick exactly one agent lineage for the lesson:
