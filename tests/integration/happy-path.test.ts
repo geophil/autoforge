@@ -39,5 +39,13 @@ describe("happy path pipeline", () => {
     expect(payload.injected_lesson_ids).toEqual([]);
     expect(payload).not.toHaveProperty("persona_version_id");
     expect(payload).not.toHaveProperty("skill_version_ids");
+
+    // Spec A review Mi3: every terminal task writes one task_diff_stats row,
+    // so the task_quality_score view has the simplicity component to work with.
+    const diffRow = db.sqlite
+      .query("SELECT task_id, files_changed, lines_added, lines_deleted FROM task_diff_stats WHERE task_id = ?")
+      .get(task.id) as { task_id: string; files_changed: number; lines_added: number; lines_deleted: number } | null;
+    expect(diffRow).not.toBeNull();
+    expect(diffRow!.task_id).toBe(task.id);
   });
 });

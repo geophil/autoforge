@@ -550,7 +550,7 @@ export class OrchestratorService {
         planner_fallback: oldTask.planSubtasks.length === 1 &&
           oldTask.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
         iteration: oldTask.iteration
-      }),
+      }, taskId),
       budgetSeconds: 60
     });
     this.transition(taskId, oldTask.projectId, "awaiting_approval", "failed", {
@@ -617,7 +617,7 @@ export class OrchestratorService {
           task.planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
         budget_seconds: this.budgetForTier(task.tier, "coder"),
         iteration: task.iteration
-      }),
+      }, taskId),
       budgetSeconds: 60
     });
 
@@ -765,7 +765,7 @@ export class OrchestratorService {
             budget_seconds: this.budgetForTier(task.tier, "coder"),
             elapsed_ms: now - updatedAt,
             iteration: task.iteration
-          }),
+          }, task.id),
           budgetSeconds: 60
         });
 
@@ -1290,14 +1290,46 @@ export class OrchestratorService {
     throw new StageFailedError(taskId, fromStage, failureReason);
   }
 
-  private failureAnalysisPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  /**
+   * Build a failure_analysis payload with guaranteed provenance keys.
+   *
+   * When `taskId` is provided AND the caller did not pass explicit provenance
+   * fields, the method looks up the most recent agent-attributed event for the
+   * task (via DbClient.getLastAgentProvenance) and backfills executor_used,
+   * persona_version_id, and skill_version_ids. Used by cancelTask / rejectTask /
+   * sweepStaleTasks — all of which emit failure_analysis from the orchestrator
+   * (not from an agent) and would otherwise carry null provenance (Spec A
+   * review Mi1).
+   */
+  private failureAnalysisPayload(
+    payload: Record<string, unknown>,
+    taskId?: string
+  ): Record<string, unknown> {
+    let executorUsed = payload.executor_used ?? null;
+    let personaVersionId = payload.persona_version_id ?? null;
+    let skillVersionIds = Array.isArray(payload.skill_version_ids)
+      ? (payload.skill_version_ids as string[])
+      : [];
+
+    const hasExplicitProvenance =
+      payload.executor_used !== undefined ||
+      payload.persona_version_id !== undefined ||
+      Array.isArray(payload.skill_version_ids);
+
+    if (taskId && !hasExplicitProvenance) {
+      const last = this.deps.db.getLastAgentProvenance(taskId);
+      if (last) {
+        executorUsed = last.executorUsed ?? null;
+        personaVersionId = last.personaVersionId ?? null;
+        skillVersionIds = last.skillVersionIds;
+      }
+    }
+
     return {
       ...payload,
-      executor_used: payload.executor_used ?? null,
-      persona_version_id: payload.persona_version_id ?? null,
-      skill_version_ids: Array.isArray(payload.skill_version_ids)
-        ? payload.skill_version_ids
-        : [],
+      executor_used: executorUsed,
+      persona_version_id: personaVersionId,
+      skill_version_ids: skillVersionIds,
       tool_stats: normalizeToolStats(payload.tool_stats as ToolStats | Record<string, unknown> | null | undefined)
     };
   }

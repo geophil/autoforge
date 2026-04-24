@@ -211,7 +211,9 @@ Emission points: (a) alongside `state.failed` transitions, (b) from the stalenes
 
 ### 5.2 `variant_selected` (new event)
 
-Emitted once per task at dispatch time. Spec A defines the payload; Spec C produces the routing decisions that populate it. In Spec A, this event is emitted by a trivial stub that records the single active variant for each agent type needed by the task — sufficient for downstream views to join cleanly once Spec C lights up real allocation.
+Emitted at every agent dispatch. Spec A defines the payload; Spec C produces the routing decisions that populate it. In Spec A, this event is emitted by a trivial stub that records the single active variant for each agent type needed by the task — sufficient for downstream views to join cleanly once Spec C lights up real allocation.
+
+**Emission cardinality.** One event per dispatch means one per `(task, agent_type, iteration)` tuple — the planner fires once per planner run, the coder fires once per subtask per iteration, the reviewer once per review, and so on. A multi-subtask rework task therefore emits many `variant_selected` events for the coder agent type. This is deliberate: emission is the atomic unit of "a variant was asked to do work." Consumers that need per-task aggregates must deduplicate — `variant_performance` does so with `SELECT DISTINCT task_id, variant_id, agent_type` (see §6.3), and any future Spec C allocation-telemetry query should follow the same pattern. Do not count rows in `events WHERE event_type = 'variant_selected'` as a proxy for task count.
 
 ```json
 {

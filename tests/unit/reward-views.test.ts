@@ -290,6 +290,38 @@ describe("task_quality_score view", () => {
     }
   });
 
+  test("planner_fallback from off-list event types is ignored (Spec A review M1)", () => {
+    // Regression guard for migration 006: only `failure_analysis` and `planned`
+    // events should contribute to the planner_fallback fidelity penalty. If a
+    // future event type happens to carry the key, it must not degrade fidelity.
+    const { db, cleanup } = freshDb();
+
+    try {
+      seedTerminalTask(db, {
+        taskId: "t4c",
+        state: "completed",
+        tier: "STANDARD",
+        iteration: 0,
+        diffLines: 30,
+        totalCost: 0.03
+      });
+      // Inject a bogus event carrying planner_fallback: true on a non-whitelisted type.
+      db.sqlite.query(
+        `INSERT INTO events (id, task_id, timestamp, project_id, agent, event_type, status, payload, budget_seconds)
+         VALUES (?, 't4c', '2026-04-24T00:00:00Z', 'p', 'orchestrator', 'variant_selected', 'done',
+                 '{"planner_fallback":true,"agent_type":"coder","selected_variant_id":"v"}', 60)`
+      ).run(randomUUID());
+
+      const row = db.sqlite
+        .query("SELECT r_fidelity FROM task_quality_score WHERE task_id = 't4c'")
+        .get() as { r_fidelity: number };
+
+      expect(row.r_fidelity).toBeCloseTo(1.0);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("array-shaped persisted plan with matching subtasks does not count as scope drift", () => {
     const { db, cleanup } = freshDb();
 

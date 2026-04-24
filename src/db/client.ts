@@ -381,6 +381,42 @@ export class DbClient {
     });
   }
 
+  /**
+   * Returns the most recent agent-attributed provenance for a task by scanning
+   * its event log in reverse chronological order. Spec A review follow-up Mi1:
+   * cancelTask / rejectTask / sweepStaleTasks emit failure_analysis after the
+   * task is in a non-agent state (awaiting_approval, stalled, etc.); the
+   * provenance of the LAST real agent run is still the most informative for
+   * the reflector and future meta analysis.
+   *
+   * Returns null when no event in the task's history carries the fields.
+   */
+  getLastAgentProvenance(taskId: string): {
+    executorUsed: string | null;
+    personaVersionId: string | null;
+    skillVersionIds: string[];
+  } | null {
+    const rows = this.sqlite.query(
+      `SELECT payload FROM events
+        WHERE task_id = ?
+          AND agent IN ('planner', 'coder', 'reviewer', 'doc')
+        ORDER BY timestamp DESC`
+    ).all(taskId) as Array<{ payload: string }>;
+    for (const row of rows) {
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(row.payload); } catch { /* ignore */ }
+      const personaVersionId = (payload.persona_version_id as string | undefined) ?? null;
+      const executorUsed = (payload.executor_used as string | undefined) ?? null;
+      const skillVersionIds = Array.isArray(payload.skill_version_ids)
+        ? (payload.skill_version_ids as string[])
+        : [];
+      if (personaVersionId !== null || executorUsed !== null || skillVersionIds.length > 0) {
+        return { executorUsed, personaVersionId, skillVersionIds };
+      }
+    }
+    return null;
+  }
+
   listFindings(taskId: string): ReviewFinding[] {
     const rows = this.sqlite.query("SELECT * FROM review_findings WHERE task_id = ? ORDER BY id").all(taskId) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
