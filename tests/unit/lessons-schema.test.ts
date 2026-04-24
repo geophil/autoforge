@@ -45,4 +45,40 @@ describe("lessons table schema", () => {
       expect.arrayContaining(["idx_lessons_lineage_active", "idx_lessons_keywords"])
     );
   });
+
+  test("CHECK constraints reject invalid outcome_kind and status", () => {
+    // Seed prerequisites for the FK targets.
+    const db = freshDb();
+    db.sqlite.query(
+      "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share) VALUES ('v','persona:coder','1','c','baseline',1.0)"
+    ).run();
+    db.sqlite.query(
+      "INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at) VALUES ('t','p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))"
+    ).run();
+
+    // outcome_kind constraint — only 'corrective' | 'reinforcing' allowed.
+    expect(() => db.sqlite.query(`
+      INSERT INTO lessons (id, agent_type, lineage_root_id, source_task_id, source_variant_id,
+                           trigger_pattern, body, outcome_kind)
+      VALUES ('l_bad_outcome','coder','v','t','v','p','b','curious')
+    `).run()).toThrow();
+
+    // status constraint — only 'active' | 'superseded' | 'retired' allowed.
+    expect(() => db.sqlite.query(`
+      INSERT INTO lessons (id, agent_type, lineage_root_id, source_task_id, source_variant_id,
+                           trigger_pattern, body, outcome_kind, status)
+      VALUES ('l_bad_status','coder','v','t','v','p','b','corrective','pending')
+    `).run()).toThrow();
+
+    // Sanity: a row with valid values still inserts cleanly.
+    db.sqlite.query(`
+      INSERT INTO lessons (id, agent_type, lineage_root_id, source_task_id, source_variant_id,
+                           trigger_pattern, body, outcome_kind)
+      VALUES ('l_ok','coder','v','t','v','p','b','corrective')
+    `).run();
+    const row = db.sqlite.query("SELECT status, outcome_kind FROM lessons WHERE id='l_ok'")
+      .get() as { status: string; outcome_kind: string };
+    expect(row.status).toBe("active");
+    expect(row.outcome_kind).toBe("corrective");
+  });
 });

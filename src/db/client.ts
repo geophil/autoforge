@@ -38,6 +38,10 @@ export interface LessonRow {
   retired_at: string | null;
 }
 
+/** Defensive cap for resolveLineageRoot — chains deeper than this almost certainly
+ *  indicate corrupt data. Paired with a visited-set for cycle detection. */
+const MAX_LINEAGE_DEPTH = 50;
+
 export class DbClient {
   readonly sqlite: Database;
 
@@ -246,7 +250,7 @@ export class DbClient {
     // Walk parent_version_id chain. Cycle-safe via a visited set with a depth cap.
     const seen = new Set<string>();
     let current: string | null = variantId;
-    for (let depth = 0; depth < 50 && current !== null; depth++) {
+    for (let depth = 0; depth < MAX_LINEAGE_DEPTH && current !== null; depth++) {
       if (seen.has(current)) {
         return current;
       }
