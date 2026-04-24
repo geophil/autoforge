@@ -15,7 +15,8 @@ const AGENT_SKILLS: Record<AgentType, string[]> = {
   "doc-review": ["documentation.md", "verification-before-completion.md"],
   pr: [],
   orchestrator: [],
-  meta: ["writing-skills.md"]
+  meta: ["writing-skills.md"],
+  reflector: []
 };
 
 export class SkillRegistry {

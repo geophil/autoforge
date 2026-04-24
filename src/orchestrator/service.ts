@@ -1446,6 +1446,10 @@ export class OrchestratorService {
     // Code if no SDK executor is configured (e.g. local dev without API key).
     if (agentType === "planner") return set.sdk ?? set.claudeCode;
 
+    // Reflector is an SDK-executor job so we can get structured JSON output
+    // reliably. Claude Code fallback for local dev without SDK credentials.
+    if (agentType === "reflector") return set.sdk ?? set.claudeCode;
+
     // Meta agent always gets Claude Code — needs broad exploration.
     if (agentType === "meta") return set.claudeCode;
 

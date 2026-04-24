@@ -1,5 +1,5 @@
 export type Tier = "EXPRESS" | "STANDARD" | "THOROUGH";
-export type AgentType = "planner" | "coder" | "reviewer" | "doc" | "doc-review" | "pr" | "orchestrator" | "meta";
+export type AgentType = "planner" | "coder" | "reviewer" | "doc" | "doc-review" | "pr" | "orchestrator" | "meta" | "reflector";
 export type TaskStatus =
   | "pending"
   | "in_progress"
