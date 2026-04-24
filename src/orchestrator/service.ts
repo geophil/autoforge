@@ -1020,6 +1020,81 @@ export class OrchestratorService {
     this.deps.db.concludeExperiment(experimentId, metricAfter, keep);
   }
 
+  /**
+   * Materialize a candidate skill_versions row from a proposed fork experiment.
+   * Copies proposed_content into the new candidate, carries over parent_version_id
+   * and specialty from evidence, flips the experiment to 'active', and applies
+   * any pending lesson retirements that were deferred by the propose_fork op
+   * (see meta-operations.ts Task 7 §6.4).
+   */
+  async approveFork(experimentId: string): Promise<{ variantId: string }> {
+    const row = this.deps.db.sqlite.query(`
+      SELECT id, operation, status, proposed_content, evidence
+        FROM experiments
+       WHERE id = ?
+    `).get(experimentId) as {
+      id: string;
+      operation: string;
+      status: string;
+      proposed_content: string | null;
+      evidence: string | null;
+    } | undefined;
+
+    if (!row) throw new Error("experiment not found");
+    if (row.operation !== "fork" || row.status !== "proposed") {
+      throw new Error("experiment not a proposed fork");
+    }
+    if (!row.proposed_content || row.proposed_content.trim().length === 0) {
+      throw new Error("proposed content missing");
+    }
+
+    const evidence = row.evidence
+      ? JSON.parse(row.evidence) as Record<string, unknown>
+      : {};
+    const parentId = typeof evidence.parent_variant_id === "string" ? evidence.parent_variant_id : undefined;
+    const specialty = typeof evidence.specialty === "string" ? evidence.specialty : undefined;
+    if (!parentId || !specialty) throw new Error("evidence missing fields");
+
+    const parent = this.deps.db.getSkillVersionById(parentId);
+    if (!parent) throw new Error("parent variant not found");
+
+    const pendingRetireIds = Array.isArray(evidence.pending_retire_lessons)
+      ? (evidence.pending_retire_lessons as unknown[]).filter((x): x is string => typeof x === "string")
+      : [];
+
+    const variantId = randomUUID();
+    const proposedContent = row.proposed_content;
+
+    this.deps.db.transaction(() => {
+      this.deps.db.sqlite.query(`
+        INSERT INTO skill_versions
+          (id, skill_name, version, content, experiment_id,
+           parent_version_id, specialty, status, traffic_share)
+        VALUES
+          ($id, $skill, $version, $content, $exp,
+           $parent, $specialty, 'candidate', 0.0)
+      `).run({
+        $id: variantId,
+        $skill: parent.skill_name,
+        $version: String(Date.now()),
+        $content: proposedContent,
+        $exp: experimentId,
+        $parent: parentId,
+        $specialty: specialty
+      });
+
+      this.deps.db.sqlite.query(
+        "UPDATE experiments SET status = 'active' WHERE id = ?"
+      ).run(experimentId);
+
+      if (pendingRetireIds.length > 0) {
+        this.deps.db.retireLessons(pendingRetireIds);
+      }
+    });
+
+    return { variantId };
+  }
+
   private async executeAndReview(
     taskId: string,
     projectId: string,
