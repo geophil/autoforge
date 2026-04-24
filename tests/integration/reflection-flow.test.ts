@@ -80,4 +80,120 @@ describe("reflection flow", () => {
       cleanup();
     }
   });
+
+  test("happy path with non-skip reflector output inserts a lesson row", async () => {
+    const { service, db, cleanup } = createTestService({
+      reflector: async () => ({
+        status: "DONE",
+        artifacts: [],
+        output: {
+          status: "DONE",
+          artifacts: [],
+          lesson: {
+            skip: false,
+            agent_type: "coder",
+            trigger_pattern: "tasks that add README comments",
+            body: "TRIGGER: readme\nOBSERVATION: clean\nPRINCIPLE: comment\nEVIDENCE: t1",
+            outcome_kind: "reinforcing",
+            keywords: "readme comment clean"
+          }
+        },
+        metrics: { elapsedSeconds: 0.1 }
+      })
+    });
+    try {
+      const task = await service.submitTask("autoforge", "Add a comment to the README", { reviewPlan: false });
+      await service.approveTask(task.id);
+
+      const lessons = db.sqlite
+        .query("SELECT id, agent_type, outcome_kind FROM lessons WHERE source_task_id = ?")
+        .all(task.id) as Array<{ id: string; agent_type: string; outcome_kind: string }>;
+      expect(lessons).toHaveLength(1);
+      expect(lessons[0].agent_type).toBe("coder");
+      expect(lessons[0].outcome_kind).toBe("reinforcing");
+
+      const inserted = db.sqlite
+        .query(
+          "SELECT json_extract(payload, '$.lesson_id') AS id FROM events WHERE task_id = ? AND event_type = 'lesson_inserted'"
+        )
+        .get(task.id) as { id: string };
+      expect(inserted.id).toBe(lessons[0].id);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("reflector output with invalid agent_type is rejected (no lesson, no persona:X row)", async () => {
+    const { service, db, cleanup } = createTestService({
+      reflector: async () => ({
+        status: "DONE",
+        artifacts: [],
+        output: {
+          status: "DONE",
+          artifacts: [],
+          lesson: {
+            skip: false,
+            agent_type: "hacker",
+            trigger_pattern: "x",
+            body: "TRIGGER\nOBSERVATION\nPRINCIPLE\nEVIDENCE",
+            outcome_kind: "corrective",
+            keywords: "x"
+          }
+        },
+        metrics: { elapsedSeconds: 0.1 }
+      })
+    });
+    try {
+      const task = await service.submitTask("autoforge", "whatever", { reviewPlan: false });
+      await service.approveTask(task.id);
+
+      const lessons = db.sqlite
+        .query("SELECT COUNT(*) AS n FROM lessons WHERE source_task_id = ?")
+        .get(task.id) as { n: number };
+      expect(lessons.n).toBe(0);
+
+      const failed = db.sqlite
+        .query(
+          "SELECT json_extract(payload, '$.reason') AS reason FROM events WHERE task_id = ? AND event_type = 'reflector_failed'"
+        )
+        .get(task.id) as { reason: string };
+      expect(failed.reason).toContain("invalid_agent_type");
+
+      const rogue = db.sqlite
+        .query("SELECT COUNT(*) AS n FROM skill_versions WHERE skill_name = 'persona:hacker'")
+        .get() as { n: number };
+      expect(rogue.n).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("reflectOnTask is idempotent when a reflector event already exists", async () => {
+    const { service, db, cleanup } = createTestService();
+    try {
+      const task = await service.submitTask("autoforge", "test", { reviewPlan: false });
+      await service.approveTask(task.id);
+      const before = (
+        db.sqlite
+          .query(
+            "SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND event_type IN ('reflector_skipped','reflector_failed','lesson_inserted')"
+          )
+          .get(task.id) as { n: number }
+      ).n;
+      expect(before).toBe(1);
+
+      const second = await service.reflectOnTask(task.id);
+      expect(second.reason).toBe("already_reflected");
+      const after = (
+        db.sqlite
+          .query(
+            "SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND event_type IN ('reflector_skipped','reflector_failed','lesson_inserted')"
+          )
+          .get(task.id) as { n: number }
+      ).n;
+      expect(after).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
 });

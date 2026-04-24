@@ -184,8 +184,15 @@ export class OrchestratorService {
         return this.requireTask(taskId);
       }
       this.captureTaskDiffStats(taskId);
-      await this.reflectOnTask(taskId);
-      this.cleanupWorktree(taskId);
+      try {
+        await this.reflectOnTask(taskId);
+      } catch (reflectErr) {
+        console.warn(
+          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+        );
+      } finally {
+        this.cleanupWorktree(taskId);
+      }
       throw err;
     }
     const task = this.deps.db.getTask(taskId);
@@ -390,8 +397,15 @@ export class OrchestratorService {
         return this.requireTask(taskId);
       }
       this.captureTaskDiffStats(taskId);
-      await this.reflectOnTask(taskId);
-      this.cleanupWorktree(taskId);
+      try {
+        await this.reflectOnTask(taskId);
+      } catch (reflectErr) {
+        console.warn(
+          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+        );
+      } finally {
+        this.cleanupWorktree(taskId);
+      }
       throw err;
     }
 
@@ -520,8 +534,15 @@ export class OrchestratorService {
 
     this.transition(taskId, task.projectId, "documenting", "completed", {});
     this.captureTaskDiffStats(taskId);
-    await this.reflectOnTask(taskId);
-    this.cleanupWorktree(taskId);
+    try {
+      await this.reflectOnTask(taskId);
+    } catch (reflectErr) {
+      console.warn(
+        `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+      );
+    } finally {
+      this.cleanupWorktree(taskId);
+    }
     return this.requireTask(taskId);
   }
 
@@ -562,8 +583,15 @@ export class OrchestratorService {
       iteration: oldTask.iteration
     });
     this.captureTaskDiffStats(taskId);
-    await this.reflectOnTask(taskId);
-    this.cleanupWorktree(taskId);
+    try {
+      await this.reflectOnTask(taskId);
+    } catch (reflectErr) {
+      console.warn(
+        `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+      );
+    } finally {
+      this.cleanupWorktree(taskId);
+    }
 
     // Spawn a fresh task from current HEAD with the operator's feedback
     // appended to the description so the new planner sees it.
@@ -629,8 +657,15 @@ export class OrchestratorService {
 
     this.transition(taskId, task.projectId, task.state, "failed", { reason: `cancelled: ${reason}`, iteration: task.iteration });
     this.captureTaskDiffStats(taskId);
-    await this.reflectOnTask(taskId);
-    this.cleanupWorktree(taskId);
+    try {
+      await this.reflectOnTask(taskId);
+    } catch (reflectErr) {
+      console.warn(
+        `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+      );
+    } finally {
+      this.cleanupWorktree(taskId);
+    }
     return this.requireTask(taskId);
   }
 
@@ -816,8 +851,15 @@ export class OrchestratorService {
         }
 
         this.captureTaskDiffStats(task.id);
-        await this.reflectOnTask(task.id);
-        this.cleanupWorktree(task.id);
+        try {
+          await this.reflectOnTask(task.id);
+        } catch (reflectErr) {
+          console.warn(
+            `[orchestrator] reflectOnTask threw for ${task.id}: ${(reflectErr as Error).message ?? reflectErr}`
+          );
+        } finally {
+          this.cleanupWorktree(task.id);
+        }
       }
     }
   }

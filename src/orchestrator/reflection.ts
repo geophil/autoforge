@@ -7,6 +7,19 @@ import type { AgentTranscriptRow } from "../types/transcripts";
 import { REFLECTION_CONFIG } from "../config/reflection";
 
 /**
+ * Whitelist of agent types the reflector is allowed to emit lessons for.
+ * Per `src/personas/reflector.md`, meta / doc / reflector are out of scope.
+ * Anything else is rejected BEFORE calling `snapshotId` so a rogue reflector
+ * cannot silently create `persona:<arbitrary>` rows via the generic fallback
+ * in `PersonaRegistry.resolve`.
+ */
+const ALLOWED_LESSON_AGENT_TYPES: ReadonlySet<string> = new Set([
+  "planner",
+  "coder",
+  "reviewer"
+]);
+
+/**
  * Structured event the reflection module asks the orchestrator to record.
  * `agent` is string-typed here so the module doesn't depend on the NATS
  * message union; the service boundary narrows it back to AutoforgeMessage's
@@ -72,6 +85,22 @@ export async function reflectOnTask(
     return { lessonId: null, skipped: true, reason: "task_not_found" };
   }
 
+  // Idempotency guard: `reflectOnTask` is public and called from six code
+  // paths. If any reflector event already exists for this task, the earlier
+  // invocation has already emitted its outcome — short-circuit without
+  // dispatching the sub-agent again or emitting a new event.
+  const alreadyReflected = deps.db.sqlite
+    .query(
+      `SELECT 1 FROM events
+        WHERE task_id = ?
+          AND event_type IN ('lesson_inserted', 'reflector_skipped', 'reflector_failed')
+        LIMIT 1`
+    )
+    .get(taskId);
+  if (alreadyReflected) {
+    return { lessonId: null, skipped: true, reason: "already_reflected" };
+  }
+
   const faRow = deps.db.sqlite
     .query(
       "SELECT payload FROM events WHERE task_id = ? AND event_type = 'failure_analysis' ORDER BY timestamp DESC LIMIT 1"
@@ -131,7 +160,9 @@ export async function reflectOnTask(
 
     const parsed = parseReflectorOutput(result.output);
     if (!parsed.ok) {
-      emitFailed(deps, task, `parse_error: ${parsed.error}`);
+      emitFailed(deps, task, `parse_error:${parsed.error}`, {
+        output_preview: String(JSON.stringify(result.output)).slice(0, 500)
+      });
       return { lessonId: null, skipped: true, reason: "parse_error" };
     }
 
@@ -146,6 +177,14 @@ export async function reflectOnTask(
     if (wordCount > REFLECTION_CONFIG.maxLessonBodyWords) {
       emitFailed(deps, task, `body_over_word_limit:${wordCount}`);
       return { lessonId: null, skipped: true, reason: "body_over_limit" };
+    }
+
+    // Reject free-form agent_type BEFORE any DB write so a rogue reflector
+    // can't create a `persona:<arbitrary>` row via PersonaRegistry's generic
+    // fallback, and can't insert a lesson row pointing at an unknown agent.
+    if (!ALLOWED_LESSON_AGENT_TYPES.has(lesson.agent_type)) {
+      emitFailed(deps, task, `invalid_agent_type:${lesson.agent_type}`);
+      return { lessonId: null, skipped: true, reason: "invalid_agent_type" };
     }
 
     const agentVariantId = deps.personas.snapshotId(lesson.agent_type as AgentType);
@@ -264,35 +303,43 @@ function parseReflectorOutput(output: unknown): ParseOk | ParseErr {
   if (typeof output !== "object" || output === null) {
     return { ok: false, error: "output_not_object" };
   }
-  const obj = output as Record<string, unknown>;
-  if (!("lesson" in obj)) {
+  const lesson = (output as Record<string, unknown>).lesson;
+  if (!lesson || typeof lesson !== "object") {
     return { ok: false, error: "missing_lesson_key" };
   }
-  const lesson = obj.lesson as ReflectorOutput["lesson"];
-  if (!lesson) return { ok: false, error: "missing_lesson_key" };
-  return { ok: true, lesson };
+  const l = lesson as Record<string, unknown>;
+  if (l.skip === true) {
+    const reason = typeof l.reason === "string" ? l.reason : "unspecified";
+    return { ok: true, lesson: { skip: true, reason } };
+  }
+  for (const field of ["agent_type", "trigger_pattern", "body", "outcome_kind"] as const) {
+    if (typeof l[field] !== "string") {
+      return { ok: false, error: `missing_or_nonstring_${field}` };
+    }
+  }
+  if (l.outcome_kind !== "corrective" && l.outcome_kind !== "reinforcing") {
+    return { ok: false, error: "invalid_outcome_kind" };
+  }
+  return { ok: true, lesson: l as ReflectorOutput["lesson"] };
 }
 
-function emitSkipped(
-  deps: ReflectionDeps,
-  task: { id: string; projectId: string },
-  reason: string
-): void {
+function emitSkipped(deps: ReflectionDeps, task: PipelineTask, reason: string): void {
   deps.recordEvent({
     taskId: task.id,
     projectId: task.projectId,
     type: "reflector_skipped",
     agent: "reflector",
     status: "done",
-    payload: { reason },
+    payload: { reason, task_state: task.state },
     budgetSeconds: REFLECTION_CONFIG.budgetSeconds
   });
 }
 
 function emitFailed(
   deps: ReflectionDeps,
-  task: { id: string; projectId: string },
-  reason: string
+  task: PipelineTask,
+  reason: string,
+  extra: Record<string, unknown> = {}
 ): void {
   deps.recordEvent({
     taskId: task.id,
@@ -300,7 +347,7 @@ function emitFailed(
     type: "reflector_failed",
     agent: "reflector",
     status: "failed",
-    payload: { reason },
+    payload: { reason, task_state: task.state, ...extra },
     budgetSeconds: REFLECTION_CONFIG.budgetSeconds
   });
 }
