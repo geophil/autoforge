@@ -300,6 +300,87 @@ export class DbClient {
     })();
   }
 
+  updateTrafficShare(variantId: string, trafficShare: number): void {
+    this.sqlite.query(
+      "UPDATE skill_versions SET traffic_share = ? WHERE id = ?"
+    ).run(trafficShare, variantId);
+  }
+
+  retireVariant(variantId: string): void {
+    this.sqlite.query(
+      "UPDATE skill_versions SET status = 'retired', traffic_share = 0.0 WHERE id = ?"
+    ).run(variantId);
+  }
+
+  /**
+   * Insert an experiment row created by a curator meta operation.
+   *
+   * Schema reconciliations applied vs. the Spec B plan sketch:
+   *   - `experiments` has no `task_id` column; the originating meta task id is
+   *     stashed into the `evidence` JSON blob under `meta_task_id` so
+   *     provenance survives.
+   *   - `metric_name` and `metric_before` are NOT NULL; when the caller has no
+   *     concrete metric yet we default to the canonical composite
+   *     `task_quality_score` and a before-value of 0 (Spec A §6).
+   */
+  insertMetaOperationExperiment(params: {
+    experimentId: string;
+    metaTaskId: string;
+    operation: string;
+    hypothesis: string;
+    changeDescription: string;
+    metricName?: string;
+    metricBefore?: number;
+    evidence: Record<string, unknown>;
+    status: "active" | "proposed";
+    proposedContent?: string | null;
+  }): void {
+    this.sqlite.query(`
+      INSERT INTO experiments
+        (id, hypothesis, change_description, metric_name, metric_before,
+         operation, evidence, status, proposed_content)
+      VALUES
+        ($id, $hypothesis, $change, $metric_name, $metric_before,
+         $operation, $evidence, $status, $proposed_content)
+    `).run({
+      $id: params.experimentId,
+      $hypothesis: params.hypothesis,
+      $change: params.changeDescription,
+      $metric_name: params.metricName ?? "task_quality_score",
+      $metric_before: params.metricBefore ?? 0,
+      $operation: params.operation,
+      $evidence: JSON.stringify({ ...params.evidence, meta_task_id: params.metaTaskId }),
+      $status: params.status,
+      $proposed_content: params.proposedContent ?? null
+    });
+  }
+
+  countBaselinesForSkillName(skillName: string): number {
+    const row = this.sqlite
+      .query("SELECT COUNT(*) AS n FROM skill_versions WHERE skill_name = ? AND status = 'baseline'")
+      .get(skillName) as { n: number };
+    return row.n;
+  }
+
+  getSkillVersionById(id: string): {
+    id: string;
+    skill_name: string;
+    status: string;
+    traffic_share: number;
+    parent_version_id: string | null;
+  } | null {
+    const row = this.sqlite
+      .query("SELECT id, skill_name, status, traffic_share, parent_version_id FROM skill_versions WHERE id = ?")
+      .get(id) as {
+        id: string;
+        skill_name: string;
+        status: string;
+        traffic_share: number;
+        parent_version_id: string | null;
+      } | undefined;
+    return row ?? null;
+  }
+
   retireLessons(ids: string[]): string[] {
     if (ids.length === 0) return [];
     const transitioned: string[] = [];
