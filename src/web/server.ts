@@ -7,6 +7,7 @@ import { createMetricsRoutes } from "./routes/metrics";
 import { createMetaRoutes } from "./routes/meta";
 import { createTranscriptsRoutes } from "./routes/transcripts";
 import { createExperimentsRoutes } from "./routes/experiments";
+import { createVariantsRoutes } from "./routes/variants";
 import type { OrchestratorService } from "../orchestrator/service";
 import type { DbClient } from "../db/client";
 import { LiveEventHub } from "./events";
@@ -26,6 +27,7 @@ export function createWebServer(
   app.route("/api/meta", createMetaRoutes(service));
   app.route("/api/transcripts", createTranscriptsRoutes(db));
   app.route("/api/experiments", createExperimentsRoutes(service));
+  app.route("/api/variants", createVariantsRoutes(db));
 
   app.get("/api/health", (ctx) => {
     return ctx.json({ status: "ok", uptime: process.uptime() });

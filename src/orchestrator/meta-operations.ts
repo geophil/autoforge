@@ -2,12 +2,10 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
 import type { DbClient } from "../db/client";
+import { adjustVariantAllocation } from "./allocation";
 import type { MetaOperation } from "../schemas/meta-output";
 
-const BASELINE_PROTECTION_MIN_SHARE = 0.5;
 const MAX_TRAFFIC_SHARE = 1.0;
-const MVP_EXPLORATION_SHARE = 0.1;
-const BASELINE_MAX_WITH_POPULATION = MAX_TRAFFIC_SHARE - MVP_EXPLORATION_SHARE;
 
 export interface MetaOperationContext {
   db: DbClient;
@@ -220,32 +218,30 @@ function handleShareAdjust(
   if (!target) return { ok: false, reason: "target_not_found" };
   const retireLessons = validateRetireLessons(ctx, target.id);
   if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
-  if (!["baseline", "active"].includes(target.status)) {
-    return { ok: false, reason: `cannot_${kind}_${target.status}_variant` };
-  }
 
   const newShare = op.traffic_share;
   if (newShare === undefined) return { ok: false, reason: "traffic_share_required" };
-  if (newShare < 0 || newShare > MAX_TRAFFIC_SHARE) {
+  if (!Number.isFinite(newShare) || newShare < 0 || newShare > MAX_TRAFFIC_SHARE) {
     return { ok: false, reason: "traffic_share_out_of_range" };
   }
-  if (target.status === "baseline" && newShare < BASELINE_PROTECTION_MIN_SHARE) {
-    return { ok: false, reason: "baseline_protected" };
-  }
-  if (target.status === "baseline" && newShare > BASELINE_MAX_WITH_POPULATION) {
-    const population = (ctx.db.sqlite
-      .query(
-        "SELECT COUNT(*) AS n FROM skill_versions WHERE skill_name = ? AND status IN ('baseline','active','candidate')"
-      )
-      .get(target.skill_name) as { n: number }).n;
-    if (population > 1) {
-      return { ok: false, reason: "baseline_exploration_reserved" };
-    }
+  const delta = kind === "promote"
+    ? newShare - target.traffic_share
+    : target.traffic_share - newShare;
+  if (delta < 0) {
+    return { ok: false, reason: `${kind}_requires_${kind === "promote" ? "increase" : "decrease"}` };
   }
 
   const experimentId = randomUUID();
-  ctx.db.transaction(() => {
-    ctx.db.updateTrafficShare(target.id, newShare);
+  const result = ctx.db.transaction<MetaOperationResult>(() => {
+    const allocation = adjustVariantAllocation(
+      ctx.db,
+      target.id,
+      { kind, delta },
+      kind === "promote" ? "meta_promote" : "meta_demote",
+      { meta_task_id: ctx.metaTaskId }
+    );
+    if (!allocation.ok) return { ok: false, reason: allocation.reason };
+
     ctx.db.insertMetaOperationExperiment({
       experimentId,
       metaTaskId: ctx.metaTaskId,
@@ -259,9 +255,11 @@ function handleShareAdjust(
       },
       status: "active"
     });
+
+    return { ok: true, experimentId };
   });
 
-  return { ok: true, experimentId };
+  return result;
 }
 
 function handleRetire(ctx: MetaOperationContext): MetaOperationResult {
@@ -274,14 +272,17 @@ function handleRetire(ctx: MetaOperationContext): MetaOperationResult {
   const retireLessons = validateRetireLessons(ctx, target.id);
   if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
 
-  if (target.status === "baseline") {
-    const count = ctx.db.countBaselinesForSkillName(target.skill_name);
-    if (count <= 1) return { ok: false, reason: "sole_baseline" };
-  }
-
   const experimentId = randomUUID();
-  ctx.db.transaction(() => {
-    ctx.db.retireVariant(target.id);
+  const result = ctx.db.transaction<MetaOperationResult>(() => {
+    const allocation = adjustVariantAllocation(
+      ctx.db,
+      target.id,
+      { kind: "set_status", newStatus: "retired", newTrafficShare: 0 },
+      "meta_retire",
+      { meta_task_id: ctx.metaTaskId }
+    );
+    if (!allocation.ok) return { ok: false, reason: allocation.reason };
+
     ctx.db.insertMetaOperationExperiment({
       experimentId,
       metaTaskId: ctx.metaTaskId,
@@ -291,7 +292,9 @@ function handleRetire(ctx: MetaOperationContext): MetaOperationResult {
       evidence: { ...op.evidence, retired_lessons: applyRetireLessons(ctx, retireLessons.ids) },
       status: "active"
     });
+
+    return { ok: true, experimentId };
   });
 
-  return { ok: true, experimentId };
+  return result;
 }

@@ -21,7 +21,7 @@ function seedVariant(
   db: DbClient,
   id: string,
   skill: string,
-  status: "baseline" | "candidate" | "active" = "baseline",
+  status: "baseline" | "candidate" | "active" | "demoted" | "retired" = "baseline",
   share = 1.0
 ): void {
   db.sqlite.query(
@@ -34,6 +34,48 @@ function makeWorktreeWithProposal(content: string): string {
   const dir = mkdtempSync(join(tmpdir(), "meta-worktree-"));
   writeFileSync(join(dir, "proposed-persona.md"), content);
   return dir;
+}
+
+function variantState(db: DbClient, id: string): { status: string; traffic_share: number } {
+  return db.sqlite
+    .query("SELECT status, traffic_share FROM skill_versions WHERE id = ?")
+    .get(id) as { status: string; traffic_share: number };
+}
+
+function experimentCount(db: DbClient): number {
+  return (db.sqlite.query("SELECT COUNT(*) AS n FROM experiments").get() as { n: number }).n;
+}
+
+function allocationEventsFor(db: DbClient, variantId: string): Array<{
+  type: string;
+  payload: Record<string, unknown>;
+}> {
+  return db.listEvents(variantId).filter((event) => event.type === "traffic_allocated");
+}
+
+function seedTask(db: DbClient, id = "t1"): void {
+  db.sqlite.query(
+    `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
+     VALUES (?,'p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))`
+  ).run(id);
+}
+
+function seedLesson(db: DbClient, variantId: string, taskId = "t1"): string {
+  return db.insertLesson({
+    agentType: "coder",
+    lineageRootId: variantId,
+    sourceTaskId: taskId,
+    sourceVariantId: variantId,
+    triggerPattern: "p",
+    body: "b",
+    outcomeKind: "corrective"
+  });
+}
+
+function forceExperimentInsertionFailure(db: DbClient): void {
+  db.insertMetaOperationExperiment = (() => {
+    throw new Error("forced_experiment_insert_failure");
+  }) as DbClient["insertMetaOperationExperiment"];
 }
 
 describe("handleMetaOperation — edit", () => {
@@ -88,7 +130,7 @@ describe("handleMetaOperation — promote/demote baseline protection", () => {
       db, operation: op, metaTaskId: "mt2", worktreePath: "/tmp/nope", projectId: "p"
     });
     expect(res.ok).toBe(false);
-    expect(res.reason).toMatch(/baseline_protected/);
+    expect(res.reason).toBe("baseline_minimum_share");
     const row = db.sqlite.query("SELECT traffic_share FROM skill_versions WHERE id='vBase'").get() as { traffic_share: number };
     expect(row.traffic_share).toBe(1.0);
   });
@@ -153,6 +195,286 @@ describe("handleMetaOperation — promote/demote baseline protection", () => {
     const row = db.sqlite.query("SELECT traffic_share FROM skill_versions WHERE id='vBase'")
       .get() as { traffic_share: number };
     expect(row.traffic_share).toBe(0.8);
+  });
+});
+
+describe("handleMetaOperation — allocation routing", () => {
+  test("meta promote emits traffic_allocated through allocation path", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "active", "persona:coder", "active", 0.2);
+
+    const result = handleMetaOperation({
+      db,
+      operation: {
+        kind: "promote",
+        target_variant_id: "active",
+        traffic_share: 0.25,
+        hypothesis: "h",
+        evidence: { task_ids: ["t1"] }
+      },
+      metaTaskId: "meta-promote",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(result.ok).toBe(true);
+    expect(variantState(db, "active")).toEqual({ status: "active", traffic_share: 0.25 });
+    const events = allocationEventsFor(db, "active");
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.reason).toBe("meta_promote");
+    expect(events[0].payload.supporting_metric).toEqual({ meta_task_id: "meta-promote" });
+    expect(experimentCount(db)).toBe(1);
+  });
+
+  test("meta demote emits traffic_allocated and updates share/status through allocation", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "active", "persona:coder", "active", 0.2);
+
+    const result = handleMetaOperation({
+      db,
+      operation: {
+        kind: "demote",
+        target_variant_id: "active",
+        traffic_share: 0,
+        hypothesis: "h",
+        evidence: { task_ids: ["t1"] }
+      },
+      metaTaskId: "meta-demote",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(result.ok).toBe(true);
+    expect(variantState(db, "active")).toEqual({ status: "demoted", traffic_share: 0 });
+    const events = allocationEventsFor(db, "active");
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.reason).toBe("meta_demote");
+    expect(events[0].payload.new_status).toBe("demoted");
+    expect(experimentCount(db)).toBe(1);
+  });
+
+  test("meta retire emits traffic_allocated and retires through allocation", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "active", "persona:coder", "active", 0.2);
+
+    const result = handleMetaOperation({
+      db,
+      operation: {
+        kind: "retire",
+        target_variant_id: "active",
+        hypothesis: "h",
+        evidence: { task_ids: ["t1"] }
+      },
+      metaTaskId: "meta-retire",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(result.ok).toBe(true);
+    expect(variantState(db, "active")).toEqual({ status: "retired", traffic_share: 0 });
+    const events = allocationEventsFor(db, "active");
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.reason).toBe("meta_retire");
+    expect(events[0].payload.new_status).toBe("retired");
+    expect(experimentCount(db)).toBe(1);
+  });
+
+  test("meta retire rejects sole baseline through allocation", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 1.0);
+
+    const result = handleMetaOperation({
+      db,
+      operation: {
+        kind: "retire",
+        target_variant_id: "base",
+        hypothesis: "h",
+        evidence: { task_ids: ["t1"] }
+      },
+      metaTaskId: "meta-sole-baseline",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("sole_baseline_retirement");
+    expect(variantState(db, "base")).toEqual({ status: "baseline", traffic_share: 1.0 });
+    expect(allocationEventsFor(db, "base")).toHaveLength(0);
+    expect(experimentCount(db)).toBe(0);
+  });
+
+  test("allocation rejection prevents experiment row insert", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 1.0);
+    seedVariant(db, "candidate", "persona:coder", "candidate", 0.0);
+
+    const result = handleMetaOperation({
+      db,
+      operation: {
+        kind: "promote",
+        target_variant_id: "candidate",
+        traffic_share: 0.1,
+        hypothesis: "h",
+        evidence: { task_ids: ["t1"] }
+      },
+      metaTaskId: "meta-candidate-promote",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("candidate_requires_graduation");
+    expect(variantState(db, "candidate")).toEqual({ status: "candidate", traffic_share: 0.0 });
+    expect(allocationEventsFor(db, "candidate")).toHaveLength(0);
+    expect(experimentCount(db)).toBe(0);
+  });
+
+  test("retire_lessons apply after successful promote and not when allocation rejects", () => {
+    const successDb = freshDb();
+    seedVariant(successDb, "base", "persona:coder", "baseline", 0.8);
+    seedVariant(successDb, "active", "persona:coder", "active", 0.2);
+    seedTask(successDb, "t-success");
+    const successLesson = seedLesson(successDb, "active", "t-success");
+
+    const success = handleMetaOperation({
+      db: successDb,
+      operation: {
+        kind: "promote",
+        target_variant_id: "active",
+        traffic_share: 0.25,
+        hypothesis: "h",
+        evidence: { task_ids: ["t-success"] },
+        retire_lessons: [{ id: successLesson, reason: "superseded" }]
+      },
+      metaTaskId: "meta-promote-lessons",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(success.ok).toBe(true);
+    expect((successDb.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(successLesson) as { status: string }).status)
+      .toBe("retired");
+
+    const rejectedDb = freshDb();
+    seedVariant(rejectedDb, "base", "persona:coder", "baseline", 1.0);
+    seedVariant(rejectedDb, "candidate", "persona:coder", "candidate", 0.0);
+    seedTask(rejectedDb, "t-rejected");
+    const rejectedLesson = seedLesson(rejectedDb, "candidate", "t-rejected");
+
+    const rejected = handleMetaOperation({
+      db: rejectedDb,
+      operation: {
+        kind: "promote",
+        target_variant_id: "candidate",
+        traffic_share: 0.1,
+        hypothesis: "h",
+        evidence: { task_ids: ["t-rejected"] },
+        retire_lessons: [{ id: rejectedLesson, reason: "superseded" }]
+      },
+      metaTaskId: "meta-rejected-lessons",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(rejected.ok).toBe(false);
+    expect(rejected.reason).toBe("candidate_requires_graduation");
+    expect((rejectedDb.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(rejectedLesson) as { status: string }).status)
+      .toBe("active");
+    expect(experimentCount(rejectedDb)).toBe(0);
+  });
+
+  test("retire_lessons apply after successful demote with allocation event and experiment", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "active", "persona:coder", "active", 0.2);
+    seedTask(db, "t-demote-lessons");
+    const lessonId = seedLesson(db, "active", "t-demote-lessons");
+
+    const result = handleMetaOperation({
+      db,
+      operation: {
+        kind: "demote",
+        target_variant_id: "active",
+        traffic_share: 0.1,
+        hypothesis: "h",
+        evidence: { task_ids: ["t-demote-lessons"] },
+        retire_lessons: [{ id: lessonId, reason: "superseded" }]
+      },
+      metaTaskId: "meta-demote-lessons",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    });
+
+    expect(result.ok).toBe(true);
+    expect(variantState(db, "active")).toEqual({ status: "active", traffic_share: 0.1 });
+    expect((db.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(lessonId) as { status: string }).status)
+      .toBe("retired");
+    expect(experimentCount(db)).toBe(1);
+    const events = allocationEventsFor(db, "active");
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.reason).toBe("meta_demote");
+  });
+
+  test("rolls back promote allocation, event, experiment, and retire_lessons when experiment insertion fails", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "active", "persona:coder", "active", 0.2);
+    seedTask(db, "t-promote-rollback");
+    const lessonId = seedLesson(db, "active", "t-promote-rollback");
+    forceExperimentInsertionFailure(db);
+
+    expect(() => handleMetaOperation({
+      db,
+      operation: {
+        kind: "promote",
+        target_variant_id: "active",
+        traffic_share: 0.25,
+        hypothesis: "h",
+        evidence: { task_ids: ["t-promote-rollback"] },
+        retire_lessons: [{ id: lessonId, reason: "superseded" }]
+      },
+      metaTaskId: "meta-promote-rollback",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    })).toThrow("forced_experiment_insert_failure");
+
+    expect(variantState(db, "active")).toEqual({ status: "active", traffic_share: 0.2 });
+    expect(allocationEventsFor(db, "active")).toHaveLength(0);
+    expect(experimentCount(db)).toBe(0);
+    expect((db.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(lessonId) as { status: string }).status)
+      .toBe("active");
+  });
+
+  test("rolls back retire allocation, event, experiment, and retire_lessons when experiment insertion fails", () => {
+    const db = freshDb();
+    seedVariant(db, "base", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "active", "persona:coder", "active", 0.2);
+    seedTask(db, "t-retire-rollback");
+    const lessonId = seedLesson(db, "active", "t-retire-rollback");
+    forceExperimentInsertionFailure(db);
+
+    expect(() => handleMetaOperation({
+      db,
+      operation: {
+        kind: "retire",
+        target_variant_id: "active",
+        hypothesis: "h",
+        evidence: { task_ids: ["t-retire-rollback"] },
+        retire_lessons: [{ id: lessonId, reason: "superseded" }]
+      },
+      metaTaskId: "meta-retire-rollback",
+      worktreePath: "/tmp/nope",
+      projectId: "p"
+    })).toThrow("forced_experiment_insert_failure");
+
+    expect(variantState(db, "active")).toEqual({ status: "active", traffic_share: 0.2 });
+    expect(allocationEventsFor(db, "active")).toHaveLength(0);
+    expect(experimentCount(db)).toBe(0);
+    expect((db.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(lessonId) as { status: string }).status)
+      .toBe("active");
   });
 });
 

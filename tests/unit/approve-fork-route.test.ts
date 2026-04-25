@@ -53,6 +53,23 @@ describe("POST /api/experiments/:id/approve-fork", () => {
 
       const lesson = db.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(lessonId) as { status: string };
       expect(lesson.status).toBe("retired");
+
+      const allocation = db.sqlite.query(`
+        SELECT payload
+          FROM events
+         WHERE event_type = 'traffic_allocated'
+           AND task_id = ?
+      `).get(body.variantId) as { payload: string } | undefined;
+      expect(allocation).toBeDefined();
+      expect(JSON.parse(allocation?.payload ?? "{}")).toMatchObject({
+        variant_id: body.variantId,
+        agent_type: "coder",
+        old_status: null,
+        old_traffic_share: null,
+        new_status: "candidate",
+        new_traffic_share: 0,
+        reason: "meta_fork_approved"
+      });
     } finally {
       cleanup();
     }

@@ -5,7 +5,7 @@ import { resolve, join as pathJoin } from "node:path";
 import type { AppEnv } from "../config/env";
 import { assessComplexity, routeTier } from "../assessment/tier";
 import { type AutoforgeMessage } from "../nats/messages";
-import type { AgentExecutor, ToolStats } from "../executors/interface";
+import type { AgentExecutor, AgentResult, AgentTask, ToolStats } from "../executors/interface";
 import type { DbClient } from "../db/client";
 import type { NatsClient } from "../nats/client";
 import type { AgentType, PipelineTask, PlanSubtask, RejectionFeedback, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
@@ -17,11 +17,14 @@ import { REFLECTION_CONFIG } from "../config/reflection";
 import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
+import { createDispatcher, type SelectionResult } from "./dispatch";
+import { runShadowDispatches, type ShadowRunner } from "./shadow";
 import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
 import type { ExecutorSet } from "../executors/factory";
 import { validateMetaOutput } from "../schemas/meta-output";
 import { handleMetaOperation } from "./meta-operations";
+import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -32,6 +35,8 @@ interface ServiceDeps {
   nats?: NatsClient;
   testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
   prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
+  dispatcher?: ReturnType<typeof createDispatcher>;
+  shadowRunner?: ShadowRunner;
 }
 
 /**
@@ -55,10 +60,13 @@ export class StageFailedError extends Error {
 export class OrchestratorService {
   private readonly skills: SkillRegistry;
   private readonly personas: PersonaRegistry;
+  private readonly dispatcher: ReturnType<typeof createDispatcher>;
+  private readonly autoTuner = new AutoTuner();
 
   constructor(private readonly deps: ServiceDeps) {
     this.skills = new SkillRegistry(resolve(process.cwd(), deps.env.SKILLS_DIR), deps.db);
     this.personas = new PersonaRegistry(deps.db, resolve(process.cwd(), "src/personas"));
+    this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db);
   }
 
   listTasks(opts?: { includeArchived?: boolean; onlyArchived?: boolean }): PipelineTask[] {
@@ -193,16 +201,7 @@ export class OrchestratorService {
         // Leave worktree intact so the operator can inspect or retry.
         return this.requireTask(taskId);
       }
-      this.captureTaskDiffStats(taskId);
-      try {
-        await this.reflectOnTask(taskId);
-      } catch (reflectErr) {
-        console.warn(
-          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
-        );
-      } finally {
-        this.cleanupWorktree(taskId);
-      }
+      await this.finalizeTerminalTask(taskId);
       throw err;
     }
     const task = this.deps.db.getTask(taskId);
@@ -237,7 +236,8 @@ export class OrchestratorService {
   ): Promise<PlanSubtask[]> {
     const plannerExecutor = this.routeExecutor(tier, "planner");
     const userPrompt = this.buildPlannerPrompt(description, tier, attempt, priorPlan, critique);
-    const plannerPersonaId = this.personas.snapshotId("planner");
+    const plannerDispatch = this.selectPersonaForDispatch("planner", { description, tier, projectId });
+    const plannerPersonaId = plannerDispatch.selection.variantId;
     const plannerSkillIds = this.skills.snapshotIds("planner");
 
     const plannerLessons = await this.loadLessonsForDispatch(plannerPersonaId, "planner", description);
@@ -246,15 +246,16 @@ export class OrchestratorService {
       taskId,
       projectId,
       agentType: "planner",
-      selectedVariantId: plannerPersonaId,
+      selection: plannerDispatch.selection,
+      selectedVariantSpecialty: plannerDispatch.specialty,
       budgetSeconds: this.budgetForTier(tier, "planner"),
       injectedLessonIds: plannerLessons.ids
     });
 
-    const plannerResult = await plannerExecutor.execute({
+    const plannerTask = {
       id: taskId,
       type: "planner",
-      systemPrompt: this.personas.resolve("planner"),
+      systemPrompt: plannerDispatch.content,
       prompt: userPrompt,
       workingDirectory: worktreePath,
       budgetSeconds: this.budgetForTier(tier, "planner"),
@@ -263,6 +264,21 @@ export class OrchestratorService {
       metadata: { description, tier, attempt },
       model: this.plannerModel(tier),
       lessons: plannerLessons.block || undefined
+    } as const;
+    const plannerResult = await plannerExecutor.execute(plannerTask);
+
+    await this.runShadowDispatchesSafely({
+      taskId,
+      projectId,
+      agentType: "planner",
+      selection: plannerDispatch.selection,
+      liveTask: plannerTask,
+      liveResult: plannerResult,
+      baselineExecutorUsed: plannerExecutor.name,
+      baselineLessonIds: plannerLessons.ids,
+      baselineVariantId: plannerDispatch.baselineVariantId,
+      loadCandidateLessons: (candidateVariantId) =>
+        this.loadLessonsForDispatch(candidateVariantId, "planner", description)
     });
 
     // Persist transcript before we do anything else — even on failure we want
@@ -280,7 +296,7 @@ export class OrchestratorService {
       personaVersionId: plannerPersonaId,
       executorUsed: plannerExecutor.name,
       model: this.plannerModel(tier),
-      systemPrompt: transcript?.systemPrompt ?? this.personas.resolve("planner"),
+      systemPrompt: transcript?.systemPrompt ?? plannerDispatch.content,
       userPrompt: transcript?.userPrompt ?? userPrompt,
       transcript: turnsJsonl,
       output: plannerResult.output ? JSON.stringify(plannerResult.output) : null,
@@ -410,16 +426,7 @@ export class OrchestratorService {
       if (err instanceof StageFailedError) {
         return this.requireTask(taskId);
       }
-      this.captureTaskDiffStats(taskId);
-      try {
-        await this.reflectOnTask(taskId);
-      } catch (reflectErr) {
-        console.warn(
-          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
-        );
-      } finally {
-        this.cleanupWorktree(taskId);
-      }
+      await this.finalizeTerminalTask(taskId);
       throw err;
     }
 
@@ -460,16 +467,7 @@ export class OrchestratorService {
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (!worktreePath) {
       this.transition(taskId, task.projectId, "replanning", "failed", { reason: "worktree missing" });
-      this.captureTaskDiffStats(taskId);
-      try {
-        await this.reflectOnTask(taskId);
-      } catch (reflectErr) {
-        console.warn(
-          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
-        );
-      } finally {
-        this.cleanupWorktree(taskId);
-      }
+      await this.finalizeTerminalTask(taskId);
       throw new Error(`Worktree missing for task ${taskId}`);
     }
 
@@ -488,16 +486,7 @@ export class OrchestratorService {
       this.transition(taskId, task.projectId, "replanning", "failed", {
         reason: err instanceof Error ? err.message : String(err)
       });
-      this.captureTaskDiffStats(taskId);
-      try {
-        await this.reflectOnTask(taskId);
-      } catch (reflectErr) {
-        console.warn(
-          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
-        );
-      } finally {
-        this.cleanupWorktree(taskId);
-      }
+      await this.finalizeTerminalTask(taskId);
       throw err;
     }
 
@@ -515,7 +504,12 @@ export class OrchestratorService {
     // Run doc agent in the task's worktree (if it still exists).
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (worktreePath) {
-      const docPersonaId = this.personas.snapshotId("doc");
+      const docDispatch = this.selectPersonaForDispatch("doc", {
+        description: task.description,
+        tier: task.tier,
+        projectId: task.projectId
+      });
+      const docPersonaId = docDispatch.selection.variantId;
       const docSkillIds = this.skills.snapshotIds("doc");
 
       const docExecutor = this.routeExecutor(task.tier, "doc");
@@ -524,14 +518,15 @@ export class OrchestratorService {
         taskId,
         projectId: task.projectId,
         agentType: "doc",
-        selectedVariantId: docPersonaId,
+        selection: docDispatch.selection,
+        selectedVariantSpecialty: docDispatch.specialty,
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         injectedLessonIds: docLessons.ids
       });
-      const docResult = await docExecutor.execute({
+      const docTask = {
         id: `${taskId}-doc`,
         type: "doc",
-        systemPrompt: this.personas.resolve("doc"),
+        systemPrompt: docDispatch.content,
         prompt: buildDocPrompt(task.description, task.planSubtasks),
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
@@ -539,6 +534,21 @@ export class OrchestratorService {
         skillFiles: this.skills.skillsForAgent("doc"),
         metadata: { taskId, description: task.description },
         lessons: docLessons.block || undefined
+      } as const;
+      const docResult = await docExecutor.execute(docTask);
+
+      await this.runShadowDispatchesSafely({
+        taskId,
+        projectId: task.projectId,
+        agentType: "doc",
+        selection: docDispatch.selection,
+        liveTask: docTask,
+        liveResult: docResult,
+        baselineExecutorUsed: docExecutor.name,
+        baselineLessonIds: docLessons.ids,
+        baselineVariantId: docDispatch.baselineVariantId,
+        loadCandidateLessons: (candidateVariantId) =>
+          this.loadLessonsForDispatch(candidateVariantId, "doc", task.description)
       });
 
       this.recordEvent({
@@ -570,16 +580,7 @@ export class OrchestratorService {
     }
 
     this.transition(taskId, task.projectId, "documenting", "completed", {});
-    this.captureTaskDiffStats(taskId);
-    try {
-      await this.reflectOnTask(taskId);
-    } catch (reflectErr) {
-      console.warn(
-        `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
-      );
-    } finally {
-      this.cleanupWorktree(taskId);
-    }
+    await this.finalizeTerminalTask(taskId);
     return this.requireTask(taskId);
   }
 
@@ -619,16 +620,7 @@ export class OrchestratorService {
       reason: `rejected: ${feedback.reason}`,
       iteration: oldTask.iteration
     });
-    this.captureTaskDiffStats(taskId);
-    try {
-      await this.reflectOnTask(taskId);
-    } catch (reflectErr) {
-      console.warn(
-        `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
-      );
-    } finally {
-      this.cleanupWorktree(taskId);
-    }
+    await this.finalizeTerminalTask(taskId);
 
     // Spawn a fresh task from current HEAD with the operator's feedback
     // appended to the description so the new planner sees it.
@@ -693,16 +685,7 @@ export class OrchestratorService {
     });
 
     this.transition(taskId, task.projectId, task.state, "failed", { reason: `cancelled: ${reason}`, iteration: task.iteration });
-    this.captureTaskDiffStats(taskId);
-    try {
-      await this.reflectOnTask(taskId);
-    } catch (reflectErr) {
-      console.warn(
-        `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
-      );
-    } finally {
-      this.cleanupWorktree(taskId);
-    }
+    await this.finalizeTerminalTask(taskId);
     return this.requireTask(taskId);
   }
 
@@ -729,6 +712,85 @@ export class OrchestratorService {
           payload: e.payload,
           budgetSeconds: e.budgetSeconds
         })
+    });
+  }
+
+  private async finalizeTerminalTask(taskId: string): Promise<void> {
+    this.captureTaskDiffStats(taskId);
+    try {
+      await this.reflectOnTask(taskId);
+    } catch (reflectErr) {
+      console.warn(
+        `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+      );
+    }
+    try {
+      await this.runAutoTunerForTask(taskId);
+    } finally {
+      this.cleanupWorktree(taskId);
+    }
+  }
+
+  private async runAutoTunerForTask(taskId: string): Promise<void> {
+    const task = this.deps.db.getTask(taskId);
+    if (!task) return;
+    if (task.state !== "completed" && task.state !== "failed") return;
+
+    try {
+      const candidateIds = new Set<string>();
+      const activeVariantIds = new Set<string>();
+
+      for (const event of this.deps.db.listEvents(taskId)) {
+        if (event.type !== "variant_selected") continue;
+        const payload = event.payload;
+        const shadowVariantIds = Array.isArray(payload.shadow_variant_ids)
+          ? payload.shadow_variant_ids.filter((id): id is string => typeof id === "string")
+          : [];
+        for (const candidateId of shadowVariantIds) {
+          candidateIds.add(candidateId);
+        }
+
+        const selectedVariantId = payload.selected_variant_id;
+        const rationale = payload.selection_rationale;
+        if (
+          typeof selectedVariantId === "string"
+          && (rationale === "exploitation" || rationale === "exploration")
+          && this.variantStatus(selectedVariantId) === "active"
+        ) {
+          activeVariantIds.add(selectedVariantId);
+        }
+      }
+
+      for (const candidateId of candidateIds) {
+        evaluateCandidate(this.deps.db, candidateId);
+      }
+      for (const variantId of activeVariantIds) {
+        this.autoTuner.evaluateActiveVariant(this.deps.db, variantId);
+      }
+      evaluateAutoRetire(this.deps.db);
+    } catch (err) {
+      this.recordAutoTunerFailed(task, err);
+    }
+  }
+
+  private variantStatus(variantId: string): string | null {
+    const row = this.deps.db.sqlite
+      .query("SELECT status FROM skill_versions WHERE id = ?")
+      .get(variantId) as { status: string } | null;
+    return row?.status ?? null;
+  }
+
+  private recordAutoTunerFailed(task: PipelineTask, err: unknown): void {
+    this.recordEvent({
+      taskId: task.id,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "auto_tuner_failed",
+      status: "done_with_concerns",
+      payload: {
+        reason: err instanceof Error ? err.message : String(err)
+      },
+      budgetSeconds: 60
     });
   }
 
@@ -887,16 +949,7 @@ export class OrchestratorService {
           ).run(new Date().toISOString(), task.id);
         }
 
-        this.captureTaskDiffStats(task.id);
-        try {
-          await this.reflectOnTask(task.id);
-        } catch (reflectErr) {
-          console.warn(
-            `[orchestrator] reflectOnTask threw for ${task.id}: ${(reflectErr as Error).message ?? reflectErr}`
-          );
-        } finally {
-          this.cleanupWorktree(task.id);
-        }
+        await this.finalizeTerminalTask(task.id);
       }
     }
   }
@@ -940,7 +993,12 @@ export class OrchestratorService {
         budgetSeconds: 600
       });
 
-      const metaPersonaId = this.personas.snapshotId("meta");
+      const metaDispatch = this.selectPersonaForDispatch("meta", {
+        description: focus ?? "meta improvement",
+        tier: "STANDARD",
+        projectId
+      });
+      const metaPersonaId = metaDispatch.selection.variantId;
       const metaSkillIds = this.skills.snapshotIds("meta");
       const metaExecutor = this.routeExecutor("STANDARD", "meta");
 
@@ -948,14 +1006,15 @@ export class OrchestratorService {
         taskId: metaTaskId,
         projectId,
         agentType: "meta",
-        selectedVariantId: metaPersonaId,
+        selection: metaDispatch.selection,
+        selectedVariantSpecialty: metaDispatch.specialty,
         budgetSeconds: 600
       });
 
       const metaResult = await metaExecutor.execute({
         id: metaTaskId,
         type: "meta",
-        systemPrompt: this.personas.resolve("meta"),
+        systemPrompt: metaDispatch.content,
         prompt,
         workingDirectory: worktree.path,
         budgetSeconds: 600,
@@ -1123,6 +1182,18 @@ export class OrchestratorService {
         $specialty: specialty
       });
 
+      this.deps.db.appendTrafficAllocatedEvent({
+        variantId,
+        agentType: parent.skill_name.startsWith("persona:")
+          ? parent.skill_name.slice("persona:".length)
+          : parent.skill_name,
+        oldStatus: null,
+        newStatus: "candidate",
+        oldTrafficShare: null,
+        newTrafficShare: 0.0,
+        reason: "meta_fork_approved"
+      });
+
       this.deps.db.sqlite.query(
         "UPDATE experiments SET status = 'active' WHERE id = ?"
       ).run(experimentId);
@@ -1164,7 +1235,8 @@ export class OrchestratorService {
 
       for (const subtask of planSubtasks) {
         const subtaskAgentType = subtask.agentType ?? "coder";
-        const subtaskPersonaId = this.personas.snapshotId(subtaskAgentType);
+        const subtaskDispatch = this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
+        const subtaskPersonaId = subtaskDispatch.selection.variantId;
         const subtaskSkillIds = this.skills.snapshotIds(subtaskAgentType);
         const coderExecutor = this.routeExecutor(tier, subtaskAgentType);
 
@@ -1176,15 +1248,16 @@ export class OrchestratorService {
           taskId,
           projectId,
           agentType: subtaskAgentType,
-          selectedVariantId: subtaskPersonaId,
+          selection: subtaskDispatch.selection,
+          selectedVariantSpecialty: subtaskDispatch.specialty,
           budgetSeconds: this.budgetForTier(tier, "coder"),
           injectedLessonIds: coderLessons.ids
         });
 
-        const coderResult = await coderExecutor.execute({
+        const liveTask = {
           id: subtask.id,
           type: subtaskAgentType,
-          systemPrompt: this.personas.resolve(subtaskAgentType),
+          systemPrompt: subtaskDispatch.content,
           prompt: buildCoderPrompt(description, subtask, iteration),
           workingDirectory: worktreePath,
           budgetSeconds: this.budgetForTier(tier, "coder"),
@@ -1192,6 +1265,21 @@ export class OrchestratorService {
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
+        };
+        const coderResult = await coderExecutor.execute(liveTask);
+
+        await this.runShadowDispatchesSafely({
+          taskId,
+          projectId,
+          agentType: subtaskAgentType,
+          selection: subtaskDispatch.selection,
+          liveTask,
+          liveResult: coderResult,
+          baselineExecutorUsed: coderExecutor.name,
+          baselineLessonIds: coderLessons.ids,
+          baselineVariantId: subtaskDispatch.baselineVariantId,
+          loadCandidateLessons: (candidateVariantId) =>
+            this.loadLessonsForDispatch(candidateVariantId, subtaskAgentType, description)
         });
 
         if (!isSuccess(coderResult.status)) {
@@ -1252,7 +1340,8 @@ export class OrchestratorService {
         break;
       }
 
-      const reviewerPersonaId = this.personas.snapshotId("reviewer");
+      const reviewerDispatch = this.selectPersonaForDispatch("reviewer", { description, tier, projectId });
+      const reviewerPersonaId = reviewerDispatch.selection.variantId;
       const reviewerSkillIds = this.skills.snapshotIds("reviewer");
       const reviewerExecutor = this.routeExecutor(tier, "reviewer");
 
@@ -1262,15 +1351,16 @@ export class OrchestratorService {
         taskId,
         projectId,
         agentType: "reviewer",
-        selectedVariantId: reviewerPersonaId,
+        selection: reviewerDispatch.selection,
+        selectedVariantSpecialty: reviewerDispatch.specialty,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         injectedLessonIds: reviewerLessons.ids
       });
 
-      const reviewResult = await reviewerExecutor.execute({
+      const reviewerTask = {
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
-        systemPrompt: this.personas.resolve("reviewer"),
+        systemPrompt: reviewerDispatch.content,
         prompt: buildReviewerPrompt(description, planSubtasks),
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
@@ -1278,6 +1368,21 @@ export class OrchestratorService {
         skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description },
         lessons: reviewerLessons.block || undefined
+      } as const;
+      const reviewResult = await reviewerExecutor.execute(reviewerTask);
+
+      await this.runShadowDispatchesSafely({
+        taskId,
+        projectId,
+        agentType: "reviewer",
+        selection: reviewerDispatch.selection,
+        liveTask: reviewerTask,
+        liveResult: reviewResult,
+        baselineExecutorUsed: reviewerExecutor.name,
+        baselineLessonIds: reviewerLessons.ids,
+        baselineVariantId: reviewerDispatch.baselineVariantId,
+        loadCandidateLessons: (candidateVariantId) =>
+          this.loadLessonsForDispatch(candidateVariantId, "reviewer", description)
       });
 
       const reviewerFailureForensics = {
@@ -1544,11 +1649,35 @@ export class OrchestratorService {
     };
   }
 
+  private selectPersonaForDispatch(
+    agentType: AgentType,
+    taskContext: { description: string; tier: Tier; projectId: string }
+  ): { selection: SelectionResult; content: string; specialty: string | null; baselineVariantId: string | null } {
+    let population = this.deps.db.loadDispatchPopulation(agentType);
+    if (population.length === 0) {
+      this.personas.snapshotId(agentType);
+      population = this.deps.db.loadDispatchPopulation(agentType);
+    }
+    this.personas.ensureDispatchBaseline(agentType);
+    population = this.deps.db.loadDispatchPopulation(agentType);
+
+    const selection = this.dispatcher.selectVariant(agentType, taskContext);
+    const selected = population.find((variant) => variant.id === selection.variantId) ?? null;
+    const baseline = population.find((variant) => variant.status === "baseline") ?? null;
+    return {
+      selection,
+      content: this.personas.resolveVariant(selection.variantId, agentType),
+      specialty: selected?.specialty ?? null,
+      baselineVariantId: baseline?.id ?? null
+    };
+  }
+
   private emitVariantSelected(input: {
     taskId: string;
     projectId: string;
     agentType: AgentType;
-    selectedVariantId: string;
+    selection: SelectionResult;
+    selectedVariantSpecialty: string | null;
     budgetSeconds: number;
     injectedLessonIds?: string[];
   }): void {
@@ -1560,15 +1689,38 @@ export class OrchestratorService {
       status: "done",
       payload: {
         agent_type: input.agentType,
-        selected_variant_id: input.selectedVariantId,
-        selected_variant_specialty: null,
-        eligible_variant_ids: [input.selectedVariantId],
-        selection_rationale: "only_eligible",
-        shadow_variant_ids: [],
+        selected_variant_id: input.selection.variantId,
+        selected_variant_specialty: input.selectedVariantSpecialty,
+        eligible_variant_ids: input.selection.eligibleVariantIds,
+        selection_rationale: input.selection.rationale,
+        shadow_variant_ids: input.selection.shadowVariantIds,
         injected_lesson_ids: input.injectedLessonIds ?? []
       },
       budgetSeconds: input.budgetSeconds
     });
+  }
+
+  private async runShadowDispatchesSafely(input: {
+    taskId: string;
+    projectId: string;
+    agentType: AgentType;
+    selection: SelectionResult;
+    liveTask: AgentTask;
+    liveResult: AgentResult;
+    baselineExecutorUsed: string | null;
+    baselineLessonIds: string[];
+    baselineVariantId: string | null;
+    loadCandidateLessons: (candidateVariantId: string) => Promise<{ ids: string[]; block: string }>;
+  }): Promise<void> {
+    try {
+      await runShadowDispatches({
+        ...input,
+        runner: this.deps.shadowRunner,
+        recordEvent: (event) => this.recordEvent(event)
+      });
+    } catch (err) {
+      console.warn(`[shadow] dispatch recording failed for task=${input.taskId} agent=${input.agentType}: ${(err as Error).message ?? err}`);
+    }
   }
 
   /**

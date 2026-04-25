@@ -38,6 +38,52 @@ export interface LessonRow {
   retired_at: string | null;
 }
 
+export interface TrafficAllocatedEventInput {
+  variantId: string;
+  agentType: string;
+  oldStatus: string | null;
+  newStatus: string;
+  oldTrafficShare: number | null;
+  newTrafficShare: number;
+  reason: string;
+  supportingMetric?: Record<string, unknown>;
+}
+
+export interface DispatchVariantRow {
+  id: string;
+  skill_name: string;
+  content: string;
+  status: "baseline" | "active" | "candidate";
+  traffic_share: number;
+  parent_version_id: string | null;
+  specialty: string | null;
+  created_at: string;
+}
+
+export interface ShadowPair {
+  id: string;
+  taskId: string;
+  timestamp: string;
+  status: string;
+  payload: Record<string, unknown>;
+  baselineVariantId: string | null;
+  candidateVariantId: string;
+  baselineComposite: number | null;
+  candidateComposite: number | null;
+  baselineScoreComponents: Record<string, unknown> | null;
+  candidateScoreComponents: Record<string, unknown> | null;
+  error: string | null;
+}
+
+export interface VariantScore {
+  taskId: string;
+  projectId: string;
+  tier: string;
+  createdAt: string;
+  selectedAt: string;
+  composite: number;
+}
+
 /** Defensive cap for resolveLineageRoot — chains deeper than this almost certainly
  *  indicate corrupt data. Paired with a visited-set for cycle detection. */
 const MAX_LINEAGE_DEPTH = 50;
@@ -152,6 +198,33 @@ export class DbClient {
       $resumable: opts?.resumable !== false ? 1 : 0,
       $executor_used: opts?.executorUsed ?? null,
       $context_envelope_hash: opts?.contextEnvelopeHash ?? null
+    });
+  }
+
+  appendTrafficAllocatedEvent(input: TrafficAllocatedEventInput): void {
+    const payload: Record<string, unknown> = {
+      variant_id: input.variantId,
+      agent_type: input.agentType,
+      old_status: input.oldStatus,
+      new_status: input.newStatus,
+      old_traffic_share: input.oldTrafficShare,
+      new_traffic_share: input.newTrafficShare,
+      reason: input.reason
+    };
+    if (input.supportingMetric !== undefined) {
+      payload.supporting_metric = input.supportingMetric;
+    }
+
+    this.appendEvent({
+      id: randomUUID(),
+      taskId: input.variantId,
+      projectId: "allocation",
+      timestamp: new Date().toISOString(),
+      agent: "orchestrator",
+      type: "traffic_allocated",
+      status: "done",
+      payload,
+      budgetSeconds: 0
     });
   }
 
@@ -282,6 +355,174 @@ export class DbClient {
       $agent_type: agentType,
       $limit: limit
     }) as LessonRow[];
+  }
+
+  loadDispatchPopulation(agentType: AgentType): DispatchVariantRow[] {
+    return this.sqlite.query(`
+      SELECT id, skill_name, content, status, traffic_share, parent_version_id, specialty, created_at
+        FROM skill_versions
+       WHERE skill_name = ?
+         AND status IN ('baseline', 'active', 'candidate')
+       ORDER BY created_at ASC, id ASC
+    `).all(`persona:${agentType}`) as DispatchVariantRow[];
+  }
+
+  loadShadowPairs(candidateId: string): ShadowPair[] {
+    const rows = this.sqlite
+      .query(`
+        SELECT id, task_id, timestamp, status, payload
+          FROM events
+         WHERE event_type = 'shadow_run_completed'
+         ORDER BY timestamp ASC, rowid ASC
+      `)
+      .all() as Array<{ id: string; task_id: string; timestamp: string; status: string; payload: string }>;
+
+    const pairs: ShadowPair[] = [];
+    for (const row of rows) {
+      let parsedPayload: unknown;
+      try {
+        parsedPayload = JSON.parse(row.payload);
+      } catch {
+        continue;
+      }
+      const payload = recordOrNull(parsedPayload);
+      if (!payload) {
+        continue;
+      }
+      if (payload.candidate_variant_id !== candidateId) {
+        continue;
+      }
+
+      pairs.push({
+        id: row.id,
+        taskId: row.task_id,
+        timestamp: row.timestamp,
+        status: row.status,
+        payload,
+        baselineVariantId: stringOrNull(payload.baseline_variant_id),
+        candidateVariantId: candidateId,
+        baselineComposite: finiteNumberOrNull(payload.baseline_composite),
+        candidateComposite: finiteNumberOrNull(payload.candidate_composite),
+        baselineScoreComponents: recordOrNull(payload.baseline_score_components),
+        candidateScoreComponents: recordOrNull(payload.candidate_score_components),
+        error: stringOrNull(payload.error)
+      });
+    }
+    return pairs;
+  }
+
+  loadRecentShadowRuns(candidateId: string, window: { limit: number }): ShadowPair[] {
+    const rows = this.sqlite
+      .query(`
+        SELECT id, task_id, timestamp, status, payload
+          FROM events
+         WHERE event_type = 'shadow_run_completed'
+           AND json_valid(payload)
+           AND json_extract(payload, '$.candidate_variant_id') = $candidate_id
+         ORDER BY timestamp DESC, rowid DESC
+         LIMIT $limit
+      `)
+      .all({
+        $candidate_id: candidateId,
+        $limit: Math.max(0, Math.floor(window.limit))
+      }) as Array<{ id: string; task_id: string; timestamp: string; status: string; payload: string }>;
+
+    const runs: ShadowPair[] = [];
+    for (const row of rows) {
+      const payload = recordOrNull(JSON.parse(row.payload));
+      if (!payload) {
+        continue;
+      }
+      runs.push({
+        id: row.id,
+        taskId: row.task_id,
+        timestamp: row.timestamp,
+        status: row.status,
+        payload,
+        baselineVariantId: stringOrNull(payload.baseline_variant_id),
+        candidateVariantId: candidateId,
+        baselineComposite: finiteNumberOrNull(payload.baseline_composite),
+        candidateComposite: finiteNumberOrNull(payload.candidate_composite),
+        baselineScoreComponents: recordOrNull(payload.baseline_score_components),
+        candidateScoreComponents: recordOrNull(payload.candidate_score_components),
+        error: stringOrNull(payload.error)
+      });
+    }
+    return runs;
+  }
+
+  loadRecentTaskScores(variantId: string, window: { limit: number; maxAgeDays: number }): VariantScore[] {
+    return this.loadRecentTaskScoresForRationales(variantId, window, ["exploitation", "exploration"]);
+  }
+
+  loadRecentSelectedTaskScores(variantId: string, window: { limit: number; maxAgeDays: number }): VariantScore[] {
+    return this.loadRecentTaskScoresForRationales(variantId, window, ["baseline", "only_eligible", "exploitation", "exploration"]);
+  }
+
+  loadRecentBaselineTaskScores(variantId: string, window: { limit: number; maxAgeDays: number }): VariantScore[] {
+    return this.loadRecentTaskScoresForRationales(variantId, window, ["baseline", "only_eligible"]);
+  }
+
+  private loadRecentTaskScoresForRationales(
+    variantId: string,
+    window: { limit: number; maxAgeDays: number },
+    rationales: string[]
+  ): VariantScore[] {
+    const cutoff = new Date(Date.now() - window.maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const rationalePlaceholders = rationales.map((_, index) => `$rationale_${index}`).join(", ");
+    const params: Record<string, string | number> = {
+      $variant_id: variantId,
+      $cutoff: cutoff,
+      $limit: Math.max(0, Math.floor(window.limit))
+    };
+    rationales.forEach((rationale, index) => {
+      params[`$rationale_${index}`] = rationale;
+    });
+    const rows = this.sqlite
+      .query(`
+        SELECT
+          tqs.task_id AS taskId,
+          tqs.project_id AS projectId,
+          tqs.tier AS tier,
+          tqs.created_at AS createdAt,
+          MAX(e.timestamp) AS selectedAt,
+          (
+            tqs.r_correctness
+            + tqs.r_simplicity
+            + tqs.r_alignment
+            + tqs.r_fidelity
+            + tqs.r_efficiency
+          ) / 5.0 AS composite
+        FROM task_quality_score tqs
+        JOIN events e ON e.task_id = tqs.task_id
+        WHERE e.event_type = 'variant_selected'
+          AND json_valid(e.payload)
+          AND json_extract(e.payload, '$.selected_variant_id') = $variant_id
+          AND json_extract(e.payload, '$.selection_rationale') IN (${rationalePlaceholders})
+          AND tqs.created_at >= $cutoff
+        GROUP BY tqs.task_id
+        ORDER BY selectedAt DESC, tqs.created_at DESC, tqs.task_id ASC
+        LIMIT $limit
+      `)
+      .all(params) as Array<{
+        taskId: string;
+        projectId: string;
+        tier: string;
+        createdAt: string;
+        selectedAt: string;
+        composite: number;
+      }>;
+
+    return rows
+      .filter((row) => Number.isFinite(row.composite))
+      .map((row) => ({
+        taskId: row.taskId,
+        projectId: row.projectId,
+        tier: row.tier,
+        createdAt: row.createdAt,
+        selectedAt: row.selectedAt,
+        composite: row.composite
+      }));
   }
 
   supersedeLessons(oldIds: string[], newLessonId: string): { transitioned: string[]; rejected: string[] } {
@@ -876,4 +1117,18 @@ export class DbClient {
       unresolvedFindings: findings.unresolved ?? 0
     };
   }
+}
+
+function finiteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function recordOrNull(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
 }
