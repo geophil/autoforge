@@ -22,6 +22,21 @@ function insertTask(db: DbClient, id: string, state: string, archivedAt?: string
     .run(...(args as Parameters<ReturnType<typeof db.sqlite.query>["run"]>));
 }
 
+function insertLessonForTask(db: DbClient, taskId: string): void {
+  db.sqlite.query(
+    "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share) VALUES ('v-archive-lesson','persona:coder','1','seed','baseline',1.0)"
+  ).run();
+  db.insertLesson({
+    agentType: "coder",
+    lineageRootId: "v-archive-lesson",
+    sourceTaskId: taskId,
+    sourceVariantId: "v-archive-lesson",
+    triggerPattern: "archive evidence",
+    body: "TRIGGER\nOBSERVATION\nPRINCIPLE\nEVIDENCE",
+    outcomeKind: "corrective"
+  });
+}
+
 describe("OrchestratorService.archiveTask", () => {
   test("throws when task is in a non-terminal state", async () => {
     const { service, db } = createTestService();
@@ -106,6 +121,18 @@ describe("OrchestratorService.deleteTaskPermanently", () => {
     expect(db.getTask("task-devt")).toBeNull();
     const events = db.listEvents("task-devt");
     expect(events).toHaveLength(0);
+  });
+
+  test("rejects lesson-bearing tasks without emitting task_deleted", async () => {
+    const { service, db } = createTestService();
+    insertTask(db, "task-lesson-delete", "completed", "2026-04-19T01:00:00Z");
+    insertLessonForTask(db, "task-lesson-delete");
+
+    await expect(service.deleteTaskPermanently("task-lesson-delete")).rejects.toThrow(/lesson/i);
+
+    expect(db.getTask("task-lesson-delete")).not.toBeNull();
+    const events = db.listEvents("task-lesson-delete");
+    expect(events.find((e) => e.type === "task_deleted")).toBeUndefined();
   });
 });
 

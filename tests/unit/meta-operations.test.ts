@@ -108,6 +108,52 @@ describe("handleMetaOperation — promote/demote baseline protection", () => {
     });
     expect(res.ok).toBe(false);
   });
+
+  test("promote candidate to nonzero traffic fails before shadow graduation", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedVariant(db, "vCand", "persona:coder", "candidate", 0.0);
+    const op: MetaOperation = {
+      kind: "promote",
+      target_variant_id: "vCand",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"] },
+      traffic_share: 0.1
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-candidate-promote", worktreePath: "/tmp/nope", projectId: "p"
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/candidate/);
+    const row = db.sqlite.query("SELECT traffic_share FROM skill_versions WHERE id='vCand'")
+      .get() as { traffic_share: number };
+    expect(row.traffic_share).toBe(0.0);
+  });
+
+  test("baseline promote cannot consume the exploration bucket once population exists", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "vActive", "persona:coder", "active", 0.2);
+    const op: MetaOperation = {
+      kind: "promote",
+      target_variant_id: "vBase",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"] },
+      traffic_share: 1.0
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-baseline-promote", worktreePath: "/tmp/nope", projectId: "p"
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/exploration/);
+    const row = db.sqlite.query("SELECT traffic_share FROM skill_versions WHERE id='vBase'")
+      .get() as { traffic_share: number };
+    expect(row.traffic_share).toBe(0.8);
+  });
 });
 
 describe("handleMetaOperation — retire", () => {
@@ -181,17 +227,17 @@ describe("handleMetaOperation — retire_lessons side effect", () => {
   test("retires listed lessons alongside the main operation", () => {
     const db = freshDb();
     seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedVariant(db, "vCand", "persona:coder", "candidate", 0.0);
     db.sqlite.query(
       `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
        VALUES ('t1','p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))`
     ).run();
 
     const l1 = db.insertLesson({
-      agentType: "coder", lineageRootId: "vBase", sourceTaskId: "t1",
-      sourceVariantId: "vBase", triggerPattern: "p", body: "b", outcomeKind: "corrective"
+      agentType: "coder", lineageRootId: "vCand", sourceTaskId: "t1",
+      sourceVariantId: "vCand", triggerPattern: "p", body: "b", outcomeKind: "corrective"
     });
 
-    seedVariant(db, "vCand", "persona:coder", "candidate", 0.0);
     const op2: MetaOperation = {
       kind: "retire",
       target_variant_id: "vCand",
@@ -207,6 +253,72 @@ describe("handleMetaOperation — retire_lessons side effect", () => {
 
     const row = db.sqlite.query("SELECT status FROM lessons WHERE id = ?").get(l1) as { status: string };
     expect(row.status).toBe("retired");
+  });
+
+  test("rejects inactive retire_lessons instead of silently ignoring them", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedVariant(db, "vCand", "persona:coder", "candidate", 0.0);
+    db.sqlite.query(
+      `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
+       VALUES ('t-inactive','p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))`
+    ).run();
+    const lessonId = db.insertLesson({
+      agentType: "coder", lineageRootId: "vCand", sourceTaskId: "t-inactive",
+      sourceVariantId: "vCand", triggerPattern: "p", body: "b", outcomeKind: "corrective"
+    });
+    db.retireLessons([lessonId]);
+
+    const op: MetaOperation = {
+      kind: "retire",
+      target_variant_id: "vCand",
+      hypothesis: "h",
+      evidence: { task_ids: ["t-inactive"] },
+      retire_lessons: [{ id: lessonId, reason: "already obsolete" }]
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-inactive", worktreePath: "/tmp/nope", projectId: "p"
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/lesson.*active/i);
+    const variant = db.sqlite.query("SELECT status FROM skill_versions WHERE id = 'vCand'")
+      .get() as { status: string };
+    expect(variant.status).toBe("candidate");
+  });
+
+  test("rejects retire_lessons outside the target variant lineage", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedVariant(db, "vCand", "persona:coder", "candidate", 0.0);
+    seedVariant(db, "vOther", "persona:coder", "active", 0.1);
+    db.sqlite.query(
+      `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
+       VALUES ('t-cross','p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))`
+    ).run();
+    const lessonId = db.insertLesson({
+      agentType: "coder", lineageRootId: "vOther", sourceTaskId: "t-cross",
+      sourceVariantId: "vOther", triggerPattern: "p", body: "b", outcomeKind: "corrective"
+    });
+
+    const op: MetaOperation = {
+      kind: "retire",
+      target_variant_id: "vCand",
+      hypothesis: "h",
+      evidence: { task_ids: ["t-cross"] },
+      retire_lessons: [{ id: lessonId, reason: "not this lineage" }]
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-cross", worktreePath: "/tmp/nope", projectId: "p"
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/lineage/i);
+    const lesson = db.sqlite.query("SELECT status FROM lessons WHERE id = ?")
+      .get(lessonId) as { status: string };
+    expect(lesson.status).toBe("active");
   });
 });
 

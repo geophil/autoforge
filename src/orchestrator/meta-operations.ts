@@ -6,6 +6,8 @@ import type { MetaOperation } from "../schemas/meta-output";
 
 const BASELINE_PROTECTION_MIN_SHARE = 0.5;
 const MAX_TRAFFIC_SHARE = 1.0;
+const MVP_EXPLORATION_SHARE = 0.1;
+const BASELINE_MAX_WITH_POPULATION = MAX_TRAFFIC_SHARE - MVP_EXPLORATION_SHARE;
 
 export interface MetaOperationContext {
   db: DbClient;
@@ -49,19 +51,49 @@ function readProposedContent(worktreePath: string, fileName: string): string | n
   try { return readFileSync(p, "utf8"); } catch { return null; }
 }
 
-function applyRetireLessons(ctx: MetaOperationContext): string[] {
-  const list = (ctx.operation.retire_lessons ?? []).map((e) => e.id);
-  return ctx.db.retireLessons(list);
+interface RetireLessonValidation {
+  ok: boolean;
+  ids: string[];
+  reason?: string;
 }
 
-function pendingRetireLessonIds(ctx: MetaOperationContext): string[] {
-  return (ctx.operation.retire_lessons ?? []).map((e) => e.id);
+function validateRetireLessons(ctx: MetaOperationContext, lineageVariantId: string): RetireLessonValidation {
+  const ids = (ctx.operation.retire_lessons ?? []).map((e) => e.id);
+  if (ids.length === 0) return { ok: true, ids };
+
+  const expectedLineageRoot = ctx.db.resolveLineageRoot(lineageVariantId) ?? lineageVariantId;
+  for (const id of ids) {
+    const row = ctx.db.sqlite
+      .query("SELECT id, status, lineage_root_id FROM lessons WHERE id = ?")
+      .get(id) as { id: string; status: string; lineage_root_id: string } | null;
+    if (!row) {
+      return { ok: false, ids, reason: `lesson_not_found:${id}` };
+    }
+    if (row.status !== "active") {
+      return { ok: false, ids, reason: `lesson_not_active:${id}` };
+    }
+    if (row.lineage_root_id !== expectedLineageRoot) {
+      return { ok: false, ids, reason: `lesson_lineage_mismatch:${id}` };
+    }
+  }
+
+  return { ok: true, ids };
+}
+
+function applyRetireLessons(ctx: MetaOperationContext, ids: string[]): string[] {
+  return ctx.db.retireLessons(ids);
+}
+
+function pendingRetireLessonIds(ids: string[]): string[] {
+  return ids;
 }
 
 function handleEdit(ctx: MetaOperationContext): MetaOperationResult {
   const op = ctx.operation as Extract<MetaOperation, { kind: "edit" }>;
   const target = ctx.db.getSkillVersionById(op.target_variant_id);
   if (!target) return { ok: false, reason: "target_not_found" };
+  const retireLessons = validateRetireLessons(ctx, target.id);
+  if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
 
   const content = readProposedContent(ctx.worktreePath, op.proposed_content_file);
   if (!content || content.trim().length === 0) {
@@ -80,7 +112,7 @@ function handleEdit(ctx: MetaOperationContext): MetaOperationResult {
       changeDescription: op.hypothesis,
       metricName: op.evidence.metric_name,
       metricBefore: op.evidence.metric_before,
-      evidence: { ...op.evidence, retired_lessons: applyRetireLessons(ctx) },
+      evidence: { ...op.evidence, retired_lessons: applyRetireLessons(ctx, retireLessons.ids) },
       status: "active",
       proposedContent: content
     });
@@ -109,6 +141,8 @@ function handleFork(ctx: MetaOperationContext): MetaOperationResult {
   const op = ctx.operation as Extract<MetaOperation, { kind: "fork" }>;
   const parent = ctx.db.getSkillVersionById(op.parent_variant_id);
   if (!parent) return { ok: false, reason: "parent_not_found" };
+  const retireLessons = validateRetireLessons(ctx, parent.id);
+  if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
   const content = readProposedContent(ctx.worktreePath, op.proposed_content_file);
   if (!content || content.trim().length === 0) {
     return { ok: false, reason: "proposed_content_empty" };
@@ -128,7 +162,7 @@ function handleFork(ctx: MetaOperationContext): MetaOperationResult {
         ...op.evidence,
         specialty: op.specialty,
         parent_variant_id: parent.id,
-        pending_retire_lessons: pendingRetireLessonIds(ctx)
+        pending_retire_lessons: pendingRetireLessonIds(retireLessons.ids)
       },
       status: "proposed",
       proposedContent: content
@@ -143,6 +177,8 @@ function handleMerge(ctx: MetaOperationContext): MetaOperationResult {
   if (!ctx.db.getSkillVersionById(op.target_variant_id)) {
     return { ok: false, reason: "target_not_found" };
   }
+  const retireLessons = validateRetireLessons(ctx, op.target_variant_id);
+  if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
   if (!ctx.db.getSkillVersionById(op.merge_source_variant_id)) {
     return { ok: false, reason: "merge_source_not_found" };
   }
@@ -160,7 +196,7 @@ function handleMerge(ctx: MetaOperationContext): MetaOperationResult {
       evidence: {
         ...op.evidence,
         merge_source_variant_id: op.merge_source_variant_id,
-        pending_retire_lessons: pendingRetireLessonIds(ctx)
+        pending_retire_lessons: pendingRetireLessonIds(retireLessons.ids)
       },
       status: "proposed"
     });
@@ -182,6 +218,11 @@ function handleShareAdjust(
   >;
   const target = ctx.db.getSkillVersionById(op.target_variant_id);
   if (!target) return { ok: false, reason: "target_not_found" };
+  const retireLessons = validateRetireLessons(ctx, target.id);
+  if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
+  if (!["baseline", "active"].includes(target.status)) {
+    return { ok: false, reason: `cannot_${kind}_${target.status}_variant` };
+  }
 
   const newShare = op.traffic_share;
   if (newShare === undefined) return { ok: false, reason: "traffic_share_required" };
@@ -190,6 +231,16 @@ function handleShareAdjust(
   }
   if (target.status === "baseline" && newShare < BASELINE_PROTECTION_MIN_SHARE) {
     return { ok: false, reason: "baseline_protected" };
+  }
+  if (target.status === "baseline" && newShare > BASELINE_MAX_WITH_POPULATION) {
+    const population = (ctx.db.sqlite
+      .query(
+        "SELECT COUNT(*) AS n FROM skill_versions WHERE skill_name = ? AND status IN ('baseline','active','candidate')"
+      )
+      .get(target.skill_name) as { n: number }).n;
+    if (population > 1) {
+      return { ok: false, reason: "baseline_exploration_reserved" };
+    }
   }
 
   const experimentId = randomUUID();
@@ -204,7 +255,7 @@ function handleShareAdjust(
       evidence: {
         ...op.evidence,
         new_traffic_share: newShare,
-        retired_lessons: applyRetireLessons(ctx)
+        retired_lessons: applyRetireLessons(ctx, retireLessons.ids)
       },
       status: "active"
     });
@@ -220,6 +271,8 @@ function handleRetire(ctx: MetaOperationContext): MetaOperationResult {
   >;
   const target = ctx.db.getSkillVersionById(op.target_variant_id);
   if (!target) return { ok: false, reason: "target_not_found" };
+  const retireLessons = validateRetireLessons(ctx, target.id);
+  if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
 
   if (target.status === "baseline") {
     const count = ctx.db.countBaselinesForSkillName(target.skill_name);
@@ -235,7 +288,7 @@ function handleRetire(ctx: MetaOperationContext): MetaOperationResult {
       operation: "retire",
       hypothesis: op.hypothesis,
       changeDescription: `retire ${target.id}`,
-      evidence: { ...op.evidence, retired_lessons: applyRetireLessons(ctx) },
+      evidence: { ...op.evidence, retired_lessons: applyRetireLessons(ctx, retireLessons.ids) },
       status: "active"
     });
   });

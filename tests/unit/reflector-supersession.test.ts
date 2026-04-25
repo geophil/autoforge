@@ -141,4 +141,76 @@ describe("reflector supersession", () => {
     expect(res.lessonId).not.toBeNull();
     expect(events.find((e) => e.type === "lessons_superseded")).toBeUndefined();
   });
+
+  test("does not supersede lessons from a different lineage", async () => {
+    const db = freshDb();
+    db.sqlite.query(
+      "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share) VALUES ('vC','persona:coder','1','c','baseline',1.0)"
+    ).run();
+    db.sqlite.query(
+      "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share) VALUES ('vOther','persona:coder','2','other','active',0.1)"
+    ).run();
+    db.sqlite.query(
+      "INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at) VALUES ('t','p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))"
+    ).run();
+    const otherLineageLesson = db.insertLesson({
+      agentType: "coder", lineageRootId: "vOther", sourceTaskId: "t",
+      sourceVariantId: "vOther", triggerPattern: "p", body: "b", outcomeKind: "corrective"
+    });
+
+    const mockExecutor = {
+      async execute() {
+        return {
+          status: "DONE",
+          artifacts: [],
+          output: {
+            status: "DONE",
+            artifacts: [],
+            lesson: {
+              skip: false,
+              agent_type: "coder",
+              trigger_pattern: "p2",
+              body: "TRIGGER\nOBSERVATION\nPRINCIPLE\nEVIDENCE",
+              outcome_kind: "corrective",
+              keywords: "react"
+            },
+            supersedes: [otherLineageLesson]
+          },
+          metrics: { elapsedSeconds: 0 }
+        };
+      },
+      name: "mock",
+      async healthCheck() {
+        return true;
+      }
+    };
+
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const personas = {
+      snapshotId: (_agent: string) => "vC",
+      resolve: (_agent: string) => "reflector-prompt"
+    };
+    const skills = { skillsForAgent: () => [] };
+
+    const res = await reflectOnTask("t", {
+      db,
+      executor: mockExecutor as any,
+      personas: personas as any,
+      skills: skills as any,
+      workingDirectory: "/tmp",
+      recordEvent: (e) => events.push({ type: e.type, payload: e.payload })
+    });
+
+    expect(res.lessonId).not.toBeNull();
+    const old = db.sqlite
+      .query("SELECT status, superseded_by FROM lessons WHERE id = ?")
+      .get(otherLineageLesson) as { status: string; superseded_by: string | null };
+    expect(old.status).toBe("active");
+    expect(old.superseded_by).toBeNull();
+    expect(events.find((e) => e.type === "lessons_superseded")).toBeUndefined();
+    const rejected = events.find((e) => e.type === "lessons_supersession_rejected");
+    expect(rejected).toBeDefined();
+    expect(rejected!.payload.requested_ids).toEqual([otherLineageLesson]);
+    expect(rejected!.payload.rejected_ids).toEqual([otherLineageLesson]);
+  });
 });

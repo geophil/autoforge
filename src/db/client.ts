@@ -284,20 +284,37 @@ export class DbClient {
     }) as LessonRow[];
   }
 
-  supersedeLessons(oldIds: string[], newLessonId: string): void {
-    if (oldIds.length === 0) return;
+  supersedeLessons(oldIds: string[], newLessonId: string): { transitioned: string[]; rejected: string[] } {
+    if (oldIds.length === 0) return { transitioned: [], rejected: [] };
+    const replacement = this.sqlite
+      .query("SELECT agent_type, lineage_root_id FROM lessons WHERE id = ?")
+      .get(newLessonId) as { agent_type: string; lineage_root_id: string } | null;
+    if (!replacement) return { transitioned: [], rejected: oldIds };
+    const transitioned: string[] = [];
+    const rejected: string[] = [];
     const stmt = this.sqlite.query(`
       UPDATE lessons
          SET status = 'superseded',
              superseded_by = $new_id,
              retired_at = datetime('now')
-       WHERE id = $id AND status = 'active'
+       WHERE id = $id
+         AND status = 'active'
+         AND agent_type = $agent_type
+         AND lineage_root_id = $lineage_root_id
     `);
     this.sqlite.transaction(() => {
       for (const id of oldIds) {
-        stmt.run({ $new_id: newLessonId, $id: id });
+        const info = stmt.run({
+          $new_id: newLessonId,
+          $id: id,
+          $agent_type: replacement.agent_type,
+          $lineage_root_id: replacement.lineage_root_id
+        });
+        if (info.changes === 1) transitioned.push(id);
+        else rejected.push(id);
       }
     })();
+    return { transitioned, rejected };
   }
 
   updateTrafficShare(variantId: string, trafficShare: number): void {
@@ -825,6 +842,12 @@ export class DbClient {
     const row = this.sqlite.query("SELECT id, archived_at FROM tasks WHERE id = ?").get(taskId) as { id: string; archived_at: string | null } | null;
     if (!row) throw new Error(`Task not found: ${taskId}`);
     if (!row.archived_at) throw new Error(`Task must be archived before permanent deletion: ${taskId}`);
+    const lessonCount = (this.sqlite
+      .query("SELECT COUNT(*) AS count FROM lessons WHERE source_task_id = ?")
+      .get(taskId) as { count: number }).count;
+    if (lessonCount > 0) {
+      throw new Error(`Cannot permanently delete task ${taskId}: ${lessonCount} lesson(s) reference it`);
+    }
     this.sqlite.transaction(() => {
       this.sqlite.query("DELETE FROM subtasks WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM review_findings WHERE task_id = ?").run(taskId);
@@ -833,7 +856,6 @@ export class DbClient {
       this.sqlite.query("DELETE FROM routing_calibration WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM task_iteration_diffs WHERE task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM task_diff_stats WHERE task_id = ?").run(taskId);
-      this.sqlite.query("DELETE FROM lessons WHERE source_task_id = ?").run(taskId);
       this.sqlite.query("DELETE FROM tasks WHERE id = ?").run(taskId);
     })();
   }

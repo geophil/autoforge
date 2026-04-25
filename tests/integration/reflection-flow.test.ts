@@ -196,4 +196,27 @@ describe("reflection flow", () => {
       cleanup();
     }
   });
+
+  test("critiquePlan missing-worktree failure still records reflection evidence", async () => {
+    const { service, db, cleanup } = createTestService();
+    try {
+      const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
+      expect(task.state).toBe("awaiting_plan_approval");
+
+      (service as unknown as { cleanupWorktree: (taskId: string) => void }).cleanupWorktree(task.id);
+
+      await expect(service.critiquePlan(task.id, "please rewrite the plan")).rejects.toThrow(/worktree missing/i);
+
+      const failed = service.getTask(task.id);
+      expect(failed?.state).toBe("failed");
+      const reflectorEvents = db.sqlite
+        .query(
+          "SELECT id FROM events WHERE task_id = ? AND event_type IN ('reflector_skipped', 'reflector_failed', 'lesson_inserted')"
+        )
+        .all(task.id) as Array<{ id: string }>;
+      expect(reflectorEvents.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      cleanup();
+    }
+  });
 });

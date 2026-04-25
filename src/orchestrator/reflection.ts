@@ -228,16 +228,33 @@ export async function reflectOnTask(
     if (Array.isArray(supersedesRaw) && supersedesRaw.length > 0) {
       const idList = supersedesRaw.filter((x): x is string => typeof x === "string");
       if (idList.length > 0) {
-        deps.db.supersedeLessons(idList, id);
-        deps.recordEvent({
-          taskId,
-          projectId: task.projectId,
-          type: "lessons_superseded",
-          agent: "reflector",
-          status: "done",
-          payload: { new_lesson_id: id, superseded_ids: idList },
-          budgetSeconds: REFLECTION_CONFIG.budgetSeconds
-        });
+        const supersession = deps.db.supersedeLessons(idList, id);
+        if (supersession.transitioned.length > 0) {
+          deps.recordEvent({
+            taskId,
+            projectId: task.projectId,
+            type: "lessons_superseded",
+            agent: "reflector",
+            status: "done",
+            payload: { new_lesson_id: id, superseded_ids: supersession.transitioned },
+            budgetSeconds: REFLECTION_CONFIG.budgetSeconds
+          });
+        }
+        if (supersession.rejected.length > 0) {
+          deps.recordEvent({
+            taskId,
+            projectId: task.projectId,
+            type: "lessons_supersession_rejected",
+            agent: "reflector",
+            status: "blocked",
+            payload: {
+              new_lesson_id: id,
+              requested_ids: idList,
+              rejected_ids: supersession.rejected
+            },
+            budgetSeconds: REFLECTION_CONFIG.budgetSeconds
+          });
+        }
       }
     }
 

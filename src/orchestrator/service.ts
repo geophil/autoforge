@@ -110,6 +110,12 @@ export class OrchestratorService {
     if (!task.archivedAt) {
       throw new Error(`Cannot delete task ${taskId}: task must be archived before permanent deletion`);
     }
+    const lessonCount = (this.deps.db.sqlite
+      .query("SELECT COUNT(*) AS count FROM lessons WHERE source_task_id = ?")
+      .get(taskId) as { count: number }).count;
+    if (lessonCount > 0) {
+      throw new Error(`Cannot permanently delete task ${taskId}: ${lessonCount} lesson(s) reference it`);
+    }
     this.recordEvent({
       taskId,
       projectId: task.projectId,
@@ -454,6 +460,16 @@ export class OrchestratorService {
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (!worktreePath) {
       this.transition(taskId, task.projectId, "replanning", "failed", { reason: "worktree missing" });
+      this.captureTaskDiffStats(taskId);
+      try {
+        await this.reflectOnTask(taskId);
+      } catch (reflectErr) {
+        console.warn(
+          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+        );
+      } finally {
+        this.cleanupWorktree(taskId);
+      }
       throw new Error(`Worktree missing for task ${taskId}`);
     }
 
@@ -472,6 +488,16 @@ export class OrchestratorService {
       this.transition(taskId, task.projectId, "replanning", "failed", {
         reason: err instanceof Error ? err.message : String(err)
       });
+      this.captureTaskDiffStats(taskId);
+      try {
+        await this.reflectOnTask(taskId);
+      } catch (reflectErr) {
+        console.warn(
+          `[orchestrator] reflectOnTask threw for ${taskId}: ${(reflectErr as Error).message ?? reflectErr}`
+        );
+      } finally {
+        this.cleanupWorktree(taskId);
+      }
       throw err;
     }
 

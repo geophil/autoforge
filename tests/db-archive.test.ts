@@ -104,6 +104,21 @@ function insertTaskIterationDiff(db: DbClient, taskId: string, fromIteration: nu
     .run(taskId, fromIteration, toIteration, 2, 5, 1, 1);
 }
 
+function insertLessonForTask(db: DbClient, taskId: string): string {
+  db.sqlite.query(
+    "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share) VALUES ('v-lesson','persona:coder','1','seed','baseline',1.0)"
+  ).run();
+  return db.insertLesson({
+    agentType: "coder",
+    lineageRootId: "v-lesson",
+    sourceTaskId: taskId,
+    sourceVariantId: "v-lesson",
+    triggerPattern: "archived task evidence",
+    body: "TRIGGER\nOBSERVATION\nPRINCIPLE\nEVIDENCE",
+    outcomeKind: "corrective"
+  });
+}
+
 describe("DbClient.archiveTask", () => {
   test("sets archived_at to a non-null ISO-ish timestamp", () => {
     const db = freshDb();
@@ -205,6 +220,21 @@ describe("DbClient.deleteTaskPermanently", () => {
     expect(diffStats).toHaveLength(0);
     const iterationDiffs = db.sqlite.query("SELECT * FROM task_iteration_diffs WHERE task_id = ?").all("task-6");
     expect(iterationDiffs).toHaveLength(0);
+  });
+
+  test("refuses to delete archived tasks that have durable lessons", () => {
+    const db = freshDb();
+    insertArchivedTask(db, "task-with-lesson");
+    const lessonId = insertLessonForTask(db, "task-with-lesson");
+
+    expect(() => db.deleteTaskPermanently("task-with-lesson")).toThrow(/lesson/i);
+
+    expect(db.getTask("task-with-lesson")).not.toBeNull();
+    const lesson = db.sqlite
+      .query("SELECT status FROM lessons WHERE id = ?")
+      .get(lessonId) as { status: string } | null;
+    expect(lesson).not.toBeNull();
+    expect(lesson!.status).toBe("active");
   });
 });
 
