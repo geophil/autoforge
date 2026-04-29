@@ -1,7 +1,8 @@
 import { defaultDispatchConfig, type DispatchConfig } from "../config/dispatch";
 import type { DbClient, DispatchVariantRow } from "../db/client";
 import type { AgentType, Tier } from "../types/core";
-import { filterBySpecialty } from "./specialty-match";
+import { filterSpecialtyEligible } from "./classifier";
+import { createDeterministicEmbeddingProvider, type EmbeddingProvider } from "./embedding";
 
 export interface SelectionResult {
   variantId: string;
@@ -14,6 +15,7 @@ export interface SelectionResult {
 interface DispatcherOptions {
   random?: () => number;
   config?: Partial<DispatchConfig>;
+  embeddingProvider?: EmbeddingProvider;
 }
 
 interface TaskContext {
@@ -25,12 +27,13 @@ interface TaskContext {
 export function createDispatcher(
   db: DbClient,
   opts: DispatcherOptions = {}
-): { selectVariant(agentType: AgentType, taskContext: TaskContext): SelectionResult } {
+): { selectVariant(agentType: AgentType, taskContext: TaskContext): Promise<SelectionResult> } {
   const random = opts.random ?? Math.random;
   const config = { ...defaultDispatchConfig, ...opts.config };
+  const embeddingProvider = opts.embeddingProvider ?? createDeterministicEmbeddingProvider();
 
   return {
-    selectVariant(agentType: AgentType, taskContext: TaskContext): SelectionResult {
+    async selectVariant(agentType: AgentType, taskContext: TaskContext): Promise<SelectionResult> {
       const population = db.loadDispatchPopulation(agentType);
       if (population.length === 1) {
         return {
@@ -42,54 +45,66 @@ export function createDispatcher(
         };
       }
 
-      const eligible = filterBySpecialty(population, taskContext.description);
-      if (eligible.length === 0) {
-        throw new Error(`No dispatch variants eligible for ${agentType}`);
-      }
-
-      const eligibleVariantIds = eligible.map((variant) => variant.id);
-      const shadowVariantIds = selectShadowVariants(eligible, config.maxShadowVariantsPerAgentType);
-      const baseline = eligible.find((variant) => variant.status === "baseline");
-      if (!baseline) {
-        throw new Error(`No baseline dispatch variant for ${agentType}`);
-      }
-
-      const active = eligible.filter((variant) => variant.status === "active");
-      const competitors = active;
-      const baselineBucket = Math.max(config.baselineMinTrafficShare, baseline.traffic_share);
-      const explorationBucket = competitors.length > 0 ? config.epsilon : 0;
-      const exploitationBucket = active.length > 0
-        ? Math.max(0, 1 - baselineBucket - explorationBucket)
-        : 0;
-      const bucketRoll = random();
-
-      if (bucketRoll < baselineBucket) {
-        return selection(baseline, agentType, "baseline", shadowVariantIds, eligibleVariantIds);
-      }
-
-      if (bucketRoll < baselineBucket + explorationBucket && competitors.length > 0) {
-        return selection(
-          selectUniform(competitors, random()),
-          agentType,
-          "exploration",
-          shadowVariantIds,
-          eligibleVariantIds
-        );
-      }
-
-      if (bucketRoll < baselineBucket + explorationBucket + exploitationBucket && active.length > 0) {
-        return selection(
-          selectWeighted(active, random()),
-          agentType,
-          "exploitation",
-          shadowVariantIds,
-          eligibleVariantIds
-        );
-      }
-
-      return selection(baseline, agentType, "baseline", shadowVariantIds, eligibleVariantIds);
+      const eligible = await filterSpecialtyEligible(population, taskContext.description, {
+        provider: embeddingProvider,
+        similarityThreshold: config.similarityThreshold
+      });
+      return chooseFromEligible(agentType, eligible, random, config);
     }
   };
+}
+
+export function chooseFromEligible(
+  agentType: AgentType,
+  eligible: DispatchVariantRow[],
+  random: () => number,
+  config: DispatchConfig
+): SelectionResult {
+  if (eligible.length === 0) {
+    throw new Error(`No dispatch variants eligible for ${agentType}`);
+  }
+
+  const eligibleVariantIds = eligible.map((variant) => variant.id);
+  const shadowVariantIds = selectShadowVariants(eligible, config.maxShadowVariantsPerAgentType);
+  const baseline = eligible.find((variant) => variant.status === "baseline");
+  if (!baseline) {
+    throw new Error(`No baseline dispatch variant for ${agentType}`);
+  }
+
+  const active = eligible.filter((variant) => variant.status === "active");
+  const competitors = active;
+  const baselineBucket = Math.max(config.baselineMinTrafficShare, baseline.traffic_share);
+  const explorationBucket = competitors.length > 0 ? config.epsilon : 0;
+  const exploitationBucket = active.length > 0
+    ? Math.max(0, 1 - baselineBucket - explorationBucket)
+    : 0;
+  const bucketRoll = random();
+
+  if (bucketRoll < baselineBucket) {
+    return selection(baseline, agentType, "baseline", shadowVariantIds, eligibleVariantIds);
+  }
+
+  if (bucketRoll < baselineBucket + explorationBucket && competitors.length > 0) {
+    return selection(
+      selectUniform(competitors, random()),
+      agentType,
+      "exploration",
+      shadowVariantIds,
+      eligibleVariantIds
+    );
+  }
+
+  if (bucketRoll < baselineBucket + explorationBucket + exploitationBucket && active.length > 0) {
+    return selection(
+      selectWeighted(active, random()),
+      agentType,
+      "exploitation",
+      shadowVariantIds,
+      eligibleVariantIds
+    );
+  }
+
+  return selection(baseline, agentType, "baseline", shadowVariantIds, eligibleVariantIds);
 }
 
 function selection(

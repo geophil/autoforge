@@ -38,6 +38,37 @@ export interface LessonRow {
   retired_at: string | null;
 }
 
+export interface ForkProposalInsert {
+  id: string;
+  agentType: string;
+  label: string;
+  keywords: string;
+  suggestedSpecialty: string;
+  representativeTaskIds: string[];
+  baselineScoreMean: number;
+  populationScoreMean: number;
+  scoreGap: number;
+  recommendationStrength: "weak" | "moderate" | "strong";
+}
+
+export interface ForkProposalRow {
+  id: string;
+  agent_type: string;
+  generated_at: string;
+  generator: string;
+  label: string;
+  keywords: string;
+  suggested_specialty: string;
+  representative_task_ids: string;
+  baseline_score_mean: number;
+  population_score_mean: number;
+  score_gap: number;
+  recommendation_strength: "weak" | "moderate" | "strong";
+  status: "open" | "acted_on" | "stale" | "dismissed";
+  acted_on_experiment_id: string | null;
+  closed_at: string | null;
+}
+
 export interface TrafficAllocatedEventInput {
   variantId: string;
   agentType: string;
@@ -57,6 +88,7 @@ export interface DispatchVariantRow {
   traffic_share: number;
   parent_version_id: string | null;
   specialty: string | null;
+  specialty_embedding: Buffer | null;
   created_at: string;
 }
 
@@ -236,6 +268,150 @@ export class DbClient {
     return this.sqlite.transaction(fn)();
   }
 
+  insertForkProposal(input: ForkProposalInsert): boolean {
+    const result = this.sqlite.query(`
+      INSERT INTO fork_proposals
+        (id, agent_type, label, keywords, suggested_specialty, representative_task_ids,
+         baseline_score_mean, population_score_mean, score_gap, recommendation_strength)
+      VALUES
+        ($id, $agent_type, $label, $keywords, $suggested_specialty, $representative_task_ids,
+         $baseline_score_mean, $population_score_mean, $score_gap, $recommendation_strength)
+      ON CONFLICT(id) DO NOTHING
+    `).run({
+      $id: input.id,
+      $agent_type: input.agentType,
+      $label: input.label,
+      $keywords: input.keywords,
+      $suggested_specialty: input.suggestedSpecialty,
+      $representative_task_ids: JSON.stringify(input.representativeTaskIds),
+      $baseline_score_mean: input.baselineScoreMean,
+      $population_score_mean: input.populationScoreMean,
+      $score_gap: input.scoreGap,
+      $recommendation_strength: input.recommendationStrength
+    });
+    return result.changes === 1;
+  }
+
+  listOpenForkProposals(agentType?: string): ForkProposalRow[] {
+    if (agentType) {
+      return this.sqlite.query(`
+        SELECT * FROM fork_proposals
+         WHERE status = 'open' AND agent_type = ?
+         ORDER BY generated_at DESC, id ASC
+      `).all(agentType) as ForkProposalRow[];
+    }
+    return this.sqlite.query(`
+      SELECT * FROM fork_proposals
+       WHERE status = 'open'
+       ORDER BY generated_at DESC, id ASC
+    `).all() as ForkProposalRow[];
+  }
+
+  getForkProposal(id: string): ForkProposalRow | null {
+    const row = this.sqlite.query("SELECT * FROM fork_proposals WHERE id = ?").get(id) as ForkProposalRow | undefined;
+    return row ?? null;
+  }
+
+  markForkProposalActedOn(proposalId: string, experimentId: string): boolean {
+    const result = this.sqlite.query(`
+      UPDATE fork_proposals
+         SET status = 'acted_on', acted_on_experiment_id = ?, closed_at = datetime('now')
+       WHERE id = ? AND status = 'open'
+    `).run(experimentId, proposalId);
+    return result.changes === 1;
+  }
+
+  markStaleForkProposals(daysOld: number): number {
+    const result = this.sqlite.query(`
+      UPDATE fork_proposals
+         SET status = 'stale', closed_at = datetime('now')
+       WHERE status = 'open'
+         AND generated_at < datetime('now', '-' || ? || ' days')
+    `).run(daysOld);
+    return result.changes;
+  }
+
+  isFirstForkForLineage(parentVariantId: string): boolean {
+    const lineageRootId = this.resolveLineageRoot(parentVariantId) ?? parentVariantId;
+    const row = this.sqlite.query(`
+      WITH RECURSIVE lineage(id) AS (
+        SELECT id
+          FROM skill_versions
+         WHERE id = ?
+        UNION ALL
+        SELECT child.id
+          FROM skill_versions child
+          JOIN lineage parent ON child.parent_version_id = parent.id
+      )
+      SELECT COUNT(*) AS n
+        FROM skill_versions sv
+        JOIN lineage ON lineage.id = sv.id
+       WHERE sv.id != ?
+         AND sv.specialty IS NOT NULL
+         AND sv.status IN ('baseline', 'active')
+    `).get(lineageRootId, lineageRootId) as { n: number };
+    return row.n === 0;
+  }
+
+  loadDiagnosticTaskHistory(agentType: string, limit: number): Array<Record<string, unknown>> {
+    return this.sqlite.query(`
+      WITH latest_variant_selected AS (
+        SELECT task_id, payload
+        FROM (
+          SELECT
+            e.task_id,
+            e.payload,
+            ROW_NUMBER() OVER (
+              PARTITION BY e.task_id
+              ORDER BY e.timestamp DESC, e.rowid DESC
+            ) AS rn
+          FROM events e
+          WHERE e.event_type = 'variant_selected'
+            AND json_extract(e.payload, '$.agent_type') = ?
+        )
+        WHERE rn = 1
+      )
+      SELECT
+        t.id AS task_id,
+        t.description,
+        t.tier,
+        t.project_id,
+        t.state,
+        tqs.r_correctness,
+        tqs.r_simplicity,
+        tqs.r_alignment,
+        tqs.r_fidelity,
+        tqs.r_efficiency,
+        tds.lines_added,
+        tds.lines_deleted,
+        e.payload AS selection_payload,
+        COALESCE((
+          SELECT json_group_array(json_object('category', rf.category, 'severity', rf.severity))
+          FROM review_findings rf
+          WHERE rf.task_id = t.id
+        ), '[]') AS review_findings,
+        (
+          SELECT fa.payload
+          FROM events fa
+          WHERE fa.task_id = t.id
+            AND fa.event_type = 'failure_analysis'
+          ORDER BY fa.timestamp DESC, fa.rowid DESC
+          LIMIT 1
+        ) AS failure_analysis_payload
+      FROM latest_variant_selected e
+      JOIN tasks t ON t.id = e.task_id
+      LEFT JOIN task_quality_score tqs ON tqs.task_id = t.id
+      LEFT JOIN task_diff_stats tds ON tds.task_id = t.id
+      WHERE t.state IN ('completed', 'failed')
+      ORDER BY t.updated_at DESC
+      LIMIT ?
+    `).all(agentType, limit) as Array<Record<string, unknown>>;
+  }
+
+  updateSpecialtyEmbedding(variantId: string, embedding: Buffer): void {
+    this.sqlite.query("UPDATE skill_versions SET specialty_embedding = ? WHERE id = ?").run(embedding, variantId);
+  }
+
   insertTaskDiffStats(taskId: string, stats: {
     files_changed: number;
     files_added: number;
@@ -359,7 +535,7 @@ export class DbClient {
 
   loadDispatchPopulation(agentType: AgentType): DispatchVariantRow[] {
     return this.sqlite.query(`
-      SELECT id, skill_name, content, status, traffic_share, parent_version_id, specialty, created_at
+      SELECT id, skill_name, content, status, traffic_share, parent_version_id, specialty, specialty_embedding, created_at
         FROM skill_versions
        WHERE skill_name = ?
          AND status IN ('baseline', 'active', 'candidate')
@@ -457,6 +633,11 @@ export class DbClient {
 
   loadRecentSelectedTaskScores(variantId: string, window: { limit: number; maxAgeDays: number }): VariantScore[] {
     return this.loadRecentTaskScoresForRationales(variantId, window, ["baseline", "only_eligible", "exploitation", "exploration"]);
+  }
+
+  loadRecentCompositeScoresForVariant(variantId: string, limit: number): number[] {
+    return this.loadRecentSelectedTaskScores(variantId, { limit, maxAgeDays: 60 })
+      .map((score) => score.composite);
   }
 
   loadRecentBaselineTaskScores(variantId: string, window: { limit: number; maxAgeDays: number }): VariantScore[] {

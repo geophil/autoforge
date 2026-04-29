@@ -22,12 +22,13 @@ function seedVariant(
   id: string,
   skill: string,
   status: "baseline" | "candidate" | "active" | "demoted" | "retired" = "baseline",
-  share = 1.0
+  share = 1.0,
+  parentId: string | null = null
 ): void {
   db.sqlite.query(
-    `INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share)
-     VALUES (?, ?, '1', 'seed-content', ?, ?)`
-  ).run(id, skill, status, share);
+    `INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share, parent_version_id)
+     VALUES (?, ?, '1', 'seed-content', ?, ?, ?)`
+  ).run(id, skill, status, share, parentId);
 }
 
 function makeWorktreeWithProposal(content: string): string {
@@ -70,6 +71,29 @@ function seedLesson(db: DbClient, variantId: string, taskId = "t1"): string {
     body: "b",
     outcomeKind: "corrective"
   });
+}
+
+function seedForkProposal(
+  db: DbClient,
+  id: string,
+  agentType = "coder",
+  status: "open" | "acted_on" | "stale" | "dismissed" = "open"
+): void {
+  db.insertForkProposal({
+    id,
+    agentType,
+    label: "UI cluster",
+    keywords: "ui,react",
+    suggestedSpecialty: "frontend React",
+    representativeTaskIds: ["t1"],
+    baselineScoreMean: 0.4,
+    populationScoreMean: 0.7,
+    scoreGap: 0.3,
+    recommendationStrength: "strong"
+  });
+  if (status !== "open") {
+    db.sqlite.query("UPDATE fork_proposals SET status = ? WHERE id = ?").run(status, id);
+  }
 }
 
 function forceExperimentInsertionFailure(db: DbClient): void {
@@ -514,7 +538,7 @@ describe("handleMetaOperation — retire", () => {
 });
 
 describe("handleMetaOperation — fork (stub)", () => {
-  test("creates a proposed experiment with content stashed, no new skill_versions row", () => {
+  test("rejects a first fork without fork proposal evidence", () => {
     const db = freshDb();
     seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
     const worktree = makeWorktreeWithProposal("# Forked frontend variant");
@@ -525,6 +549,128 @@ describe("handleMetaOperation — fork (stub)", () => {
       specialty: "frontend React",
       hypothesis: "h",
       evidence: { task_ids: ["t1"] },
+      proposed_content_file: "proposed-persona.md"
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-first-missing-proposal", worktreePath: worktree, projectId: "p"
+    });
+
+    expect(res).toEqual({ ok: false, reason: "fork_proposal_required" });
+    expect(experimentCount(db)).toBe(0);
+  });
+
+  test("accepts a first fork with a matching open proposal", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedForkProposal(db, "fp-coder", "coder");
+    const worktree = makeWorktreeWithProposal("# Forked frontend variant");
+
+    const op: MetaOperation = {
+      kind: "fork",
+      parent_variant_id: "vBase",
+      specialty: "frontend React",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"], fork_proposal_id: "fp-coder" },
+      proposed_content_file: "proposed-persona.md"
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-first-open-proposal", worktreePath: worktree, projectId: "p"
+    });
+
+    expect(res.ok).toBe(true);
+    const exp = db.sqlite.query("SELECT evidence, status FROM experiments WHERE id = ?")
+      .get(res.experimentId as string) as { evidence: string; status: string };
+    expect(exp.status).toBe("proposed");
+    expect(JSON.parse(exp.evidence).fork_proposal_id).toBe("fp-coder");
+  });
+
+  test("rejects a first fork when proposal agent does not match parent", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedForkProposal(db, "fp-doc", "doc");
+    const worktree = makeWorktreeWithProposal("# Forked frontend variant");
+
+    const op: MetaOperation = {
+      kind: "fork",
+      parent_variant_id: "vBase",
+      specialty: "frontend React",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"], fork_proposal_id: "fp-doc" },
+      proposed_content_file: "proposed-persona.md"
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-wrong-agent-proposal", worktreePath: worktree, projectId: "p"
+    });
+
+    expect(res).toEqual({ ok: false, reason: "fork_proposal_agent_mismatch" });
+    expect(experimentCount(db)).toBe(0);
+  });
+
+  test("allows a later fork in an approved lineage without proposal evidence", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 0.8);
+    seedVariant(db, "vApprovedFork", "persona:coder", "active", 0.2, "vBase");
+    db.sqlite.query("UPDATE skill_versions SET specialty = 'frontend React' WHERE id = 'vApprovedFork'").run();
+    const worktree = makeWorktreeWithProposal("# Follow-up fork");
+
+    const op: MetaOperation = {
+      kind: "fork",
+      parent_variant_id: "vBase",
+      specialty: "backend API",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"] },
+      proposed_content_file: "proposed-persona.md"
+    };
+
+    const res = handleMetaOperation({
+      db, operation: op, metaTaskId: "mt-later-fork", worktreePath: worktree, projectId: "p"
+    });
+
+    expect(res.ok).toBe(true);
+    expect(experimentCount(db)).toBe(1);
+  });
+
+  test("does not treat candidate, demoted, or retired descendants as approved lineage forks", () => {
+    for (const status of ["candidate", "demoted", "retired"] as const) {
+      const db = freshDb();
+      seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+      seedVariant(db, `v${status}`, "persona:coder", status, 0, "vBase");
+      db.sqlite.query("UPDATE skill_versions SET specialty = 'frontend React' WHERE id = ?").run(`v${status}`);
+      const worktree = makeWorktreeWithProposal("# Follow-up fork");
+
+      const op: MetaOperation = {
+        kind: "fork",
+        parent_variant_id: "vBase",
+        specialty: "backend API",
+        hypothesis: "h",
+        evidence: { task_ids: ["t1"] },
+        proposed_content_file: "proposed-persona.md"
+      };
+
+      const res = handleMetaOperation({
+        db, operation: op, metaTaskId: `mt-${status}-descendant`, worktreePath: worktree, projectId: "p"
+      });
+
+      expect(res).toEqual({ ok: false, reason: "fork_proposal_required" });
+      expect(experimentCount(db)).toBe(0);
+    }
+  });
+
+  test("creates a proposed experiment with content stashed, no new skill_versions row", () => {
+    const db = freshDb();
+    seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedForkProposal(db, "fp-coder", "coder");
+    const worktree = makeWorktreeWithProposal("# Forked frontend variant");
+
+    const op: MetaOperation = {
+      kind: "fork",
+      parent_variant_id: "vBase",
+      specialty: "frontend React",
+      hypothesis: "h",
+      evidence: { task_ids: ["t1"], fork_proposal_id: "fp-coder" },
       proposed_content_file: "proposed-persona.md"
     };
 
@@ -690,6 +836,7 @@ describe("handleMetaOperation — proposed ops defer retire_lessons", () => {
   test("fork stores retire_lessons as pending, does not retire them yet", () => {
     const db = freshDb();
     seedVariant(db, "vBase", "persona:coder", "baseline", 1.0);
+    seedForkProposal(db, "fp-coder", "coder");
     db.sqlite.query(
       `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
        VALUES ('t1','p','d','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))`
@@ -705,7 +852,7 @@ describe("handleMetaOperation — proposed ops defer retire_lessons", () => {
       parent_variant_id: "vBase",
       specialty: "frontend",
       hypothesis: "h",
-      evidence: { task_ids: ["t1"] },
+      evidence: { task_ids: ["t1"], fork_proposal_id: "fp-coder" },
       proposed_content_file: "proposed-persona.md",
       retire_lessons: [{ id: lessonId, reason: "superseded" }]
     };

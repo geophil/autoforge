@@ -48,6 +48,28 @@ export function mannWhitneyULess(sampleA: number[], sampleB: number[]): Statisti
   return mannWhitneyU(sampleA, sampleB, "less");
 }
 
+export function kolmogorovSmirnovTwoSample(sampleA: number[], sampleB: number[]): StatisticalTestResult {
+  const a = sampleA.filter(Number.isFinite).sort((left, right) => left - right);
+  const b = sampleB.filter(Number.isFinite).sort((left, right) => left - right);
+  if (a.length === 0 || b.length === 0) {
+    return { pValue: 1, effect: 0, n: 0 };
+  }
+
+  let i = 0;
+  let j = 0;
+  let d = 0;
+  while (i < a.length || j < b.length) {
+    const next = j >= b.length || (i < a.length && a[i] <= b[j]) ? a[i] : b[j];
+    while (i < a.length && a[i] <= next) i += 1;
+    while (j < b.length && b[j] <= next) j += 1;
+    d = Math.max(d, Math.abs(i / a.length - j / b.length));
+  }
+
+  const nEff = (a.length * b.length) / (a.length + b.length);
+  const pValue = Math.min(1, 2 * Math.exp(-2 * nEff * d * d));
+  return { pValue: clampPValue(pValue), effect: mean(a) - mean(b), n: a.length + b.length };
+}
+
 function mannWhitneyU(sampleA: number[], sampleB: number[], direction: "greater" | "less"): StatisticalTestResult {
   const finiteA = sampleA.filter(Number.isFinite);
   const finiteB = sampleB.filter(Number.isFinite);

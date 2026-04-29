@@ -4,8 +4,15 @@ import { basename, relative, resolve } from "node:path";
 import type { DbClient } from "../db/client";
 import { adjustVariantAllocation } from "./allocation";
 import type { MetaOperation } from "../schemas/meta-output";
+import { kolmogorovSmirnovTwoSample } from "./sequential-test";
 
 const MAX_TRAFFIC_SHARE = 1.0;
+
+function agentTypeForSkillName(skillName: string): string {
+  return skillName.startsWith("persona:")
+    ? skillName.slice("persona:".length)
+    : skillName;
+}
 
 export interface MetaOperationContext {
   db: DbClient;
@@ -55,6 +62,17 @@ interface RetireLessonValidation {
   reason?: string;
 }
 
+interface MergeVariantRow {
+  id: string;
+  skill_name: string;
+  status: string;
+  traffic_share: number;
+  parent_version_id: string | null;
+  specialty: string | null;
+  content: string;
+  created_at: string;
+}
+
 function validateRetireLessons(ctx: MetaOperationContext, lineageVariantId: string): RetireLessonValidation {
   const ids = (ctx.operation.retire_lessons ?? []).map((e) => e.id);
   if (ids.length === 0) return { ok: true, ids };
@@ -84,6 +102,15 @@ function applyRetireLessons(ctx: MetaOperationContext, ids: string[]): string[] 
 
 function pendingRetireLessonIds(ids: string[]): string[] {
   return ids;
+}
+
+export function mergeSpecialtyText(a: string | null | undefined, b: string | null | undefined): string {
+  const parts = [a, b]
+    .map((part) => part?.trim())
+    .filter((part): part is string => Boolean(part));
+  const uniqueParts = [...new Set(parts)];
+  const merged = uniqueParts.length === 0 ? "merged variant" : uniqueParts.join(" + ");
+  return merged.length <= 150 ? merged : merged.slice(0, 147).trimEnd() + "...";
 }
 
 function handleEdit(ctx: MetaOperationContext): MetaOperationResult {
@@ -141,6 +168,17 @@ function handleFork(ctx: MetaOperationContext): MetaOperationResult {
   if (!parent) return { ok: false, reason: "parent_not_found" };
   const retireLessons = validateRetireLessons(ctx, parent.id);
   if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
+  const proposalId = op.evidence.fork_proposal_id ?? null;
+  if (ctx.db.isFirstForkForLineage(parent.id)) {
+    if (!proposalId) return { ok: false, reason: "fork_proposal_required" };
+    const proposal = ctx.db.getForkProposal(proposalId);
+    if (!proposal || proposal.status !== "open") {
+      return { ok: false, reason: "fork_proposal_not_open" };
+    }
+    if (proposal.agent_type !== agentTypeForSkillName(parent.skill_name)) {
+      return { ok: false, reason: "fork_proposal_agent_mismatch" };
+    }
+  }
   const content = readProposedContent(ctx.worktreePath, op.proposed_content_file);
   if (!content || content.trim().length === 0) {
     return { ok: false, reason: "proposed_content_empty" };
@@ -172,35 +210,153 @@ function handleFork(ctx: MetaOperationContext): MetaOperationResult {
 
 function handleMerge(ctx: MetaOperationContext): MetaOperationResult {
   const op = ctx.operation as Extract<MetaOperation, { kind: "merge" }>;
-  if (!ctx.db.getSkillVersionById(op.target_variant_id)) {
+  const target = getMergeVariant(ctx.db, op.target_variant_id);
+  if (!target) {
     return { ok: false, reason: "target_not_found" };
   }
-  const retireLessons = validateRetireLessons(ctx, op.target_variant_id);
+  if (op.target_variant_id === op.merge_source_variant_id) {
+    return { ok: false, reason: "merge_requires_distinct_variants" };
+  }
+  const retireLessons = validateRetireLessons(ctx, target.id);
   if (!retireLessons.ok) return { ok: false, reason: retireLessons.reason };
-  if (!ctx.db.getSkillVersionById(op.merge_source_variant_id)) {
+  const source = getMergeVariant(ctx.db, op.merge_source_variant_id);
+  if (!source) {
     return { ok: false, reason: "merge_source_not_found" };
   }
+  if (target.skill_name !== source.skill_name) {
+    return { ok: false, reason: "merge_agent_type_mismatch" };
+  }
+  if (target.status !== "active" || source.status !== "active") {
+    return { ok: false, reason: "merge_requires_active_variants" };
+  }
+
+  const targetLineageRoot = ctx.db.resolveLineageRoot(target.id) ?? target.id;
+  const sourceLineageRoot = ctx.db.resolveLineageRoot(source.id) ?? source.id;
+  if (targetLineageRoot !== sourceLineageRoot) {
+    return { ok: false, reason: "merge_lineage_mismatch" };
+  }
+
+  const targetScores = ctx.db.loadRecentCompositeScoresForVariant(target.id, 30);
+  const sourceScores = ctx.db.loadRecentCompositeScoresForVariant(source.id, 30);
+  if (targetScores.length < 30 || sourceScores.length < 30) {
+    return { ok: false, reason: "merge_insufficient_observations" };
+  }
+
+  const ks = kolmogorovSmirnovTwoSample(targetScores, sourceScores);
+  if (ks.pValue < 0.30 || Math.abs(ks.effect) >= 0.03) {
+    return { ok: false, reason: "merge_not_indistinguishable" };
+  }
+
+  const selection = selectMergeSurvivor(target, source, mean(targetScores), mean(sourceScores));
+  const survivor = selection.survivor;
+  const loser = selection.loser;
+  const mergedSpecialty = mergeSpecialtyText(target.specialty, source.specialty);
 
   const experimentId = randomUUID();
-  ctx.db.transaction(() => {
+  const result = ctx.db.transaction<MetaOperationResult>(() => {
+    const allocation = adjustVariantAllocation(
+      ctx.db,
+      loser.id,
+      { kind: "set_status", newStatus: "retired", newTrafficShare: 0 },
+      "meta_merge",
+      { meta_task_id: ctx.metaTaskId, experiment_id: experimentId, kept_variant_id: survivor.id }
+    );
+    if (!allocation.ok) return { ok: false, reason: allocation.reason };
+
+    ctx.db.sqlite.query(
+      "UPDATE skill_versions SET specialty = ?, specialty_embedding = NULL WHERE id = ?"
+    ).run(mergedSpecialty, survivor.id);
+
     ctx.db.insertMetaOperationExperiment({
       experimentId,
       metaTaskId: ctx.metaTaskId,
       operation: "merge",
       hypothesis: op.hypothesis,
-      changeDescription: `merge proposal: ${op.merge_source_variant_id} into ${op.target_variant_id}`,
+      changeDescription: `merge ${loser.id} into ${survivor.id}`,
       metricName: op.evidence.metric_name,
       metricBefore: op.evidence.metric_before,
       evidence: {
         ...op.evidence,
+        target_variant_id: target.id,
         merge_source_variant_id: op.merge_source_variant_id,
-        pending_retire_lessons: pendingRetireLessonIds(retireLessons.ids)
+        kept_variant_id: survivor.id,
+        retired_variant_id: loser.id,
+        merged_specialty: mergedSpecialty,
+        tie_breaker_used: selection.tieBreakerUsed,
+        ks_p_value: ks.pValue,
+        mean_difference: ks.effect,
+        retired_lessons: applyRetireLessons(ctx, retireLessons.ids)
       },
-      status: "proposed"
+      status: "active"
     });
+
+    ctx.db.appendEvent({
+      id: randomUUID(),
+      taskId: ctx.metaTaskId,
+      projectId: ctx.projectId,
+      timestamp: new Date().toISOString(),
+      agent: "orchestrator",
+      type: "variants_merged",
+      status: "done",
+      payload: {
+        experiment_id: experimentId,
+        kept_variant_id: survivor.id,
+        retired_variant_id: loser.id,
+        merged_specialty: mergedSpecialty,
+        tie_breaker_used: selection.tieBreakerUsed
+      },
+      budgetSeconds: 0
+    });
+
+    return { ok: true, experimentId };
   });
 
-  return { ok: true, experimentId };
+  return result;
+}
+
+function getMergeVariant(db: DbClient, id: string): MergeVariantRow | null {
+  const row = db.sqlite
+    .query(`
+      SELECT id, skill_name, status, traffic_share, parent_version_id, specialty, content, created_at
+        FROM skill_versions
+       WHERE id = ?
+    `)
+    .get(id) as MergeVariantRow | undefined;
+  return row ?? null;
+}
+
+function selectMergeSurvivor(
+  target: MergeVariantRow,
+  source: MergeVariantRow,
+  targetMean: number,
+  sourceMean: number
+): { survivor: MergeVariantRow; loser: MergeVariantRow; tieBreakerUsed: string } {
+  const meanTieWindow = 0.005;
+  if (Math.abs(targetMean - sourceMean) > meanTieWindow) {
+    return targetMean > sourceMean
+      ? { survivor: target, loser: source, tieBreakerUsed: "composite_score" }
+      : { survivor: source, loser: target, tieBreakerUsed: "composite_score" };
+  }
+
+  if (target.content.length !== source.content.length) {
+    return target.content.length < source.content.length
+      ? { survivor: target, loser: source, tieBreakerUsed: "text_size" }
+      : { survivor: source, loser: target, tieBreakerUsed: "text_size" };
+  }
+
+  const targetCreated = Date.parse(target.created_at);
+  const sourceCreated = Date.parse(source.created_at);
+  if (Number.isFinite(targetCreated) && Number.isFinite(sourceCreated) && targetCreated !== sourceCreated) {
+    return targetCreated < sourceCreated
+      ? { survivor: target, loser: source, tieBreakerUsed: "created_at" }
+      : { survivor: source, loser: target, tieBreakerUsed: "created_at" };
+  }
+
+  return { survivor: target, loser: source, tieBreakerUsed: "none" };
+}
+
+function mean(values: number[]): number {
+  return values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 function handleShareAdjust(

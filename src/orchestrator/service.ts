@@ -18,13 +18,16 @@ import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
 import { createDispatcher, type SelectionResult } from "./dispatch";
+import { createEmbeddingProvider, serializeEmbedding, type EmbeddingProvider } from "./embedding";
 import { runShadowDispatches, type ShadowRunner } from "./shadow";
+import { defaultDispatchConfig } from "../config/dispatch";
 import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
 import type { ExecutorSet } from "../executors/factory";
 import { validateMetaOutput } from "../schemas/meta-output";
 import { handleMetaOperation } from "./meta-operations";
 import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
+import { runDiagnostic } from "./diagnostic";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -36,6 +39,7 @@ interface ServiceDeps {
   testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
   prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
   dispatcher?: ReturnType<typeof createDispatcher>;
+  embeddingProvider?: EmbeddingProvider;
   shadowRunner?: ShadowRunner;
 }
 
@@ -61,12 +65,66 @@ export class OrchestratorService {
   private readonly skills: SkillRegistry;
   private readonly personas: PersonaRegistry;
   private readonly dispatcher: ReturnType<typeof createDispatcher>;
+  private readonly embeddingProvider: EmbeddingProvider;
   private readonly autoTuner = new AutoTuner();
+  private terminalTaskCount = 0;
 
   constructor(private readonly deps: ServiceDeps) {
     this.skills = new SkillRegistry(resolve(process.cwd(), deps.env.SKILLS_DIR), deps.db);
     this.personas = new PersonaRegistry(deps.db, resolve(process.cwd(), "src/personas"));
-    this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db);
+    this.embeddingProvider = deps.embeddingProvider ?? createEmbeddingProvider(deps.env);
+    this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db, {
+      embeddingProvider: this.embeddingProvider
+    });
+  }
+
+  async backfillSpecialtyEmbeddings(): Promise<number> {
+    const rows = this.deps.db.sqlite.query(`
+      SELECT id, specialty
+        FROM skill_versions
+       WHERE specialty IS NOT NULL
+         AND specialty_embedding IS NULL
+       ORDER BY created_at ASC, id ASC
+    `).all() as Array<{ id: string; specialty: string }>;
+
+    let updated = 0;
+    for (const row of rows) {
+      try {
+        const vector = await this.embeddingProvider.embed(row.specialty);
+        this.deps.db.updateSpecialtyEmbedding(row.id, serializeEmbedding(vector));
+        updated += 1;
+      } catch (err) {
+        console.warn(
+          `[embedding] Specialty embedding backfill failed for variant=${row.id}: ${(err as Error).message ?? err}`
+        );
+      }
+    }
+    return updated;
+  }
+
+  async runPopulationDiagnostic(
+    agentType: AgentType,
+    trigger: "task_count_50" | "nightly_cron" | "manual" = "manual"
+  ): Promise<{ clustersProposed: number }> {
+    const clustersProposed = await runDiagnostic({
+      db: this.deps.db,
+      executor: this.deps.executor,
+      agentType,
+      trigger,
+      workingDirectory: process.cwd()
+    });
+    return { clustersProposed };
+  }
+
+  startDiagnosticScheduler(): void {
+    const dayMs = 24 * 60 * 60 * 1000;
+    setInterval(() => {
+      for (const agentType of ["planner", "coder", "reviewer", "doc"] as AgentType[]) {
+        void this.runPopulationDiagnostic(agentType, "nightly_cron").catch((err) => {
+          console.warn(`[diagnostic] nightly ${agentType} failed: ${(err as Error).message}`);
+        });
+      }
+    }, dayMs).unref?.();
   }
 
   listTasks(opts?: { includeArchived?: boolean; onlyArchived?: boolean }): PipelineTask[] {
@@ -236,7 +294,7 @@ export class OrchestratorService {
   ): Promise<PlanSubtask[]> {
     const plannerExecutor = this.routeExecutor(tier, "planner");
     const userPrompt = this.buildPlannerPrompt(description, tier, attempt, priorPlan, critique);
-    const plannerDispatch = this.selectPersonaForDispatch("planner", { description, tier, projectId });
+    const plannerDispatch = await this.selectPersonaForDispatch("planner", { description, tier, projectId });
     const plannerPersonaId = plannerDispatch.selection.variantId;
     const plannerSkillIds = this.skills.snapshotIds("planner");
 
@@ -504,7 +562,7 @@ export class OrchestratorService {
     // Run doc agent in the task's worktree (if it still exists).
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (worktreePath) {
-      const docDispatch = this.selectPersonaForDispatch("doc", {
+      const docDispatch = await this.selectPersonaForDispatch("doc", {
         description: task.description,
         tier: task.tier,
         projectId: task.projectId
@@ -725,16 +783,26 @@ export class OrchestratorService {
       );
     }
     try {
-      await this.runAutoTunerForTask(taskId);
+      const processedTerminalTask = await this.runAutoTunerForTask(taskId);
+      if (processedTerminalTask && !this.isMetaTask(taskId)) {
+        this.terminalTaskCount += 1;
+      }
+      if (processedTerminalTask && !this.isMetaTask(taskId) && this.terminalTaskCount % defaultDispatchConfig.diagnosticTriggerTaskCount === 0) {
+        for (const agentType of ["planner", "coder", "reviewer", "doc"] as AgentType[]) {
+          void this.runPopulationDiagnostic(agentType, "task_count_50").catch((err) => {
+            console.warn(`[diagnostic] ${agentType} failed: ${(err as Error).message}`);
+          });
+        }
+      }
     } finally {
       this.cleanupWorktree(taskId);
     }
   }
 
-  private async runAutoTunerForTask(taskId: string): Promise<void> {
+  private async runAutoTunerForTask(taskId: string): Promise<boolean> {
     const task = this.deps.db.getTask(taskId);
-    if (!task) return;
-    if (task.state !== "completed" && task.state !== "failed") return;
+    if (!task) return false;
+    if (task.state !== "completed" && task.state !== "failed") return false;
 
     try {
       const candidateIds = new Set<string>();
@@ -771,6 +839,11 @@ export class OrchestratorService {
     } catch (err) {
       this.recordAutoTunerFailed(task, err);
     }
+    return true;
+  }
+
+  private isMetaTask(taskId: string): boolean {
+    return this.deps.db.listEvents(taskId).some((event) => event.agent === "meta");
   }
 
   private variantStatus(variantId: string): string | null {
@@ -993,7 +1066,7 @@ export class OrchestratorService {
         budgetSeconds: 600
       });
 
-      const metaDispatch = this.selectPersonaForDispatch("meta", {
+      const metaDispatch = await this.selectPersonaForDispatch("meta", {
         description: focus ?? "meta improvement",
         tier: "STANDARD",
         projectId
@@ -1126,7 +1199,75 @@ export class OrchestratorService {
    * any pending lesson retirements that were deferred by the propose_fork op
    * (see meta-operations.ts Task 7 §6.4).
    */
-  async approveFork(experimentId: string): Promise<{ variantId: string }> {
+  listPendingForkExperiments(): Array<Record<string, unknown>> {
+    return (this.deps.db.sqlite.query(`
+      SELECT id, hypothesis, change_description, metric_name, metric_before,
+             operation, evidence, status, proposed_content, created_at
+        FROM experiments
+       WHERE status = 'proposed'
+         AND operation = 'fork'
+       ORDER BY created_at DESC, id ASC
+    `).all() as Array<Record<string, unknown>>).map((row) => {
+      const evidence = typeof row.evidence === "string" && row.evidence.length > 0
+        ? JSON.parse(row.evidence) as Record<string, unknown>
+        : {};
+      return {
+        experiment_id: row.id,
+        hypothesis: row.hypothesis,
+        evidence,
+        parent_variant_id: evidence.parent_variant_id ?? null,
+        proposed_specialty: evidence.specialty ?? null,
+        proposed_content_preview: typeof row.proposed_content === "string"
+          ? row.proposed_content.slice(0, 500)
+          : "",
+        created_at: row.created_at
+      };
+    });
+  }
+
+  rejectFork(experimentId: string, reviewer?: string, reason?: string): void {
+    const row = this.deps.db.sqlite.query(`
+      SELECT id, operation, status
+        FROM experiments
+       WHERE id = ?
+    `).get(experimentId) as { id: string; operation: string; status: string } | undefined;
+
+    if (!row) throw new Error("experiment not found");
+    if (row.operation !== "fork" || row.status !== "proposed") {
+      throw new Error("experiment not a proposed fork");
+    }
+
+    this.deps.db.transaction(() => {
+      this.deps.db.sqlite.query(`
+        UPDATE experiments
+           SET status = 'discard',
+               human_notes = ?,
+               completed_at = datetime('now')
+         WHERE id = ?
+      `).run(reason ?? null, experimentId);
+
+      this.deps.db.appendEvent({
+        id: randomUUID(),
+        taskId: experimentId,
+        projectId: "meta",
+        timestamp: new Date().toISOString(),
+        agent: "orchestrator",
+        type: "fork_rejected",
+        status: "done",
+        payload: {
+          experiment_id: experimentId,
+          reviewer: reviewer ?? null,
+          reason: reason ?? null
+        },
+        budgetSeconds: 0
+      });
+    });
+  }
+
+  async approveFork(
+    experimentId: string,
+    opts: { approver?: string; notes?: string } = {}
+  ): Promise<{ variantId: string }> {
     const row = this.deps.db.sqlite.query(`
       SELECT id, operation, status, proposed_content, evidence
         FROM experiments
@@ -1160,11 +1301,33 @@ export class OrchestratorService {
     const pendingRetireIds = Array.isArray(evidence.pending_retire_lessons)
       ? (evidence.pending_retire_lessons as unknown[]).filter((x): x is string => typeof x === "string")
       : [];
+    const forkProposalId = typeof evidence.fork_proposal_id === "string" ? evidence.fork_proposal_id : null;
 
     const variantId = randomUUID();
     const proposedContent = row.proposed_content;
+    const lineageRootId = this.deps.db.resolveLineageRoot(parentId) ?? parentId;
+    let specialtyEmbedding: Buffer | null = null;
+    try {
+      specialtyEmbedding = serializeEmbedding(await this.embeddingProvider.embed(specialty));
+    } catch {
+      specialtyEmbedding = null;
+    }
 
     this.deps.db.transaction(() => {
+      if (forkProposalId) {
+        const proposal = this.deps.db.getForkProposal(forkProposalId);
+        if (!proposal || proposal.status !== "open") {
+          throw new Error("fork proposal not open");
+        }
+      }
+
+      const transition = this.deps.db.sqlite.query(
+        "UPDATE experiments SET status = 'active' WHERE id = ? AND status = 'proposed'"
+      ).run(experimentId);
+      if (transition.changes !== 1) {
+        throw new Error("experiment not a proposed fork");
+      }
+
       this.deps.db.sqlite.query(`
         INSERT INTO skill_versions
           (id, skill_name, version, content, experiment_id,
@@ -1182,6 +1345,10 @@ export class OrchestratorService {
         $specialty: specialty
       });
 
+      if (specialtyEmbedding) {
+        this.deps.db.updateSpecialtyEmbedding(variantId, specialtyEmbedding);
+      }
+
       this.deps.db.appendTrafficAllocatedEvent({
         variantId,
         agentType: parent.skill_name.startsWith("persona:")
@@ -1194,13 +1361,38 @@ export class OrchestratorService {
         reason: "meta_fork_approved"
       });
 
-      this.deps.db.sqlite.query(
-        "UPDATE experiments SET status = 'active' WHERE id = ?"
-      ).run(experimentId);
-
       if (pendingRetireIds.length > 0) {
         this.deps.db.retireLessons(pendingRetireIds);
       }
+
+      if (forkProposalId) {
+        const marked = this.deps.db.markForkProposalActedOn(forkProposalId, experimentId);
+        if (!marked) {
+          throw new Error("fork proposal not open");
+        }
+      }
+
+      this.deps.db.appendEvent({
+        id: randomUUID(),
+        taskId: experimentId,
+        projectId: "meta",
+        timestamp: new Date().toISOString(),
+        agent: "orchestrator",
+        type: "fork_approved",
+        status: "done",
+        payload: {
+          experiment_id: experimentId,
+          variant_id: variantId,
+          new_variant_id: variantId,
+          parent_variant_id: parentId,
+          parent_id: parentId,
+          lineage_root_id: lineageRootId,
+          specialty,
+          approver: opts.approver ?? null,
+          notes: opts.notes ?? null
+        },
+        budgetSeconds: 0
+      });
     });
 
     return { variantId };
@@ -1235,7 +1427,7 @@ export class OrchestratorService {
 
       for (const subtask of planSubtasks) {
         const subtaskAgentType = subtask.agentType ?? "coder";
-        const subtaskDispatch = this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
+        const subtaskDispatch = await this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
         const subtaskPersonaId = subtaskDispatch.selection.variantId;
         const subtaskSkillIds = this.skills.snapshotIds(subtaskAgentType);
         const coderExecutor = this.routeExecutor(tier, subtaskAgentType);
@@ -1340,7 +1532,7 @@ export class OrchestratorService {
         break;
       }
 
-      const reviewerDispatch = this.selectPersonaForDispatch("reviewer", { description, tier, projectId });
+      const reviewerDispatch = await this.selectPersonaForDispatch("reviewer", { description, tier, projectId });
       const reviewerPersonaId = reviewerDispatch.selection.variantId;
       const reviewerSkillIds = this.skills.snapshotIds("reviewer");
       const reviewerExecutor = this.routeExecutor(tier, "reviewer");
@@ -1649,10 +1841,10 @@ export class OrchestratorService {
     };
   }
 
-  private selectPersonaForDispatch(
+  private async selectPersonaForDispatch(
     agentType: AgentType,
     taskContext: { description: string; tier: Tier; projectId: string }
-  ): { selection: SelectionResult; content: string; specialty: string | null; baselineVariantId: string | null } {
+  ): Promise<{ selection: SelectionResult; content: string; specialty: string | null; baselineVariantId: string | null }> {
     let population = this.deps.db.loadDispatchPopulation(agentType);
     if (population.length === 0) {
       this.personas.snapshotId(agentType);
@@ -1661,7 +1853,7 @@ export class OrchestratorService {
     this.personas.ensureDispatchBaseline(agentType);
     population = this.deps.db.loadDispatchPopulation(agentType);
 
-    const selection = this.dispatcher.selectVariant(agentType, taskContext);
+    const selection = await this.dispatcher.selectVariant(agentType, taskContext);
     const selected = population.find((variant) => variant.id === selection.variantId) ?? null;
     const baseline = population.find((variant) => variant.status === "baseline") ?? null;
     return {

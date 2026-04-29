@@ -34,6 +34,8 @@ const service = new OrchestratorService({
   worktrees,
   nats
 });
+await service.backfillSpecialtyEmbeddings();
+service.startDiagnosticScheduler();
 
 // Mark any tasks that were stuck in non-terminal states (e.g. from a crashed
 // previous run or a timed-out executor) as failed with a failure_analysis event.

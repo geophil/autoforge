@@ -38,7 +38,7 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 - **Type**: `"claude-code" | "anthropic-sdk" | "mock"`
 - **Default**: `"claude-code"`
-- **Affects**: `domain-agent-execution.md` — which `AgentExecutor` implementation is used.
+- **Affects**: `domain-agent-execution.md` — primary fallback in `ExecutorSet`; `OrchestratorService.routeExecutor()` can still choose the SDK or Claude Code executor per tier and agent type.
   - `claude-code`: spawns the Claude CLI subprocess
   - `anthropic-sdk`: uses Anthropic Messages API with tool-use loop (requires `ANTHROPIC_API_KEY`)
   - `mock`: deterministic responses, used in tests
@@ -83,7 +83,7 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 - **Type**: string (optional)
 - **Default**: unset
-- **Affects**: `domain-agent-execution.md` / `AnthropicSdkExecutor` — required when `EXECUTOR_DEFAULT=anthropic-sdk`. **Never passed to Claude Code agent subprocess.**
+- **Affects**: `domain-agent-execution.md` / `AnthropicSdkExecutor` — required when `EXECUTOR_DEFAULT=anthropic-sdk`; when set, it also makes the SDK executor available for planner, reflector, and EXPRESS routing. **Never passed to Claude Code agent subprocess.**
 
 ### `ANTHROPIC_MODEL`
 
@@ -91,11 +91,35 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Default**: `"claude-sonnet-4-6"`
 - **Affects**: `domain-agent-execution.md` / `AnthropicSdkExecutor` — model ID used for API calls.
 
+### `OPENAI_API_KEY`
+
+- **Type**: string (optional)
+- **Default**: unset
+- **Affects**: `domain-task-orchestration.md` / `src/orchestrator/embedding.ts` — required only when `EMBEDDING_PROVIDER=openai`. Used by the orchestrator to embed task descriptions and variant specialties for dispatch eligibility. **Never passed to agent executors.**
+
+### `EMBEDDING_PROVIDER`
+
+- **Type**: `"deterministic" | "openai"`
+- **Default**: `"deterministic"`
+- **Affects**: `domain-task-orchestration.md` — selects the specialty embedding backend used by `filterSpecialtyEligible()` and the `skill_versions.specialty_embedding` backfill path.
+
+### `EMBEDDING_MODEL`
+
+- **Type**: string
+- **Default**: `"text-embedding-3-small"`
+- **Affects**: `domain-task-orchestration.md` — OpenAI embedding model name used when `EMBEDDING_PROVIDER=openai`.
+
 ### `QMD_MCP_URL`
 
 - **Type**: string (optional)
 - **Default**: unset
-- **Affects**: `domain-agent-execution.md` — when set, the planner agent receives this URL as an environment variable and `ClaudeCodeExecutor` writes a temporary `--mcp-config` file so the planner can call QMD MCP tools (`query`, `get`, `multi_get`, `status`) to retrieve architecture context before planning. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
+- **Affects**: `domain-agent-execution.md` — when set, `OrchestratorService.agentEnvironment()` forwards this non-secret URL to task-facing planner/coder/reviewer/doc/doc-review runs. `ClaudeCodeExecutor` writes a temporary `--mcp-config`; `AnthropicSdkExecutor` opens an in-process MCP client. Both expose QMD tools (`query`, `get`, `multi_get`, `status`) to agents that receive the environment. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
+
+### `AUTOFORGE_URL`
+
+- **Type**: string (CLI environment variable, not validated by `loadEnv()`)
+- **Default**: `"http://127.0.0.1:3000"`
+- **Affects**: `src/cli/index.ts` — base URL used by CLI commands such as `autoforge experiments list-pending`, `autoforge experiments approve-fork`, and `autoforge experiments reject-fork`.
 
 ## Configuration File
 
@@ -118,7 +142,13 @@ const EnvSchema = z.object({
   SKILLS_DIR:               z.string().default("./skills"),
   ANTHROPIC_API_KEY:        z.string().optional(),
   ANTHROPIC_MODEL:          z.string().default("claude-sonnet-4-6"),
-  QMD_MCP_URL:              z.string().optional()
+  OPENAI_API_KEY:           z.string().optional(),
+  EMBEDDING_PROVIDER:       z.enum(["deterministic", "openai"]).default("deterministic"),
+  EMBEDDING_MODEL:          z.string().default("text-embedding-3-small"),
+  QMD_MCP_URL:              z.string().optional(),
+  PLANNER_MODEL_COMPLEX:    z.string().default("claude-opus-4-7"),
+  PLANNER_MODEL_EXPRESS:    z.string().default("claude-sonnet-4-6"),
+  PLANNER_MAX_ITERATIONS:   z.coerce.number().int().min(0).max(10).default(3)
 });
 ```
 
@@ -136,4 +166,4 @@ environment:
   - QMD_MCP_URL=http://qmd:8181/mcp
 ```
 
-`autoforge` waits for `qmd` to pass its health check before starting, ensuring the knowledge base is indexed before the first task is planned.
+`autoforge` waits for `qmd` to pass its health check before starting, ensuring the knowledge base is indexed before task-facing agents query it.

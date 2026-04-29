@@ -19,6 +19,9 @@ const EnvSchema = z.object({
   // Anthropic SDK executor settings (used when EXECUTOR_DEFAULT=anthropic-sdk).
   ANTHROPIC_API_KEY: z.string().optional(),
   ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6"),
+  OPENAI_API_KEY: z.string().optional(),
+  EMBEDDING_PROVIDER: z.enum(["deterministic", "openai"]).default("deterministic"),
+  EMBEDDING_MODEL: z.string().default("text-embedding-3-small"),
   // QMD MCP endpoint — passed to agent environments so agents can query the knowledge base.
   QMD_MCP_URL: z.string().optional(),
   PLANNER_MODEL_COMPLEX: z.string().default("claude-opus-4-7"),

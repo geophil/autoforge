@@ -16,7 +16,7 @@ if (task.state === "awaiting_approval") {
 throw new Error(`Task ${taskId} did not reach approval state; current state: ${task.state}`);
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:99`
+**Implemented in**: `OrchestratorService.submitTask()`.
 
 ### Rework Is Capped at 3 Iterations
 
@@ -33,7 +33,7 @@ if (iteration > 3) {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:256`
+**Implemented in**: `OrchestratorService.executeAndReview()`.
 
 ### EXPRESS Tier Skips Review
 
@@ -47,7 +47,7 @@ if (tier === "EXPRESS") {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:219`
+**Implemented in**: `OrchestratorService.executeAndReview()`.
 
 ### Orchestrator Owns All Git Operations
 
@@ -59,7 +59,7 @@ Agents never push directly. The orchestrator commits each subtask's output after
 this.deps.worktrees.commit({ branch, path: worktreePath }, `autoforge: ${subtask.description}`);
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:214`. See `domain-pr-gate.md` > Git Worktree Isolation.
+**Implemented in**: `OrchestratorService.executeAndReview()`. See `domain-pr-gate.md` > Git Worktree Isolation.
 
 ### Agents Receive a Time Budget
 
@@ -77,7 +77,7 @@ private budgetForTier(tier, step): number {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:364`
+**Implemented in**: `OrchestratorService.budgetForTier()`.
 
 ## Core Flows
 
@@ -89,17 +89,56 @@ A new task progresses from submission through to a PR awaiting human approval.
 2. **Assessment**: `assessComplexity(description)` assigns scope/novelty/risk/coupling dimensions. `routeTier(assessment)` maps them to EXPRESS/STANDARD/THOROUGH. See `domain-complexity-routing.md`.
 3. **Worktree creation**: A git branch `autoforge/{taskId}` and isolated working directory are created. See `domain-pr-gate.md` > Git Worktree Isolation.
 4. **Initial events**: `created` and `state.assessing`/`state.planning` events are recorded atomically.
-5. **Planner agent**: Executor runs a `planner` type agent; output is parsed into `PlanSubtask[]` and the turn-by-turn transcript is persisted to `agent_transcripts` (stage `planner`, attempt 0).
-6. **Plan-review pause** (STANDARD/THOROUGH, or any task submitted with `reviewPlan: true`): task transitions to `awaiting_plan_approval` and awaits human action. On approve, the pipeline resumes at step 7. On critique, the planner re-runs with the prior plan and critique appended (up to `PLANNER_MAX_ITERATIONS` revisions), producing a new `agent_transcripts` row per attempt and returning to `awaiting_plan_approval`. EXPRESS tasks skip this pause and proceed directly to step 7.
-7. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, then runs the reviewer (unless EXPRESS). Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
-8. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
-9. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
-10. **State**: Task transitions to `awaiting_approval`.
+5. **Planner dispatch**: `OrchestratorService` asks `createDispatcher().selectVariant("planner", taskContext)` for the selected population variant, resolves that variant's prompt content through `PersonaRegistry.resolveVariant()`, injects active lineage lessons from `loadLessonsForDispatch()`, and emits `variant_selected`.
+6. **Planner agent**: Executor runs a `planner` type agent; output is parsed into `PlanSubtask[]` and the turn-by-turn transcript is persisted to `agent_transcripts` (stage `planner`, attempt 0).
+7. **Plan-review pause** (STANDARD/THOROUGH, or any task submitted with `reviewPlan: true`): task transitions to `awaiting_plan_approval` and awaits human action. On approve, the pipeline resumes at step 8. On critique, the planner re-runs with the prior plan and critique appended (up to `PLANNER_MAX_ITERATIONS` revisions), producing a new `agent_transcripts` row per attempt and returning to `awaiting_plan_approval`. EXPRESS tasks skip this pause and proceed directly to step 8.
+8. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, then runs the reviewer (unless EXPRESS). Each planner/coder/reviewer/doc dispatch selects a population variant, injects selected variant content and lineage lessons, and runs any candidate shadow variants after the live result. Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
+9. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
+10. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
+11. **State**: Task transitions to `awaiting_approval`.
 
 **Error paths**:
 - Any coder returning FAILED/TIMEOUT → task transitions to `failed`
 - Rework iteration > 3 → `failed`
 - PR gate rejected → `failed`
+
+### Population Dispatch Flow (`OrchestratorService.selectPersonaForDispatch`)
+
+Before each live planner, coder, reviewer, doc, or meta agent run, `OrchestratorService` delegates persona selection to the dispatcher. The result drives both prompt content and observability:
+
+```typescript
+// src/orchestrator/dispatch.ts
+export interface SelectionResult {
+  variantId: string;
+  agentType: AgentType;
+  rationale: "only_eligible" | "baseline" | "exploitation" | "exploration" | "shadow_parallel";
+  shadowVariantIds: string[];
+  eligibleVariantIds: string[];
+}
+```
+
+Dispatch rules:
+- `filterSpecialtyEligible()` always keeps the `baseline` and generalist variants eligible, then adds specialists whose `specialty_embedding` or keyword specialty matches the task description.
+- Baseline protection reserves at least `baselineMinTrafficShare` (`0.5` by default) for the baseline variant.
+- Epsilon exploration reserves `epsilon` (`0.1` by default) for uniform selection among active competitors.
+- Exploitation uses active variants weighted by `traffic_share`.
+- Candidate shadow selection picks up to `maxShadowVariantsPerAgentType` newest `candidate` variants for parallel evaluation; candidates do not receive live traffic until graduation.
+
+`OrchestratorService` then resolves selected variant content and lessons before execution:
+
+```typescript
+// src/orchestrator/service.ts
+const subtaskDispatch = await this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
+const coderLessons = await this.loadLessonsForDispatch(subtaskDispatch.selection.variantId, subtaskAgentType, description);
+
+const liveTask = {
+  type: subtaskAgentType,
+  systemPrompt: subtaskDispatch.content,
+  lessons: coderLessons.block || undefined
+};
+```
+
+Lineage lessons come from `retrieveActiveLessonsForDispatch()` and are scoped to the selected variant's lineage root, so forked variants inherit useful corrections without globalizing niche behavior.
 
 ### Approve Task Flow
 
@@ -115,8 +154,10 @@ Human approves the PR via `POST /api/tasks/:id/approve`.
 Human rejects via `POST /api/tasks/:id/reject` with a reason.
 
 1. **Guard**: Task must be in `awaiting_approval`.
-2. **PR close**: `closePullRequest(task.prUrl)` closes the PR without merging.
-3. **Re-queue**: Transitions through `reworking → executing → reviewing → pr_created → awaiting_approval` (all recorded as events) with incremented iteration.
+2. **PR close**: `closePullRequest(task.prUrl)` best-effort closes the old PR without merging.
+3. **Old task failure**: The old task records `failure_analysis`, transitions from `awaiting_approval` to `failed`, and runs terminal cleanup/reflection.
+4. **Fresh restart task**: `submitTask()` creates a new task from current HEAD with rejection feedback appended to the description and `reviewPlan: false`.
+5. **Lineage event**: The old task emits `restart_spawned` with `restart_child_task_id` and rejection categories. The HTTP response body is the new restart task.
 
 ## State Transitions
 
@@ -127,12 +168,12 @@ received → assessing → planning → awaiting_plan_approval ⇄ replanning
                                                           ↓
                                                      pr_created → awaiting_approval
                                                                         ↓         ↓
-                                                                   documenting  reworking
+                                                                   documenting  failed
                                                                         ↓
                                                                    completed
 ```
 
-EXPRESS-tier tasks and tasks submitted with `reviewPlan: false` skip `awaiting_plan_approval` and transition directly from `planning` to `executing`. Any stage can transition to `failed`. See `domain-event-sourcing.md` for how transitions are persisted.
+EXPRESS-tier tasks and tasks submitted with `reviewPlan: false` skip `awaiting_plan_approval` and transition directly from `planning` to `executing`. Internal reviewer findings can still trigger `reviewing → reworking → executing` within the same task. Operator rejection at `awaiting_approval` does not requeue the same task; it fails the old task and spawns a fresh restart task linked by `restart_spawned`. Any stage can transition to `failed`. See `domain-event-sourcing.md` for how transitions are persisted.
 
 ### Plan-review states
 
@@ -155,7 +196,7 @@ if (!mustRework) {
 }
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:250`
+**Implemented in**: `OrchestratorService.executeAndReview()`.
 
 ### Plan Subtask Fallback
 
@@ -173,7 +214,7 @@ return [{
 }];
 ```
 
-**Enforced in**: `src/orchestrator/service.ts:423`
+**Implemented in**: `OrchestratorService.parsePlannerOutput()`.
 
 ## Integration Points
 
@@ -181,6 +222,7 @@ return [{
 - **Agent Execution**: All agent steps dispatched via `AgentExecutor.execute()`. See `domain-agent-execution.md`.
 - **PR Gate & Version Control**: `evaluatePrGate`, `createPullRequest`, `mergePullRequest`, `closePullRequest`, `WorktreeManager`. See `domain-pr-gate.md`.
 - **Event Sourcing**: Every state change recorded via `recordEvent()` + `transition()`. See `domain-event-sourcing.md`.
+- **Dispatch Policy**: `createDispatcher()`, `filterSpecialtyEligible()`, `emitVariantSelected()`, and `runShadowDispatchesSafely()` select population variants, inject lineage lessons, and emit selection/shadow telemetry.
 - **Skills Registry**: `SkillRegistry.skillsForAgent()` injects skill files into each agent prompt.
 - **Web API**: Routes delegate directly to `OrchestratorService`. See `domain-web-api.md`.
 
@@ -189,6 +231,9 @@ return [{
 | File | Purpose |
 |------|---------|
 | `src/orchestrator/service.ts` | Core pipeline logic, agent dispatch, approval/rejection flows |
+| `src/orchestrator/dispatch.ts` | Population dispatch policy: baseline, exploration, exploitation, shadow candidate selection |
+| `src/orchestrator/classifier.ts` | Specialty eligibility filtering via `specialty_embedding` and keyword fallback |
+| `src/orchestrator/lessons.ts` | Lineage-scoped active lesson retrieval for prompt injection |
 | `src/orchestrator/state-machine.ts` | Allowed state transitions, `assertTransition` guard |
 | `src/orchestrator/recovery.ts` | Crash recovery via NATS replay or SQLite rebuild |
 | `src/types/core.ts` | Canonical types: `PipelineTask`, `TaskStage`, `Tier`, `ReviewFinding`, `PlanSubtask` |

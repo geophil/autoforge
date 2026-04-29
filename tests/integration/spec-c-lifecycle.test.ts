@@ -250,15 +250,18 @@ describe("Spec C lifecycle auto-tuner hook", () => {
     try {
       ensureBaseline(db, "coder", 0.5);
       seedVariant(db, { id: "coder-active", agentType: "coder", status: "active", share: 0.8 });
+      (service as unknown as { terminalTaskCount: number }).terminalTaskCount = 49;
 
       await expect(
         service.submitTask("autoforge", "frontend non-terminal crash", { forceTier: "EXPRESS" })
       ).rejects.toThrow("synthetic PR creation failure");
+      await Bun.sleep(10);
 
       const task = db.listTasks().find((candidate) => candidate.description === "frontend non-terminal crash");
       expect(task?.state).toBe("reviewing");
       expect((service as unknown as { deps: { worktrees: WorktreeManager } }).deps.worktrees.findWorktreePath(task!.id)).toBeNull();
       expect(db.listEvents(task!.id).some((event) => event.type === "auto_tuner_failed")).toBe(false);
+      expect(db.sqlite.query("SELECT id FROM events WHERE event_type = 'diagnostic_run_completed'").all()).toHaveLength(0);
       const allocations = db.sqlite
         .query(`SELECT id FROM events
           WHERE event_type = 'traffic_allocated'
