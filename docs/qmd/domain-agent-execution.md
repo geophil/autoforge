@@ -179,6 +179,7 @@ Used when `EXECUTOR_DEFAULT=anthropic-sdk`. Runs a tool-use agentic loop against
 5. **Deadline check**: If `Date.now() >= deadlineMs` at loop start → TIMEOUT.
 6. **Status read**: Same `.autoforge-status.json` convention as ClaudeCodeExecutor.
 7. **Token tracking**: `totalInputTokens` and `totalOutputTokens` accumulated across all loop iterations and returned in `AgentResult.metrics`.
+8. **SDK-only context compaction**: when projected input reaches a model-budget threshold, old tool-use/tool-result exchange groups are compacted into a structured memory block. Compaction preserves API pairing validity (drop/retain full exchange groups only), uses a pinned summarization model by default (`claude-haiku-4`), and falls back to bounded extractive memory when summarization fails.
 
 Both executors now use **client-side MCP**: `ClaudeCodeExecutor` writes a `--mcp-config` file the Claude CLI consumes; `AnthropicSdkExecutor` runs the MCP client in-process via `@modelcontextprotocol/sdk`. Anthropic's remote MCP connector (`mcp_servers` API param) is intentionally not used — it would require the QMD server to be publicly reachable, which it isn't (QMD lives on the docker / k8s service network).
 
@@ -189,6 +190,15 @@ Available local tools for `AnthropicSdkExecutor` (same set regardless of MCP):
 - `search_files` — grep over working directory
 - `read_multiple_files` — batch read
 - `bash` — run a shell command (60s timeout)
+
+Compaction telemetry is stored in transcript turns (`kind: "compaction"`) with:
+- `droppedTurns`
+- `retainedRecentTurns`
+- `triggerInputTokens`
+- `summaryInputCharCount`
+- `summaryOutputCharCount`
+- `summaryModel` (or `null` on fallback)
+- `usedFallback`
 
 When `QMD_MCP_URL` is set in `AgentTask.environment`, that agent sees QMD's MCP tools (`query`, `get`, `multi_get`, `status`) — names that don't collide with the local set.
 
@@ -265,7 +275,7 @@ export interface AgentExecutor {
 | File | Purpose |
 |------|---------|
 | `src/executors/interface.ts` | `AgentExecutor`, `AgentTask`, `AgentResult` interfaces |
-| `src/executors/factory.ts` | `createExecutors(env)` and legacy `createExecutor(env)` — builds the primary/SDK/Claude Code executor set |
+| `src/executors/factory.ts` | `createExecutors(env)` — builds the primary/SDK/Claude Code executor set |
 | `src/executors/claude-code.ts` | `ClaudeCodeExecutor` — spawns Claude CLI subprocess; supports MCP |
 | `src/executors/anthropic-sdk.ts` | `AnthropicSdkExecutor` — Anthropic Messages API tool-use loop |
 | `src/executors/mock.ts` | `MockExecutor` — deterministic responses for tests |

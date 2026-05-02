@@ -87,7 +87,8 @@ publish(event: { type: string; data: unknown }): void {
 | `POST` | `/api/tasks/:id/cancel` | `approvals.ts` | Cancel a task; returns the task object directly |
 | `POST` | `/api/tasks/:id/approve-plan` | `approvals.ts` | Approve a task paused in `awaiting_plan_approval` |
 | `POST` | `/api/tasks/:id/critique-plan` | `approvals.ts` | Submit plan critique and rerun planner |
-| `POST` | `/api/tasks/:id/retry` | `approvals.ts` | Retry from `awaiting_intervention` with optional `fromStage` |
+| `POST` | `/api/tasks/:id/retry` | `approvals.ts` | Retry from `awaiting_intervention` with optional `fromStage`, `checkpointId`, and `operatorNote` |
+| `POST` | `/api/tasks/:id/steer` | `approvals.ts` | Queue boundary-safe steering for the next attempt (`scope: next_attempt`) |
 | `POST` | `/api/meta` | `meta.ts` | Trigger meta-loop analysis; returns `experimentId` |
 | `POST` | `/api/meta/:experimentId/conclude` | `meta.ts` | Conclude experiment (keep or revert) |
 | `GET`  | `/api/transcripts/by-task/:taskId` | `transcripts.ts` | List transcripts for a task |
@@ -128,6 +129,14 @@ POST /api/tasks/:id/approve
 ```
 
 `POST /api/tasks/:id/reject` closes and fails the old task, spawns a fresh restart task with feedback appended, emits `restart_spawned`, and returns the new task object directly.
+
+### Intervention Retry and Steering Flow
+
+- `POST /api/tasks/:id/retry` accepts optional rollback inputs:
+  - `checkpointId`: rewind worktree to a recorded checkpoint before retrying
+  - `operatorNote`: attached to `rollback_applied` / `retry_requested` for forensics
+  - `fromStage`: `planning` or `executing`
+- `POST /api/tasks/:id/steer` queues an operator message as `steering_message`; the next planner/coder/reviewer/doc dispatch injects it and emits `steering_consumed`.
 
 ### SSE Dashboard Flow
 
@@ -205,6 +214,10 @@ app.post("/run", async (ctx) => {
 - **Event Log**: `GET /api/tasks/:id/events` delegates to `DbClient.listEvents(taskId)`.
 - **Event Sourcing**: `DbClient.metricsForProject()` queries the materialized `tasks` and `review_findings` tables.
 - **Live Events**: `LiveEventHub` is instantiated once in `createWebServer` and passed to both task and approval route factories.
+
+## Known Limitation (V1)
+
+Approval-surface mutating routes (including retry/rollback and steering) currently have no built-in authentication middleware. Deploy behind a trusted network boundary or reverse proxy that enforces operator auth until route-level auth is added.
 
 ## File Map
 

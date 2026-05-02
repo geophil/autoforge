@@ -69,6 +69,22 @@ function mergeOperation(targetId: string, sourceId: string): MetaOperation {
 function runMerge(db: DbClient, targetId: string, sourceId: string) {
   return handleMetaOperation({
     db,
+    // Persist canonical events the way OrchestratorService.recordEvent would,
+    // so tests that read variants_merged events back from the DB observe them.
+    recordEvent: (event) => {
+      db.appendEvent({
+        id: randomUUID(),
+        taskId: event.taskId,
+        projectId: event.projectId,
+        timestamp: new Date().toISOString(),
+        agent: event.agent,
+        type: event.type,
+        status: event.status,
+        payload: event.analyticsOnly ? { ...event.payload, __analytics_only: true } : event.payload,
+        budgetSeconds: event.budgetSeconds,
+        elapsedSeconds: event.elapsedSeconds
+      });
+    },
     operation: mergeOperation(targetId, sourceId),
     metaTaskId: "meta-merge-task",
     worktreePath: "/tmp/nope",

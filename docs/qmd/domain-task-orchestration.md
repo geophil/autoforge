@@ -61,6 +61,23 @@ this.deps.worktrees.commit({ branch, path: worktreePath }, `autoforge: ${subtask
 
 **Implemented in**: `OrchestratorService.executeAndReview()`. See `domain-pr-gate.md` > Git Worktree Isolation.
 
+### Lifecycle Hooks Run at Guarded Boundaries
+
+Autoforge runs allowlisted Bun scripts in two deterministic phases:
+
+- `post_coder_pre_review` (mutating allowed): after coder commits, before reviewer dispatch.
+- `pre_pr_gate` (read-only): after review passes, before authenticated tests and PR gate.
+
+V1 is Bun-only and only discovers fixed allowlisted script names from `package.json` (`format`, `lint:fix`, `lint`, `test`), with deterministic phase gating.
+
+If a lifecycle hook fails, the orchestrator records `lifecycle_hook_failed` and pauses the task in `awaiting_intervention` with `failure_category=lifecycle_hook_failed`.
+
+### Rollback and Steering Are Boundary-Safe
+
+- Checkpoints are durable event-log markers (`checkpoint_created`) captured at safe stage boundaries and subtask commits.
+- Rollback (`rollback_applied`) is only valid when retrying from `awaiting_intervention`; terminal/archived tasks are not rollback targets because worktrees are pruned at terminal cleanup.
+- Steering (`steering_message`) is injected only on the next agent dispatch boundary and marked consumed with `steering_consumed`; no live in-loop interruption is attempted.
+
 ### Agents Receive a Time Budget
 
 Every agent invocation is constrained by `budgetSeconds`. Budget is tier- and step-dependent; the orchestrator enforces it via the executor.
@@ -92,7 +109,7 @@ A new task progresses from submission through to a PR awaiting human approval.
 5. **Planner dispatch**: `OrchestratorService` asks `createDispatcher().selectVariant("planner", taskContext)` for the selected population variant, resolves that variant's prompt content through `PersonaRegistry.resolveVariant()`, injects active lineage lessons from `loadLessonsForDispatch()`, and emits `variant_selected`.
 6. **Planner agent**: Executor runs a `planner` type agent; output is parsed into `PlanSubtask[]` and the turn-by-turn transcript is persisted to `agent_transcripts` (stage `planner`, attempt 0).
 7. **Plan-review pause** (STANDARD/THOROUGH, or any task submitted with `reviewPlan: true`): task transitions to `awaiting_plan_approval` and awaits human action. On approve, the pipeline resumes at step 8. On critique, the planner re-runs with the prior plan and critique appended (up to `PLANNER_MAX_ITERATIONS` revisions), producing a new `agent_transcripts` row per attempt and returning to `awaiting_plan_approval`. EXPRESS tasks skip this pause and proceed directly to step 8.
-8. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, then runs the reviewer (unless EXPRESS). Each planner/coder/reviewer/doc dispatch selects a population variant, injects selected variant content and lineage lessons, and runs any candidate shadow variants after the live result. Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
+8. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, runs `post_coder_pre_review` lifecycle hooks, then runs the reviewer (unless EXPRESS). Each planner/coder/reviewer/doc dispatch selects a population variant, injects selected variant content and lineage lessons, and runs any candidate shadow variants after the live result. Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
 9. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
 10. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
 11. **State**: Task transitions to `awaiting_approval`.

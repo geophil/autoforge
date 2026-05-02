@@ -71,6 +71,7 @@ LEFT JOIN (
       END
     ) AS planner_fallback
   FROM events
+  WHERE event_type IN ('planned', 'failure_analysis')
   GROUP BY task_id
 ) fa ON fa.task_id = t.id
 LEFT JOIN (

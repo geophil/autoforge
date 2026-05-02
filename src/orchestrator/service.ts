@@ -30,7 +30,7 @@ import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
 import { runDiagnostic } from "./diagnostic";
 import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayload, type TaskCheckpointStage } from "./checkpoints";
 import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
-import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun } from "./lifecycle-hooks";
+import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -44,6 +44,18 @@ interface ServiceDeps {
   dispatcher?: ReturnType<typeof createDispatcher>;
   embeddingProvider?: EmbeddingProvider;
   shadowRunner?: ShadowRunner;
+  /**
+   * Override for the lifecycle-hook runner. Production omits this and gets
+   * `runLifecycleHooks` (which actually invokes `bun run <script>` in the
+   * task worktree). Tests inject a stub that returns a "skipped, completed"
+   * result so the orchestrator pipeline doesn't recursively execute the
+   * autoforge `lint` / `test` scripts inside the test fixture's worktree.
+   */
+  lifecycleHookRunner?: (input: {
+    phase: LifecycleHookPhase;
+    workingDirectory: string;
+    timeoutSeconds: number;
+  }) => LifecycleHooksResult;
 }
 
 /**
@@ -2304,10 +2316,11 @@ export class OrchestratorService {
     worktreePath: string;
     iteration: number;
   }): Promise<void> {
-    if (this.deps.env.NODE_ENV === "test" && process.env.AUTOFORGE_ENABLE_TEST_HOOKS !== "1") {
+    if (this.deps.env.NODE_ENV === "test" && this.deps.env.AUTOFORGE_ENABLE_TEST_HOOKS !== "1") {
       return;
     }
-    const hookResults = runLifecycleHooks({
+    const runHooks = this.deps.lifecycleHookRunner ?? runLifecycleHooks;
+    const hookResults = runHooks({
       phase: input.phase,
       workingDirectory: input.worktreePath,
       timeoutSeconds: this.deps.env.AUTOFORGE_HOOK_TIMEOUT_SECONDS

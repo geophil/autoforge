@@ -66,8 +66,34 @@ function recordMetaEvent(
     analyticsOnly?: boolean;
   }
 ): void {
-  if (!ctx.recordEvent) return;
-  ctx.recordEvent(input);
+  if (ctx.recordEvent) {
+    ctx.recordEvent(input);
+    return;
+  }
+
+  const payload = input.analyticsOnly
+    ? { ...input.payload, __analytics_only: true }
+    : input.payload;
+
+  const message: AutoforgeMessage = {
+    id: randomUUID(),
+    taskId: input.taskId,
+    projectId: input.projectId,
+    timestamp: new Date().toISOString(),
+    agent: input.agent,
+    type: input.type,
+    status: input.status,
+    payload,
+    budgetSeconds: input.budgetSeconds,
+    elapsedSeconds: input.elapsedSeconds
+  };
+
+  ctx.db.transaction(() => {
+    ctx.db.appendEvent(message);
+    if (!input.analyticsOnly) {
+      ctx.db.applyEvent(message);
+    }
+  });
 }
 
 function readProposedContent(worktreePath: string, fileName: string): string | null {

@@ -206,6 +206,21 @@ Population operations are still ordinary append-only `events` rows. The importan
 | `fork_rejected` | `OrchestratorService.rejectFork()` | Records human rejection of a proposed fork experiment with reviewer and reason metadata. |
 | `variants_merged` | `handleMerge()` | Records merge operation metadata, survivor/retired IDs, and specialty/content consolidation. |
 
+### Harness Control Events (No Schema Migration Required)
+
+The following control events use the existing type-agnostic `events` table and do not require new projection tables:
+
+| Event type | Emitted by | Purpose |
+|------------|------------|---------|
+| `checkpoint_created` | `OrchestratorService.recordCheckpoint()` | Durable rollback anchor with `checkpoint_id`, `stage`, `iteration`, and `git_sha`. |
+| `rollback_applied` | `OrchestratorService.retryFromIntervention()` | Records rollback target checkpoint and before/after iteration/head metadata. |
+| `steering_message` | `OrchestratorService.addSteeringMessage()` | Queues operator steering to be injected at next safe dispatch boundary. |
+| `steering_consumed` | `OrchestratorService.recordSteeringConsumed()` | Marks queued steering as consumed by a specific dispatch. |
+| `lifecycle_hook_completed` | `OrchestratorService.runLifecyclePhase()` | Records lifecycle hook execution details (or skip reason) per phase/script. |
+| `lifecycle_hook_failed` | `OrchestratorService.runLifecyclePhase()` | Records hook failure forensics before pausing task in `awaiting_intervention`. |
+
+NATS impact: `recordEvent()` publishes all six event types on the same `autoforge.task.{projectId}.{taskId}.{event.type}` contract, so downstream consumers should decide whether to render, aggregate, or filter these control-plane events.
+
 ### `fork_proposals` Table
 
 The diagnostician writes proposed population niches into `fork_proposals`. Rows start as `open`; approval connects the proposal to an experiment and marks it acted on, while stale/dismissed rows remain searchable for operator review.

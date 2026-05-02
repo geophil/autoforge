@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -120,5 +120,24 @@ describe("DbClient migrations", () => {
       .query("SELECT COUNT(*) AS count FROM schema_migrations WHERE migration_file = ?")
       .get("001_broken_migration.sql") as { count: number };
     expect(migrationCount.count).toBe(0);
+  });
+
+  test("repository migration file set is unchanged", () => {
+    const files = readdirSync(resolve(process.cwd(), "src/db/migrations"))
+      .filter((name) => name.endsWith(".sql"))
+      .sort();
+
+    expect(files).toEqual([
+      "001_population_schema.sql",
+      "002_task_diff_stats.sql",
+      "003_transcripts_variant.sql",
+      "004_experiments_evidence.sql",
+      "005_reward_views.sql",
+      "006_fix_reward_views_planner_fallback.sql",
+      "007_lessons.sql",
+      "008_experiments_proposed_content.sql",
+      "009_fork_proposals.sql",
+      "010_specialty_embedding.sql"
+    ]);
   });
 });

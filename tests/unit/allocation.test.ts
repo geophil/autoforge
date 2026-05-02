@@ -14,8 +14,15 @@ function allocationEvents(db: ReturnType<typeof freshDb>): Array<{ task_id: stri
     .all() as Array<{ task_id: string; payload: string }>;
 }
 
+function stripAnalyticsMarker(payload: Record<string, unknown>): Record<string, unknown> {
+  // `__analytics_only` is an internal hint to DbClient.applyEvent so reads of
+  // event payloads in tests should compare the observable shape only.
+  const { __analytics_only: _ignored, ...rest } = payload;
+  return rest;
+}
+
 function parsedAllocationEvents(db: ReturnType<typeof freshDb>): Array<Record<string, unknown>> {
-  return allocationEvents(db).map((event) => JSON.parse(event.payload) as Record<string, unknown>);
+  return allocationEvents(db).map((event) => stripAnalyticsMarker(JSON.parse(event.payload) as Record<string, unknown>));
 }
 
 describe("adjustVariantAllocation", () => {
@@ -405,7 +412,7 @@ describe("adjustVariantAllocation", () => {
     const events = allocationEvents(db);
     expect(events).toHaveLength(1);
     expect(events[0].task_id).toBe("cand");
-    expect(JSON.parse(events[0].payload)).toEqual({
+    expect(stripAnalyticsMarker(JSON.parse(events[0].payload) as Record<string, unknown>)).toEqual({
       variant_id: "cand",
       agent_type: "coder",
       old_status: "candidate",
