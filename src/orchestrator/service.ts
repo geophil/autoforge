@@ -382,6 +382,7 @@ export class OrchestratorService {
       model: this.plannerModel(tier),
       lessons: plannerLessons.block || undefined
     } as const;
+    const plannerResult = await plannerExecutor.execute(plannerTask);
     this.recordSteeringConsumed({
       taskId,
       projectId,
@@ -390,7 +391,6 @@ export class OrchestratorService {
       iteration: attempt,
       personaVariantId: plannerPersonaId
     });
-    const plannerResult = await plannerExecutor.execute(plannerTask);
 
     await this.runShadowDispatchesSafely({
       taskId,
@@ -665,6 +665,7 @@ export class OrchestratorService {
         metadata: { taskId, description: task.description },
         lessons: docLessons.block || undefined
       } as const;
+      const docResult = await docExecutor.execute(docTask);
       this.recordSteeringConsumed({
         taskId,
         projectId: task.projectId,
@@ -673,7 +674,6 @@ export class OrchestratorService {
         iteration: task.iteration,
         personaVariantId: docPersonaId
       });
-      const docResult = await docExecutor.execute(docTask);
 
       await this.runShadowDispatchesSafely({
         taskId,
@@ -992,10 +992,7 @@ export class OrchestratorService {
       if (!checkpoint || checkpoint.task_id !== taskId) {
         throw new Error("checkpoint_not_found");
       }
-      if (
-        opts.fromStage &&
-        checkpointStageOrder(checkpoint.stage) > checkpointStageOrder(opts.fromStage)
-      ) {
+      if (checkpointStageOrder(checkpoint.stage) > checkpointStageOrder(targetStage)) {
         throw new Error("checkpoint_stage_after_retry_stage");
       }
 
@@ -1586,6 +1583,7 @@ export class OrchestratorService {
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
         };
+        const coderResult = await coderExecutor.execute(liveTask);
         this.recordSteeringConsumed({
           taskId,
           projectId,
@@ -1594,7 +1592,6 @@ export class OrchestratorService {
           iteration,
           personaVariantId: subtaskPersonaId
         });
-        const coderResult = await coderExecutor.execute(liveTask);
 
         await this.runShadowDispatchesSafely({
           taskId,
@@ -1719,6 +1716,7 @@ export class OrchestratorService {
         metadata: { taskId, iteration, description },
         lessons: reviewerLessons.block || undefined
       } as const;
+      const reviewResult = await reviewerExecutor.execute(reviewerTask);
       this.recordSteeringConsumed({
         taskId,
         projectId,
@@ -1727,7 +1725,6 @@ export class OrchestratorService {
         iteration,
         personaVariantId: reviewerPersonaId
       });
-      const reviewResult = await reviewerExecutor.execute(reviewerTask);
 
       await this.runShadowDispatchesSafely({
         taskId,
@@ -2282,6 +2279,9 @@ export class OrchestratorService {
     };
   }
 
+  // Call AFTER `executor.execute(...)` resolves. If execute throws (synchronous
+  // dispatch error), the steering remains pending and will be re-injected on
+  // the next attempt instead of being silently marked consumed.
   private recordSteeringConsumed(input: {
     taskId: string;
     projectId: string;

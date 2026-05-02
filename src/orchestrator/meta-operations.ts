@@ -52,6 +52,10 @@ export function handleMetaOperation(ctx: MetaOperationContext): MetaOperationRes
   }
 }
 
+// Production callers (OrchestratorService.submitMetaTask) always wire
+// `recordEvent`. Tests/standalone callers may omit it; in that case the event
+// is dropped rather than silently bypassing the orchestrator's append +
+// projection + NATS pipeline.
 function recordMetaEvent(
   ctx: MetaOperationContext,
   input: {
@@ -66,34 +70,7 @@ function recordMetaEvent(
     analyticsOnly?: boolean;
   }
 ): void {
-  if (ctx.recordEvent) {
-    ctx.recordEvent(input);
-    return;
-  }
-
-  const payload = input.analyticsOnly
-    ? { ...input.payload, __analytics_only: true }
-    : input.payload;
-
-  const message: AutoforgeMessage = {
-    id: randomUUID(),
-    taskId: input.taskId,
-    projectId: input.projectId,
-    timestamp: new Date().toISOString(),
-    agent: input.agent,
-    type: input.type,
-    status: input.status,
-    payload,
-    budgetSeconds: input.budgetSeconds,
-    elapsedSeconds: input.elapsedSeconds
-  };
-
-  ctx.db.transaction(() => {
-    ctx.db.appendEvent(message);
-    if (!input.analyticsOnly) {
-      ctx.db.applyEvent(message);
-    }
-  });
+  ctx.recordEvent?.(input);
 }
 
 function readProposedContent(worktreePath: string, fileName: string): string | null {

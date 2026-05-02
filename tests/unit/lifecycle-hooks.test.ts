@@ -47,7 +47,7 @@ function runPhase(phase: LifecycleHookPhase, dir: string) {
 }
 
 describe("lifecycle hooks", () => {
-  test("discovers only allowlisted scripts for each phase", () => {
+  test("discovers all allowlisted scripts for each phase in allowlist order", () => {
     const dir = createRepoWithScripts({
       format: "echo format",
       "lint:fix": "echo lint-fix",
@@ -59,9 +59,38 @@ describe("lifecycle hooks", () => {
       const post = discoverLifecycleHookScripts("post_coder_pre_review", dir);
       const pre = discoverLifecycleHookScripts("pre_pr_gate", dir);
       expect(post.skipReason).toBeNull();
-      expect(post.scripts).toEqual(["format"]);
+      expect(post.scripts).toEqual(["format", "lint:fix", "lint", "test"]);
+      expect(pre.skipReason).toBeNull();
+      expect(pre.scripts).toEqual(["lint", "test"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("discovery skips entries not present in package.json", () => {
+    const dir = createRepoWithScripts({ lint: "echo lint" });
+    try {
+      const pre = discoverLifecycleHookScripts("pre_pr_gate", dir);
       expect(pre.skipReason).toBeNull();
       expect(pre.scripts).toEqual(["lint"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("runs every discovered script in allowlist order until one fails", () => {
+    const dir = createRepoWithScripts({
+      lint: "echo lint-ok",
+      test: "node -e \"process.exit(2)\""
+    });
+    try {
+      const result = runPhase("pre_pr_gate", dir);
+      expect(result.runs).toHaveLength(2);
+      expect(result.runs[0].script).toBe("lint");
+      expect(result.runs[0].result).toBe("completed");
+      expect(result.runs[1].script).toBe("test");
+      expect(result.runs[1].result).toBe("failed");
+      expect(result.failedRun?.script).toBe("test");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

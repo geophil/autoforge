@@ -886,6 +886,10 @@ async function retryTask(taskId, fromStage, btnEl) {
           toast("Rollback failed: checkpoint not found.", "error");
           return;
         }
+        if (body?.error === "invalid_worktree_path") {
+          toast("Rollback failed: worktree path no longer matches this task.", "error");
+          return;
+        }
         toast("Task is no longer paused for intervention.", "error");
         return;
       }

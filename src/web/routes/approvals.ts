@@ -102,7 +102,16 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
       if (msg.startsWith("Cannot retry:")) {
         return ctx.json({ error: "invalid_state", message: msg }, 409);
       }
-      if (msg === "checkpoint_unreachable" || msg === "checkpoint_not_found") {
+      // Rollback failures (state is incompatible with the requested rollback)
+      // are surfaced as HTTP 409 so the dashboard can show them inline without
+      // dropping the operator note. `checkpoint_stage_after_retry_stage` is
+      // operator input validation, so it stays 400.
+      const rollbackConflictErrors = new Set([
+        "checkpoint_unreachable",
+        "checkpoint_not_found",
+        "invalid_worktree_path"
+      ]);
+      if (rollbackConflictErrors.has(msg)) {
         return ctx.json({ error: msg, message: msg }, 409);
       }
       if (msg === "checkpoint_stage_after_retry_stage") {
