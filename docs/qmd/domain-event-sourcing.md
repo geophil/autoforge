@@ -221,6 +221,22 @@ The following control events use the existing type-agnostic `events` table and d
 
 NATS impact: `recordEvent()` publishes all six event types on the same `autoforge.task.{projectId}.{taskId}.{event.type}` contract, so downstream consumers should decide whether to render, aggregate, or filter these control-plane events.
 
+### SDK Compaction Transcript Fields
+
+When the Anthropic SDK executor compacts its message history to stay under the model context budget, it appends a `compaction` turn to the executor transcript. The transcript itself is not an event-log message, but the fields are recorded alongside per-task transcripts and are useful for downstream observability:
+
+| Field | Meaning |
+|---|---|
+| `droppedTurns` | Number of historical assistant/tool-result turns replaced by the memory block. |
+| `retainedRecentTurns` | Number of most-recent turns preserved verbatim (always ≥ 1). |
+| `triggerInputTokens` | Projected next-call input tokens that crossed the compaction threshold. |
+| `summaryInputCharCount` | Character size of the slice fed to the summarizer. |
+| `summaryOutputCharCount` | Character size of the produced memory block (capped at 8 KiB on fallback). |
+| `summaryModel` | Pinned summarization model name, or `null` if the deterministic fallback was used. |
+| `usedFallback` | True when the LLM summarizer failed and the bounded extractive fallback ran. |
+
+All fields except `droppedTurns` are optional in the type union for backward compatibility with older transcripts.
+
 ### `fork_proposals` Table
 
 The diagnostician writes proposed population niches into `fork_proposals`. Rows start as `open`; approval connects the proposal to an experiment and marks it acted on, while stale/dismissed rows remain searchable for operator review.

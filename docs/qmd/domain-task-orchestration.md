@@ -76,7 +76,28 @@ If a lifecycle hook fails, the orchestrator records `lifecycle_hook_failed` and 
 
 - Checkpoints are durable event-log markers (`checkpoint_created`) captured at safe stage boundaries and subtask commits.
 - Rollback (`rollback_applied`) is only valid when retrying from `awaiting_intervention`; terminal/archived tasks are not rollback targets because worktrees are pruned at terminal cleanup.
-- Steering (`steering_message`) is injected only on the next agent dispatch boundary and marked consumed with `steering_consumed`; no live in-loop interruption is attempted.
+- Steering (`steering_message`) is injected only on the next agent dispatch boundary and marked consumed with `steering_consumed` *after* the executor returns; no live in-loop interruption is attempted.
+
+#### Checkpoint SHA Lifecycle
+
+Checkpoint *events* persist in the event log indefinitely. Checkpoint *SHAs* are tied to the task worktree branch and may become unreachable after terminal cleanup prunes the worktree. Rollback is therefore only meaningful while the task is non-terminal.
+
+| Capture point | Stage payload | Label |
+|---|---|---|
+| Right after `WorktreeManager.create(taskId)` resolves | `planning` | `task-start` |
+| After each subtask commit inside `executeAndReview()` | `executing` | `subtask-<sequence>` |
+| When entering `awaiting_intervention` via `pauseForIntervention` | `awaiting_intervention` | encodes prior stage / failure category |
+| Inside `retryFromIntervention` before the new attempt begins | `awaiting_intervention` | `pre-retry` |
+
+Each checkpoint records `checkpoint_id`, `task_id`, `iteration`, `stage`, `git_sha`, and `label`. If the worktree HEAD cannot be resolved (non-git context) the checkpoint is skipped and no event is recorded.
+
+`WorktreeManager.resetToCommit(worktreePath, sha)` enforces three preconditions before mutating the worktree:
+
+1. The path must be the task worktree under the manager's root and contain the `.autoforge-worktree.json` marker.
+2. The target SHA must be reachable from the current HEAD (`git merge-base --is-ancestor <sha> HEAD`).
+3. The orchestrator only calls it from `retryFromIntervention`, which requires the task to be in `awaiting_intervention`.
+
+The reset uses `git reset --hard <sha>` followed by `git clean -fd`, which destroys uncommitted changes — including any in-flight hook output, scratch files, or partial coder writes.
 
 ### Agents Receive a Time Budget
 
