@@ -2,6 +2,7 @@ import type { AppEnv } from "../config/env";
 import { ClaudeCodeExecutor } from "./claude-code";
 import { AnthropicSdkExecutor } from "./anthropic-sdk";
 import { MockExecutor } from "./mock";
+import type { AgentExecutor } from "./interface";
 
 export interface ExecutorSet {
   /** Primary executor — used when no routing rule overrides. */

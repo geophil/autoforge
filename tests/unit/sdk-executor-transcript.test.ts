@@ -454,18 +454,20 @@ describe("SDK executor return-path transcript invariants", () => {
 });
 
 describe("SDK executor compaction marker", () => {
-  test("records a compaction turn when iteration 20 triggers splice", async () => {
+  test("records a compaction turn when token threshold triggers memory compaction", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sdk-cmp-"));
     writeFileSync(join(dir, "hello.txt"), "world");
     writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
 
     const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    (exec as unknown as { _testSummarize?: (input: { model: string; text: string }) => Promise<string> })
+      ._testSummarize = async ({ text }) => `summary: ${text.slice(0, 60)}`;
     let callCount = 0;
     (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
       callCount++;
-      if (callCount <= 21) {
+      if (callCount <= 4) {
         return {
-          usage: { input_tokens: 5, output_tokens: 7 },
+          usage: { input_tokens: 80_000, output_tokens: 7 },
           stop_reason: "tool_use",
           content: [
             { type: "tool_use", id: `tu_${callCount}`, name: "read_file", input: { path: "hello.txt" } }

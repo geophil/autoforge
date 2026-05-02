@@ -305,6 +305,129 @@ describe("retryFromIntervention", () => {
     expect(events.some((e) => e.type === "retry_requested")).toBe(true);
   });
 
+  test("rollback to task-start checkpoint then retry from planning stays replay-consistent", async () => {
+    let plannerCalls = 0;
+    const { service, db } = createTestService({
+      planner: async () => {
+        plannerCalls += 1;
+        if (plannerCalls === 1) {
+          return {
+            status: "FAILED",
+            artifacts: [],
+            blockReason: "first call fails",
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+        return {
+          status: "DONE",
+          artifacts: [],
+          output: {
+            subtasks: [{
+              id: "sub-1", sequence: 1, description: "Do the thing",
+              filesInScope: ["src/foo.ts"], dependencies: [], testCriteria: ["tests pass"]
+            }]
+          },
+          metrics: { elapsedSeconds: 0.2, tokenInput: 100, tokenOutput: 50 }
+        };
+      }
+    });
+
+    const paused = await service.submitTask("autoforge", "Build a STANDARD feature");
+    expect(paused.state).toBe("awaiting_intervention");
+
+    const taskStartCheckpoint = db.listEvents(paused.id).find(
+      (event) => event.type === "checkpoint_created" && event.payload.label === "task-start"
+    );
+    expect(taskStartCheckpoint).toBeDefined();
+
+    const retried = await service.retryFromIntervention(paused.id, {
+      fromStage: "planning",
+      checkpointId: String(taskStartCheckpoint!.payload.checkpoint_id),
+      operatorNote: "reset to task start"
+    });
+    expect(retried.state).toBe("awaiting_plan_approval");
+    expect(plannerCalls).toBe(2);
+
+    const rollback = db.listEvents(paused.id).find((event) => event.type === "rollback_applied");
+    expect(rollback).toBeDefined();
+    expect(rollback!.payload.checkpoint_id).toBe(taskStartCheckpoint!.payload.checkpoint_id);
+    expect(rollback!.payload.operator_note).toBe("reset to task start");
+
+    const live = db.getTask(paused.id);
+    expect(live).toBeDefined();
+    db.rebuildProjectionsFromEvents();
+    const rebuilt = db.getTask(paused.id);
+    expect(rebuilt).toBeDefined();
+    expect(rebuilt?.state).toBe(live?.state);
+    expect(rebuilt?.iteration).toBe(live?.iteration);
+  });
+
+  test("rejects retry stage earlier than checkpoint stage", async () => {
+    const { service, db } = createTestService({
+      planner: async () => ({
+        status: "FAILED",
+        artifacts: [],
+        blockReason: "planner failed",
+        metrics: { elapsedSeconds: 0.1 }
+      })
+    });
+
+    const paused = await service.submitTask("autoforge", "Build a STANDARD feature");
+    expect(paused.state).toBe("awaiting_intervention");
+
+    const interventionCheckpoint = db.listEvents(paused.id).find(
+      (event) => event.type === "checkpoint_created" && event.payload.stage === "awaiting_intervention"
+    );
+    expect(interventionCheckpoint).toBeDefined();
+
+    await expect(service.retryFromIntervention(paused.id, {
+      fromStage: "planning",
+      checkpointId: String(interventionCheckpoint!.payload.checkpoint_id)
+    })).rejects.toThrow("checkpoint_stage_after_retry_stage");
+  });
+
+  test("steering queued during intervention is consumed on next planner retry", async () => {
+    let plannerCalls = 0;
+    const { service, db } = createTestService({
+      planner: async () => {
+        plannerCalls += 1;
+        if (plannerCalls === 1) {
+          return {
+            status: "FAILED",
+            artifacts: [],
+            blockReason: "first call fails",
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+        return {
+          status: "DONE",
+          artifacts: [],
+          output: {
+            subtasks: [{
+              id: "sub-1", sequence: 1, description: "Do the thing",
+              filesInScope: ["src/foo.ts"], dependencies: [], testCriteria: ["tests pass"]
+            }]
+          },
+          metrics: { elapsedSeconds: 0.2, tokenInput: 100, tokenOutput: 50 }
+        };
+      }
+    });
+
+    const paused = await service.submitTask("autoforge", "Build a STANDARD feature");
+    expect(paused.state).toBe("awaiting_intervention");
+    service.addSteeringMessage(paused.id, "Keep the plan focused and avoid unrelated refactors.");
+
+    await service.retryFromIntervention(paused.id, { fromStage: "planning" });
+
+    const events = db.listEvents(paused.id);
+    const steeringMessage = events.find((event) => event.type === "steering_message");
+    const consumed = events.find((event) => event.type === "steering_consumed");
+    expect(steeringMessage).toBeDefined();
+    expect(consumed).toBeDefined();
+    expect(consumed!.payload.agent_type).toBe("planner");
+    expect(consumed!.payload.steering_event_ids).toContain(steeringMessage!.id);
+  });
+
   test("retry from executing re-runs coder with existing plan", async () => {
     let coderCalls = 0;
     const { service } = createTestService({

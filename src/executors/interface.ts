@@ -34,7 +34,16 @@ export interface ToolStats {
 export type AgentTranscriptTurn =
   | { kind: "assistant"; content: unknown[] }
   | { kind: "tool_result"; toolUseId: string; content: string }
-  | { kind: "compaction"; droppedTurns: number }
+  | {
+      kind: "compaction";
+      droppedTurns: number;
+      retainedRecentTurns?: number;
+      triggerInputTokens?: number;
+      summaryInputCharCount?: number;
+      summaryOutputCharCount?: number;
+      summaryModel?: string | null;
+      usedFallback?: boolean;
+    }
   | { kind: "error"; name: string; message: string; stack?: string };
 
 export interface AgentTranscript {

@@ -26,7 +26,8 @@ const EnvSchema = z.object({
   QMD_MCP_URL: z.string().optional(),
   PLANNER_MODEL_COMPLEX: z.string().default("claude-opus-4-7"),
   PLANNER_MODEL_EXPRESS: z.string().default("claude-sonnet-4-6"),
-  PLANNER_MAX_ITERATIONS: z.coerce.number().int().min(0).max(10).default(3)
+  PLANNER_MAX_ITERATIONS: z.coerce.number().int().min(0).max(10).default(3),
+  AUTOFORGE_HOOK_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300)
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;

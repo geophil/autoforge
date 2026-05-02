@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DbClient } from "../../src/db/client";
@@ -177,6 +177,60 @@ function variantState(db: DbClient, id: string): { status: string; traffic_share
 }
 
 describe("Spec C lifecycle auto-tuner hook", () => {
+  test("post_coder_pre_review hook failure pauses task in awaiting_intervention", async () => {
+    const previous = process.env.AUTOFORGE_ENABLE_TEST_HOOKS;
+    process.env.AUTOFORGE_ENABLE_TEST_HOOKS = "1";
+    const { service, db, cleanup } = createLifecycleService({
+      randomValues: [0],
+      handlers: {
+        coder: async (agentTask) => {
+          const packageJsonPath = join(agentTask.workingDirectory, "package.json");
+          const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+            scripts?: Record<string, string>;
+          };
+          pkg.scripts = {
+            ...(pkg.scripts ?? {}),
+            lint: "node -e \"process.stderr.write('hook-failed'); process.exit(1)\""
+          };
+          writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2));
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: {},
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+      }
+    });
+    try {
+      const task = await service.submitTask("autoforge", "trigger hook failure", {
+        forceTier: "EXPRESS",
+        reviewPlan: false
+      });
+      expect(task.state).toBe("awaiting_intervention");
+
+      const events = db.listEvents(task.id);
+      const hookFailure = events.find((event) => event.type === "lifecycle_hook_failed");
+      expect(hookFailure).toBeDefined();
+      expect(hookFailure?.payload.phase).toBe("post_coder_pre_review");
+      expect(hookFailure?.payload.script).toBe("lint");
+      expect(hookFailure?.payload.exit_code).toBe(1);
+      expect(typeof hookFailure?.payload.log_path).toBe("string");
+
+      const failureAnalysis = [...events].reverse().find((event) => event.type === "failure_analysis");
+      expect(failureAnalysis).toBeDefined();
+      expect(failureAnalysis?.payload.failure_category).toBe("lifecycle_hook_failed");
+      expect(failureAnalysis?.payload.stage_failed).toBe("executing");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.AUTOFORGE_ENABLE_TEST_HOOKS;
+      } else {
+        process.env.AUTOFORGE_ENABLE_TEST_HOOKS = previous;
+      }
+      cleanup();
+    }
+  });
+
   test("terminal completion evaluates shadow candidates and graduates a candidate with enough evidence", async () => {
     const { service, db, cleanup } = createLifecycleService({ randomValues: [0] });
     try {

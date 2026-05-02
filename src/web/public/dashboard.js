@@ -189,11 +189,35 @@ async function refreshTaskDetail(taskId) {
       task.checkpoints = checkpoints
         .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
         .slice(0, 10);
+      task.pendingSteering = collectPendingSteeringEvents(allEvents);
     }
     renderTaskDetail(task);
   } catch {
     detailContent.innerHTML = `<div class="empty-state">Failed to load task.</div>`;
   }
+}
+
+function collectPendingSteeringEvents(events) {
+  const consumed = new Set();
+  for (const event of events) {
+    if (event.type !== "steering_consumed") continue;
+    const ids = event.payload?.steering_event_ids;
+    if (Array.isArray(ids)) {
+      for (const id of ids) {
+        if (typeof id === "string") consumed.add(id);
+      }
+    }
+  }
+
+  return events
+    .filter((event) => event.type === "steering_message")
+    .filter((event) => !consumed.has(event.id))
+    .map((event) => ({
+      id: event.id,
+      timestamp: event.timestamp,
+      message: event.payload?.message || "",
+      author: event.payload?.author || "operator"
+    }));
 }
 
 function renderTaskDetail(task) {
@@ -203,6 +227,24 @@ function renderTaskDetail(task) {
   const terminalStates = ["completed", "failed"];
   const nonTerminalStates = ["received", "assessing", "planning", "awaiting_plan_approval", "replanning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting", "awaiting_intervention"];
   let actionsHtml = "";
+  const pendingSteering = Array.isArray(task.pendingSteering) ? task.pendingSteering : [];
+  const pendingSteeringHtml = pendingSteering.length > 0
+    ? `<div class="forensic-row"><span class="forensic-label">Pending steering</span>
+        <span class="forensic-value">${pendingSteering.map((item) =>
+          `<div style="margin-bottom:0.35rem;"><code>${esc(item.author || "operator")}</code> · ${esc(timeAgo(item.timestamp))}<br>${esc(item.message)}</div>`
+        ).join("")}</span></div>`
+    : `<div class="forensic-row"><span class="forensic-label">Pending steering</span><span class="forensic-value">none</span></div>`;
+  const steeringComposer = `
+    <div class="intervention-rollback">
+      <label for="steering-input" class="forensic-label">Steer next attempt</label>
+      <textarea id="steering-input" class="critique-input" rows="2" maxlength="4000"
+        placeholder="Guidance for the next agent attempt (not the currently running process)."></textarea>
+      ${pendingSteeringHtml}
+      <div style="margin-top:0.5rem;">
+        <button class="btn btn-secondary" onclick="submitSteering('${task.id}', this)">Queue Steering</button>
+      </div>
+    </div>
+  `;
 
   if (task.state === "awaiting_intervention") {
     const fa = task.latestFailureAnalysis?.payload ?? {};
@@ -272,6 +314,7 @@ function renderTaskDetail(task) {
           <textarea id="retry-operator-note" class="critique-input" rows="2" maxlength="4000"
             placeholder="Optional operator note (saved on rollback/retry events)"></textarea>
         </div>
+        ${steeringComposer}
         <div class="intervention-buttons">
           ${retryButtons.join("")}
           <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel task</button>
@@ -335,6 +378,7 @@ function renderTaskDetail(task) {
             maxlength="4000"></textarea>
           <div class="critique-counter" id="critique-counter">0 / 4000</div>
         </div>
+        ${steeringComposer}
         <div class="plan-review-buttons">
           <button class="btn btn-approve" onclick="approvePlan('${task.id}', this)">Approve &amp; Continue</button>
           <button class="btn btn-secondary" id="btn-critique"
@@ -354,6 +398,7 @@ function renderTaskDetail(task) {
   } else if (nonTerminalStates.includes(task.state)) {
     actionsHtml = `
       <div class="task-detail-actions">
+        ${steeringComposer}
         <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')">Cancel task</button>
       </div>`;
   }
@@ -858,6 +903,34 @@ async function retryTask(taskId, fromStage, btnEl) {
   });
 }
 
+async function submitSteering(taskId, btnEl) {
+  const input = document.getElementById("steering-input");
+  const message = input?.value?.trim();
+  if (!message) {
+    toast("Enter steering guidance first.", "error");
+    return;
+  }
+  await runAction(btnEl, "Queueing…", btnEl?.closest(".intervention-rollback"), async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/steer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, scope: "next_attempt" })
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(body?.message ?? JSON.stringify(body) ?? "Failed to queue steering");
+      }
+      if (input) input.value = "";
+      toast("Steering queued for the next agent attempt.", "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Steering failed: ${err.message}`, "error");
+    }
+  });
+}
+
 async function archiveTask(taskId, event) {
   event.stopPropagation();
   try {
@@ -902,6 +975,7 @@ window.cancelTask = cancelTask;
 window.approvePlan = approvePlan;
 window.critiquePlan = critiquePlan;
 window.retryTask = retryTask;
+window.submitSteering = submitSteering;
 window.archiveTask = archiveTask;
 window.unarchiveTask = unarchiveTask;
 window.deleteTask = deleteTask;

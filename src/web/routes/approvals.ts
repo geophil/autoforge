@@ -30,6 +30,14 @@ const RetrySchema = z.object({
   operatorNote: z.string().min(1).max(4000).optional()
 });
 
+const SteerSchema = z.object({
+  message: z.string().min(1).max(4000),
+  // V1 supports next_attempt only. Reserved future values:
+  // - task_lifetime: apply on every dispatch until task terminates.
+  // - until_revoked: apply until a dedicated steering_revoked event.
+  scope: z.literal("next_attempt")
+});
+
 export function createApprovalRoutes(service: OrchestratorService, events: LiveEventHub): Hono {
   const app = new Hono();
 
@@ -104,6 +112,29 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
         return ctx.json({ error: "unsupported_stage", message: msg }, 400);
       }
       return ctx.json({ error: "retry_failed", message: msg }, 400);
+    }
+  });
+
+  app.post("/:id/steer", async (ctx) => {
+    let body: { message: string; scope: "next_attempt" };
+    try {
+      body = SteerSchema.parse(await ctx.req.json());
+    } catch (err) {
+      return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    try {
+      const task = service.addSteeringMessage(ctx.req.param("id"), body.message, body.scope);
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot steer")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      if (msg === "unsupported_steering_scope") {
+        return ctx.json({ error: "unsupported_scope", message: msg }, 400);
+      }
+      return ctx.json({ error: "steer_failed", message: msg }, 400);
     }
   });
 

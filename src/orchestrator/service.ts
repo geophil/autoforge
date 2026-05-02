@@ -29,6 +29,8 @@ import { handleMetaOperation } from "./meta-operations";
 import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
 import { runDiagnostic } from "./diagnostic";
 import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayload, type TaskCheckpointStage } from "./checkpoints";
+import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
+import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun } from "./lifecycle-hooks";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -136,6 +138,36 @@ export class OrchestratorService {
 
   getTask(taskId: string): PipelineTask | null {
     return this.deps.db.getTask(taskId);
+  }
+
+  addSteeringMessage(
+    taskId: string,
+    message: string,
+    scope: SteeringScope = "next_attempt",
+    author = "operator"
+  ): PipelineTask {
+    const task = this.requireTask(taskId);
+    if (task.state === "completed" || task.state === "failed") {
+      throw new Error(`Cannot steer task ${taskId}: task is in terminal state '${task.state}'`);
+    }
+    if (scope !== "next_attempt") {
+      throw new Error("unsupported_steering_scope");
+    }
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "steering_message",
+      status: "done",
+      payload: {
+        message: message.trim(),
+        scope,
+        author,
+        created_at: new Date().toISOString()
+      },
+      budgetSeconds: 60
+    });
+    return this.requireTask(taskId);
   }
 
   async archiveTask(taskId: string): Promise<PipelineTask> {
@@ -305,6 +337,10 @@ export class OrchestratorService {
   ): Promise<PlanSubtask[]> {
     const plannerExecutor = this.routeExecutor(tier, "planner");
     const userPrompt = this.buildPlannerPrompt(description, tier, attempt, priorPlan, critique);
+    const plannerSteering = this.steeringForDispatch(taskId);
+    const plannerPrompt = plannerSteering.prompt
+      ? `${plannerSteering.prompt}\n\n${userPrompt}`
+      : userPrompt;
     const plannerDispatch = await this.selectPersonaForDispatch("planner", { description, tier, projectId });
     const plannerPersonaId = plannerDispatch.selection.variantId;
     const plannerSkillIds = this.skills.snapshotIds("planner");
@@ -325,7 +361,7 @@ export class OrchestratorService {
       id: taskId,
       type: "planner",
       systemPrompt: plannerDispatch.content,
-      prompt: userPrompt,
+      prompt: plannerPrompt,
       workingDirectory: worktreePath,
       budgetSeconds: this.budgetForTier(tier, "planner"),
       environment: this.agentEnvironment(),
@@ -334,6 +370,14 @@ export class OrchestratorService {
       model: this.plannerModel(tier),
       lessons: plannerLessons.block || undefined
     } as const;
+    this.recordSteeringConsumed({
+      taskId,
+      projectId,
+      steeringEventIds: plannerSteering.eventIds,
+      agentType: "planner",
+      iteration: attempt,
+      personaVariantId: plannerPersonaId
+    });
     const plannerResult = await plannerExecutor.execute(plannerTask);
 
     await this.runShadowDispatchesSafely({
@@ -366,7 +410,7 @@ export class OrchestratorService {
       executorUsed: plannerExecutor.name,
       model: this.plannerModel(tier),
       systemPrompt: transcript?.systemPrompt ?? plannerDispatch.content,
-      userPrompt: transcript?.userPrompt ?? userPrompt,
+      userPrompt: transcript?.userPrompt ?? plannerPrompt,
       transcript: turnsJsonl,
       output: plannerResult.output ? JSON.stringify(plannerResult.output) : null,
       critique,
@@ -592,11 +636,16 @@ export class OrchestratorService {
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         injectedLessonIds: docLessons.ids
       });
+      const docSteering = this.steeringForDispatch(taskId);
+      const baseDocPrompt = buildDocPrompt(task.description, task.planSubtasks);
+      const docPrompt = docSteering.prompt
+        ? `${docSteering.prompt}\n\n${baseDocPrompt}`
+        : baseDocPrompt;
       const docTask = {
         id: `${taskId}-doc`,
         type: "doc",
         systemPrompt: docDispatch.content,
-        prompt: buildDocPrompt(task.description, task.planSubtasks),
+        prompt: docPrompt,
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         environment: this.agentEnvironment(),
@@ -604,6 +653,14 @@ export class OrchestratorService {
         metadata: { taskId, description: task.description },
         lessons: docLessons.block || undefined
       } as const;
+      this.recordSteeringConsumed({
+        taskId,
+        projectId: task.projectId,
+        steeringEventIds: docSteering.eventIds,
+        agentType: "doc",
+        iteration: task.iteration,
+        personaVariantId: docPersonaId
+      });
       const docResult = await docExecutor.execute(docTask);
 
       await this.runShadowDispatchesSafely({
@@ -1500,11 +1557,16 @@ export class OrchestratorService {
           injectedLessonIds: coderLessons.ids
         });
 
+        const coderSteering = this.steeringForDispatch(taskId);
+        const baseCoderPrompt = buildCoderPrompt(description, subtask, iteration);
+        const coderPrompt = coderSteering.prompt
+          ? `${coderSteering.prompt}\n\n${baseCoderPrompt}`
+          : baseCoderPrompt;
         const liveTask = {
           id: subtask.id,
           type: subtaskAgentType,
           systemPrompt: subtaskDispatch.content,
-          prompt: buildCoderPrompt(description, subtask, iteration),
+          prompt: coderPrompt,
           workingDirectory: worktreePath,
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: this.agentEnvironment(),
@@ -1512,6 +1574,14 @@ export class OrchestratorService {
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
         };
+        this.recordSteeringConsumed({
+          taskId,
+          projectId,
+          steeringEventIds: coderSteering.eventIds,
+          agentType: subtaskAgentType,
+          iteration,
+          personaVariantId: subtaskPersonaId
+        });
         const coderResult = await coderExecutor.execute(liveTask);
 
         await this.runShadowDispatchesSafely({
@@ -1587,6 +1657,15 @@ export class OrchestratorService {
         });
       }
 
+      await this.runLifecyclePhase({
+        taskId,
+        projectId,
+        fromStage: "executing",
+        phase: "post_coder_pre_review",
+        worktreePath,
+        iteration
+      });
+
       this.transition(taskId, projectId, "executing", "reviewing", { iteration });
 
       // EXPRESS tier skips the reviewer — faster turnaround, lower risk tolerance.
@@ -1611,11 +1690,16 @@ export class OrchestratorService {
         injectedLessonIds: reviewerLessons.ids
       });
 
+      const reviewerSteering = this.steeringForDispatch(taskId);
+      const baseReviewerPrompt = buildReviewerPrompt(description, planSubtasks);
+      const reviewerPrompt = reviewerSteering.prompt
+        ? `${reviewerSteering.prompt}\n\n${baseReviewerPrompt}`
+        : baseReviewerPrompt;
       const reviewerTask = {
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
         systemPrompt: reviewerDispatch.content,
-        prompt: buildReviewerPrompt(description, planSubtasks),
+        prompt: reviewerPrompt,
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: this.agentEnvironment(),
@@ -1623,6 +1707,14 @@ export class OrchestratorService {
         metadata: { taskId, iteration, description },
         lessons: reviewerLessons.block || undefined
       } as const;
+      this.recordSteeringConsumed({
+        taskId,
+        projectId,
+        steeringEventIds: reviewerSteering.eventIds,
+        agentType: "reviewer",
+        iteration,
+        personaVariantId: reviewerPersonaId
+      });
       const reviewResult = await reviewerExecutor.execute(reviewerTask);
 
       await this.runShadowDispatchesSafely({
@@ -1744,6 +1836,15 @@ export class OrchestratorService {
         budgetSeconds: this.budgetForTier(tier, "coder")
       });
     }
+
+    await this.runLifecyclePhase({
+      taskId,
+      projectId,
+      fromStage: "reviewing",
+      phase: "pre_pr_gate",
+      worktreePath,
+      iteration
+    });
 
     const runTests = this.deps.testRunner ?? runAuthenticatedTests;
     const testResult = await runTests(worktreePath, projectId);
@@ -2159,6 +2260,129 @@ export class OrchestratorService {
       },
       budgetSeconds: 60
     });
+  }
+
+  private steeringForDispatch(taskId: string): { prompt: string; eventIds: string[] } {
+    const pending = collectPendingSteering(this.deps.db.listEvents(taskId));
+    return {
+      prompt: renderSteeringPrompt(pending),
+      eventIds: pending.map((message) => message.eventId)
+    };
+  }
+
+  private recordSteeringConsumed(input: {
+    taskId: string;
+    projectId: string;
+    steeringEventIds: string[];
+    agentType: AgentType;
+    iteration: number;
+    personaVariantId: string;
+  }): void {
+    if (input.steeringEventIds.length === 0) return;
+    if (!["planner", "coder", "reviewer", "doc"].includes(input.agentType)) return;
+    this.recordEvent({
+      taskId: input.taskId,
+      projectId: input.projectId,
+      agent: "orchestrator",
+      type: "steering_consumed",
+      status: "done",
+      payload: {
+        steering_event_ids: input.steeringEventIds,
+        agent_type: input.agentType,
+        iteration: input.iteration,
+        persona_variant_id: input.personaVariantId
+      },
+      budgetSeconds: 60
+    });
+  }
+
+  private async runLifecyclePhase(input: {
+    taskId: string;
+    projectId: string;
+    fromStage: TaskStage;
+    phase: LifecycleHookPhase;
+    worktreePath: string;
+    iteration: number;
+  }): Promise<void> {
+    if (this.deps.env.NODE_ENV === "test" && process.env.AUTOFORGE_ENABLE_TEST_HOOKS !== "1") {
+      return;
+    }
+    const hookResults = runLifecycleHooks({
+      phase: input.phase,
+      workingDirectory: input.worktreePath,
+      timeoutSeconds: this.deps.env.AUTOFORGE_HOOK_TIMEOUT_SECONDS
+    });
+    for (const run of hookResults.runs) {
+      this.recordLifecycleHookEvent(input, run);
+      if (run.result === "failed") {
+        this.pauseForIntervention({
+          taskId: input.taskId,
+          projectId: input.projectId,
+          fromStage: input.fromStage,
+          failureCategory: "lifecycle_hook_failed",
+          failureReason: `Lifecycle hook failed (${run.phase}${run.script ? `:${run.script}` : ""})`,
+          forensics: this.lifecycleHookForensics(input.iteration, run)
+        });
+      }
+    }
+  }
+
+  private recordLifecycleHookEvent(
+    context: {
+      taskId: string;
+      projectId: string;
+      iteration: number;
+    },
+    run: LifecycleHookRun
+  ): void {
+    const payload = this.lifecycleHookForensics(context.iteration, run);
+
+    if (run.result === "failed") {
+      this.recordEvent({
+        taskId: context.taskId,
+        projectId: context.projectId,
+        agent: "orchestrator",
+        type: "lifecycle_hook_failed",
+        status: "failed",
+        payload,
+        budgetSeconds: 60
+      });
+      return;
+    }
+
+    this.recordEvent({
+      taskId: context.taskId,
+      projectId: context.projectId,
+      agent: "orchestrator",
+      type: "lifecycle_hook_completed",
+      status: run.skipped ? "done_with_concerns" : "done",
+      payload,
+      budgetSeconds: 60
+    });
+  }
+
+  private lifecycleHookForensics(iteration: number, run: LifecycleHookRun): Record<string, unknown> {
+    return {
+      phase: run.phase,
+      script: run.script,
+      command: run.command,
+      skipped: run.skipped,
+      skip_reason: run.skipReason,
+      result: run.result,
+      failure_reason: run.failureReason,
+      exit_code: run.exitCode,
+      timed_out: run.timedOut,
+      elapsed_seconds: run.elapsedSeconds,
+      stdout_excerpt: run.stdoutExcerpt,
+      stderr_excerpt: run.stderrExcerpt,
+      log_path: run.logPath,
+      changed_file_count: run.changedFileCount,
+      lines_added: run.linesAdded,
+      lines_deleted: run.linesDeleted,
+      committed: run.committed,
+      commit_sha: run.commitSha,
+      iteration
+    };
   }
 
   private cleanupWorktree(taskId: string): void {

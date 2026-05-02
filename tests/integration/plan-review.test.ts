@@ -36,6 +36,24 @@ describe("approvePlan", () => {
     expect(task.state).toBe("awaiting_approval");
     await expect(service.approvePlan(task.id)).rejects.toThrow();
   });
+
+  test("queued steering is consumed on next coder dispatch", async () => {
+    const { service, db } = createTestService();
+    const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
+    expect(task.state).toBe("awaiting_plan_approval");
+
+    service.addSteeringMessage(task.id, "Prefer the v2 endpoint and avoid legacy adapters.");
+    const resumed = await service.approvePlan(task.id);
+    expect(resumed.state).toBe("awaiting_approval");
+
+    const events = db.listEvents(task.id);
+    const steeringMessage = events.find((event) => event.type === "steering_message");
+    const consumed = events.find((event) => event.type === "steering_consumed");
+    expect(steeringMessage).toBeDefined();
+    expect(consumed).toBeDefined();
+    expect(consumed!.payload.agent_type).toBe("coder");
+    expect(consumed!.payload.steering_event_ids).toContain(steeringMessage!.id);
+  });
 });
 
 describe("critiquePlan", () => {
