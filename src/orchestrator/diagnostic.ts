@@ -1,9 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DbClient } from "../db/client";
 import type { AgentExecutor } from "../executors/interface";
 import type { AgentType } from "../types/core";
+import type { AutoforgeMessage } from "../nats/messages";
 
 export interface DiagnosticCluster {
   label: string;
@@ -23,6 +24,17 @@ export interface DiagnosticOutput {
 export interface RunDiagnosticInput {
   db: DbClient;
   executor: AgentExecutor;
+  recordEvent: (input: {
+    taskId: string;
+    projectId: string;
+    agent: AutoforgeMessage["agent"];
+    type: string;
+    status: AutoforgeMessage["status"];
+    payload: Record<string, unknown>;
+    budgetSeconds: number;
+    elapsedSeconds?: number;
+    analyticsOnly?: boolean;
+  }) => void;
   agentType: AgentType;
   trigger?: string;
   workingDirectory?: string;
@@ -69,7 +81,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
   const tasks = input.db.loadDiagnosticTaskHistory(input.agentType, DIAGNOSTIC_HISTORY_LIMIT);
 
   if (tasks.length < MIN_HISTORY_TASKS) {
-    appendDiagnosticEvent(input.db, {
+    appendDiagnosticEvent(input.recordEvent, {
       taskId: diagnosticTaskId(input.agentType, generatedAt),
       type: "diagnostic_run_completed",
       status: "done",
@@ -98,7 +110,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
     });
 
     if (result.status !== "DONE") {
-      appendDiagnosticEvent(input.db, {
+      appendDiagnosticEvent(input.recordEvent, {
         taskId: diagnosticTaskId(input.agentType, generatedAt),
         type: "diagnostic_run_completed",
         status: "done",
@@ -127,7 +139,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
         continue;
       }
       clustersProposed += 1;
-      appendDiagnosticEvent(input.db, {
+      appendDiagnosticEvent(input.recordEvent, {
         taskId: diagnosticTaskId(input.agentType, generatedAt),
         type: "diagnostic_cluster_detected",
         status: "done",
@@ -142,7 +154,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
     }
     runDiagnosticStalenessSweep(input.db, STALE_PROPOSAL_DAYS);
 
-    appendDiagnosticEvent(input.db, {
+    appendDiagnosticEvent(input.recordEvent, {
       taskId: diagnosticTaskId(input.agentType, generatedAt),
       type: "diagnostic_run_completed",
       status: "done",
@@ -150,7 +162,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
     });
     return clustersProposed;
   } catch (error) {
-    appendDiagnosticEvent(input.db, {
+    appendDiagnosticEvent(input.recordEvent, {
       taskId: diagnosticTaskId(input.agentType, generatedAt),
       type: "diagnostic_run_completed",
       status: "done",
@@ -231,7 +243,7 @@ function completionPayload(
 }
 
 function appendDiagnosticEvent(
-  db: DbClient,
+  recordEvent: RunDiagnosticInput["recordEvent"],
   input: {
     taskId: string;
     type: string;
@@ -239,17 +251,16 @@ function appendDiagnosticEvent(
     payload: Record<string, unknown>;
   }
 ): void {
-  db.appendEvent({
-    id: randomUUID(),
+  recordEvent({
     taskId: input.taskId,
     projectId: "diagnostic",
-    timestamp: new Date().toISOString(),
     agent: "diagnostician",
     type: input.type,
     status: input.status,
     payload: input.payload,
     budgetSeconds: DIAGNOSTIC_BUDGET_SECONDS,
-    elapsedSeconds: typeof input.payload.elapsed_seconds === "number" ? input.payload.elapsed_seconds : undefined
+    elapsedSeconds: typeof input.payload.elapsed_seconds === "number" ? input.payload.elapsed_seconds : undefined,
+    analyticsOnly: true
   });
 }
 

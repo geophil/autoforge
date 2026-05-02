@@ -241,7 +241,8 @@ export class DbClient {
       new_status: input.newStatus,
       old_traffic_share: input.oldTrafficShare,
       new_traffic_share: input.newTrafficShare,
-      reason: input.reason
+      reason: input.reason,
+      __analytics_only: true
     };
     if (input.supportingMetric !== undefined) {
       payload.supporting_metric = input.supportingMetric;
@@ -261,6 +262,10 @@ export class DbClient {
   }
 
   applyEvent(message: AutoforgeMessage): void {
+    const payload = message.payload as Record<string, unknown> | undefined;
+    if (payload?.__analytics_only === true) {
+      return;
+    }
     applyEventProjection(this.sqlite, message);
   }
 

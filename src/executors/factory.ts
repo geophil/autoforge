@@ -1,5 +1,4 @@
 import type { AppEnv } from "../config/env";
-import type { AgentExecutor } from "./interface";
 import { ClaudeCodeExecutor } from "./claude-code";
 import { AnthropicSdkExecutor } from "./anthropic-sdk";
 import { MockExecutor } from "./mock";
@@ -42,9 +41,3 @@ export function createExecutors(env: AppEnv): ExecutorSet {
   return { primary: claudeCode, sdk, claudeCode };
 }
 
-/**
- * Legacy single-executor factory for tests and simple callers.
- */
-export function createExecutor(env: AppEnv): AgentExecutor {
-  return createExecutors(env).primary;
-}

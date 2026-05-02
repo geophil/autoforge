@@ -106,9 +106,11 @@ export class OrchestratorService {
     agentType: AgentType,
     trigger: "task_count_50" | "nightly_cron" | "manual" = "manual"
   ): Promise<{ clustersProposed: number }> {
+    const diagnosticExecutor = this.routeExecutor("STANDARD", "diagnostician");
     const clustersProposed = await runDiagnostic({
       db: this.deps.db,
-      executor: this.deps.executor,
+      executor: diagnosticExecutor,
+      recordEvent: (event) => this.recordEvent(event),
       agentType,
       trigger,
       workingDirectory: process.cwd()
@@ -1009,18 +1011,10 @@ export class OrchestratorService {
           budgetSeconds: 60
         });
 
-        // Force through valid state transitions to reach failed.
-        try {
-          this.transition(task.id, task.projectId, task.state, "failed", {
-            reason: `stalled: task stuck in '${task.state}' beyond staleness threshold`,
-            iteration: task.iteration
-          });
-        } catch {
-          // State machine may reject some transitions — update projection directly.
-          this.deps.db.sqlite.query(
-            "UPDATE tasks SET state = 'failed', updated_at = ? WHERE id = ?"
-          ).run(new Date().toISOString(), task.id);
-        }
+        this.transition(task.id, task.projectId, task.state, "failed", {
+          reason: `stalled: task stuck in '${task.state}' beyond staleness threshold`,
+          iteration: task.iteration
+        });
 
         await this.finalizeTerminalTask(task.id);
       }
@@ -1137,6 +1131,7 @@ export class OrchestratorService {
       const operation = validation.value.operation;
       const handleResult = handleMetaOperation({
         db: this.deps.db,
+        recordEvent: (event) => this.recordEvent(event),
         operation,
         metaTaskId,
         worktreePath: worktree.path,
@@ -1246,11 +1241,9 @@ export class OrchestratorService {
          WHERE id = ?
       `).run(reason ?? null, experimentId);
 
-      this.deps.db.appendEvent({
-        id: randomUUID(),
+      this.recordEvent({
         taskId: experimentId,
         projectId: "meta",
-        timestamp: new Date().toISOString(),
         agent: "orchestrator",
         type: "fork_rejected",
         status: "done",
@@ -1259,7 +1252,8 @@ export class OrchestratorService {
           reviewer: reviewer ?? null,
           reason: reason ?? null
         },
-        budgetSeconds: 0
+        budgetSeconds: 0,
+        analyticsOnly: true
       });
     });
   }
@@ -1372,11 +1366,9 @@ export class OrchestratorService {
         }
       }
 
-      this.deps.db.appendEvent({
-        id: randomUUID(),
+      this.recordEvent({
         taskId: experimentId,
         projectId: "meta",
-        timestamp: new Date().toISOString(),
         agent: "orchestrator",
         type: "fork_approved",
         status: "done",
@@ -1391,7 +1383,8 @@ export class OrchestratorService {
           approver: opts.approver ?? null,
           notes: opts.notes ?? null
         },
-        budgetSeconds: 0
+        budgetSeconds: 0,
+        analyticsOnly: true
       });
     });
 
@@ -1968,10 +1961,12 @@ export class OrchestratorService {
     personaVersionId?: string;
     skillVersionIds?: string[];
     resumable?: boolean;
+    analyticsOnly?: boolean;
   }): void {
     const provenance: Record<string, unknown> = {};
     if (input.personaVersionId) provenance.persona_version_id = input.personaVersionId;
     if (input.skillVersionIds?.length) provenance.skill_version_ids = input.skillVersionIds;
+    if (input.analyticsOnly) provenance.__analytics_only = true;
 
     const message: AutoforgeMessage = {
       id: randomUUID(),
@@ -1991,7 +1986,9 @@ export class OrchestratorService {
 
     this.deps.db.transaction(() => {
       this.deps.db.appendEvent(message, { executorUsed: input.executorUsed });
-      this.deps.db.applyEvent(message);
+      if (!input.analyticsOnly) {
+        this.deps.db.applyEvent(message);
+      }
     });
 
     // Publish to NATS JetStream asynchronously (fire-and-forget; SQLite is the source of truth).
@@ -2043,6 +2040,9 @@ export class OrchestratorService {
     // Reflector is an SDK-executor job so we can get structured JSON output
     // reliably. Claude Code fallback for local dev without SDK credentials.
     if (agentType === "reflector") return set.sdk ?? set.claudeCode;
+
+    // Diagnostician should prefer SDK for structured JSON payloads.
+    if (agentType === "diagnostician") return set.sdk ?? set.claudeCode;
 
     // Meta agent always gets Claude Code — needs broad exploration.
     if (agentType === "meta") return set.claudeCode;

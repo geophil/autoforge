@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AnthropicSdkExecutor } from "../../src/executors/anthropic-sdk";
@@ -112,6 +112,47 @@ describe("SDK executor transcript capture", () => {
     expect(toolResult).toBeDefined();
     if (toolResult && toolResult.kind === "tool_result") {
       expect(toolResult.content).toBe("world");
+    }
+  });
+
+  test("treats list_directory recursive=true boolean as recursive", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-tr-list-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+    writeFileSync(join(dir, "root.txt"), "root");
+    const nestedDir = join(dir, "nested");
+    mkdirSync(nestedDir, { recursive: true });
+    writeFileSync(join(nestedDir, "child.txt"), "child");
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    let callCount = 0;
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          usage: { input_tokens: 5, output_tokens: 7 },
+          stop_reason: "tool_use",
+          content: [
+            { type: "tool_use", id: "tu_list", name: "list_directory", input: { path: ".", recursive: true } }
+          ]
+        };
+      }
+      return {
+        usage: { input_tokens: 5, output_tokens: 7 },
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "done" }]
+      };
+    };
+
+    const result = await exec.execute({
+      id: "tx-list", type: "planner", systemPrompt: "p", prompt: "u",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    const toolResult = result.transcript!.turns.find((t) => t.kind === "tool_result");
+    expect(toolResult).toBeDefined();
+    if (toolResult && toolResult.kind === "tool_result") {
+      expect(toolResult.content).toContain("nested/");
+      expect(toolResult.content).toContain("child.txt");
     }
   });
 });
@@ -337,6 +378,34 @@ describe("SDK executor return-path transcript invariants", () => {
       expect(errorTurn.message).toBe("synthetic upstream failure");
       expect(errorTurn.name).toBe("Error");
     }
+  });
+
+  test("FAILED return path reports completed tool iterations", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-fail-iter-"));
+    writeFileSync(join(dir, "hello.txt"), "world");
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    let calls = 0;
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          usage: { input_tokens: 5, output_tokens: 7 },
+          stop_reason: "tool_use",
+          content: [{ type: "tool_use", id: "tu_1", name: "read_file", input: { path: "hello.txt" } }]
+        };
+      }
+      throw new Error("synthetic upstream failure");
+    };
+
+    const result = await exec.execute({
+      id: "tf-iter", type: "planner", systemPrompt: "p-fail", prompt: "u-fail",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(result.status).toBe("FAILED");
+    expect(result.metrics.toolStats?.iterations).toBe(1);
   });
 
   test("TIMEOUT return path includes transcript", async () => {

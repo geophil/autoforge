@@ -21,7 +21,12 @@ getRewardWeights();
 const nats = new NatsClient(env.NATS_URL);
 await nats.connect(); // logs a warning and continues if unavailable
 
-const recovery = new RecoveryService(db, nats);
+const recovery = new RecoveryService(db, nats, (message) => {
+  db.transaction(() => {
+    db.appendEvent(message);
+    db.applyEvent(message);
+  });
+});
 await recovery.recover();
 
 const executors = createExecutors(env);

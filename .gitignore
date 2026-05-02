@@ -2,5 +2,6 @@ node_modules/
 dist/
 data/
 .runtime-worktrees/
+.worktrees/
 .env
 .env.local

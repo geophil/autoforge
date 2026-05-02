@@ -5,8 +5,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { AgentExecutor, AgentResult, AgentTask, AgentTranscript, AgentTranscriptTurn } from "./interface";
+import { buildStatusReportingPrompt, loadSkillFiles, readStatusFile } from "./status-convention";
 
-const STATUS_FILE = ".autoforge-status.json";
 const MAX_TOOL_ITERATIONS = 50;
 const PER_CALL_TIMEOUT_MS = 120_000;
 const CIRCUIT_BREAKER_READ_THRESHOLD = 12;
@@ -179,7 +179,7 @@ const TOOLS: Anthropic.Tool[] = [
 // Tool stats (for circuit breaker and failure attribution)
 // ---------------------------------------------------------------------------
 
-interface ToolStats {
+interface ExecutorToolStats {
   readCount: number;
   writeCount: number;
   bashCount: number;
@@ -195,7 +195,7 @@ async function executeTool(
   input: Record<string, unknown>,
   cwd: string,
   env: Record<string, string>,
-  stats: ToolStats,
+  stats: ExecutorToolStats,
   mcp: McpConnection | null
 ): Promise<string> {
   if (mcp && mcp.toolNames.has(name)) {
@@ -233,7 +233,7 @@ async function executeTool(
         stats.readCount++;
         const abs = resolve(cwd, sinput.path);
         if (!existsSync(abs)) return `Error: directory not found: ${sinput.path}`;
-        const recursive = sinput.recursive === "true";
+        const recursive = input.recursive === true || input.recursive === "true";
         if (recursive) {
           return listRecursive(abs, cwd, 0, 3);
         }
@@ -384,8 +384,9 @@ export class AnthropicSdkExecutor implements AgentExecutor {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let timedOut = false;
+    let completedIterations = 0;
     const deadlineMs = Date.now() + task.budgetSeconds * 1000;
-    const stats: ToolStats = { readCount: 0, writeCount: 0, bashCount: 0, searchCount: 0 };
+    const stats: ExecutorToolStats = { readCount: 0, writeCount: 0, bashCount: 0, searchCount: 0 };
 
     // Open a client-side MCP connection if the task is configured for QMD.
     // Tools are merged once and reused for every iteration.
@@ -474,6 +475,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
 
         totalInputTokens += response.usage.input_tokens;
         totalOutputTokens += response.usage.output_tokens;
+        completedIterations += 1;
 
         messages.push({ role: "assistant", content: response.content });
         turns.push({ kind: "assistant", content: response.content });
@@ -523,7 +525,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           elapsedSeconds,
           tokenInput: totalInputTokens,
           tokenOutput: totalOutputTokens,
-          toolStats: { ...stats, iterations: MAX_TOOL_ITERATIONS }
+          toolStats: { ...stats, iterations: completedIterations }
         },
         transcript: buildTranscript()
       };
@@ -537,7 +539,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
     }
 
     const elapsedSeconds = (Date.now() - start) / 1000;
-    const totalIterations = messages.filter((m) => m.role === "assistant").length;
+    const totalIterations = completedIterations;
 
     if (timedOut) {
       return {
@@ -617,59 +619,9 @@ function buildSystemPrompt(task: AgentTask): string {
     sections.push(`# Skills\n\n${skillContents}`);
   }
 
-  sections.push(`# Status Reporting (required)
-
-When you have finished the task you MUST write \`${STATUS_FILE}\` in the working directory using the write_file tool with this exact JSON format:
-
-\`\`\`json
-{
-  "status": "DONE",
-  "artifacts": ["relative/path/to/changed/file1", "relative/path/to/changed/file2"]
-}
-\`\`\`
-
-Valid status values:
-- **"DONE"** — completed successfully, all criteria met
-- **"DONE_WITH_CONCERNS"** — completed but add a "concerns" field explaining what was imperfect
-- **"BLOCKED"** — cannot proceed; add a "blockReason" field with a clear explanation
-- **"NEEDS_CONTEXT"** — missing information; add a "blockReason" field specifying what is needed
-
-Time budget: ${task.budgetSeconds} seconds. Work efficiently. Use search_files to find relevant code rather than reading every file. Use read_multiple_files to read several files at once.`);
+  sections.push(buildStatusReportingPrompt(task.budgetSeconds));
 
   return sections.join("\n\n");
-}
-
-function loadSkillFiles(skillFiles: string[]): string {
-  const parts: string[] = [];
-  for (const filePath of skillFiles) {
-    try {
-      if (existsSync(filePath)) {
-        parts.push(readFileSync(filePath, "utf8").trim());
-      }
-    } catch {
-      // skip unreadable skill files
-    }
-  }
-  return parts.join("\n\n---\n\n");
-}
-
-interface AgentStatusFile {
-  status: "DONE" | "DONE_WITH_CONCERNS" | "BLOCKED" | "NEEDS_CONTEXT";
-  artifacts: string[];
-  concerns?: string;
-  blockReason?: string;
-  // Extra fields (e.g. "meta" from the meta agent, "subtasks" from the planner) pass through as output.
-  [key: string]: unknown;
-}
-
-function readStatusFile(workingDirectory: string): AgentStatusFile | null {
-  const statusPath = join(workingDirectory, STATUS_FILE);
-  try {
-    if (!existsSync(statusPath)) return null;
-    return JSON.parse(readFileSync(statusPath, "utf8")) as AgentStatusFile;
-  } catch {
-    return null;
-  }
 }
 
 /**

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
 import type { DbClient } from "../db/client";
+import type { AutoforgeMessage } from "../nats/messages";
 import { adjustVariantAllocation } from "./allocation";
 import type { MetaOperation } from "../schemas/meta-output";
 import { kolmogorovSmirnovTwoSample } from "./sequential-test";
@@ -16,6 +17,17 @@ function agentTypeForSkillName(skillName: string): string {
 
 export interface MetaOperationContext {
   db: DbClient;
+  recordEvent?: (input: {
+    taskId: string;
+    projectId: string;
+    agent: AutoforgeMessage["agent"];
+    type: string;
+    status: AutoforgeMessage["status"];
+    payload: Record<string, unknown>;
+    budgetSeconds: number;
+    elapsedSeconds?: number;
+    analyticsOnly?: boolean;
+  }) => void;
   operation: MetaOperation;
   metaTaskId: string;
   worktreePath: string;
@@ -38,6 +50,24 @@ export function handleMetaOperation(ctx: MetaOperationContext): MetaOperationRes
     case "demote":  return handleShareAdjust(ctx, "demote");
     case "retire":  return handleRetire(ctx);
   }
+}
+
+function recordMetaEvent(
+  ctx: MetaOperationContext,
+  input: {
+    taskId: string;
+    projectId: string;
+    agent: AutoforgeMessage["agent"];
+    type: string;
+    status: AutoforgeMessage["status"];
+    payload: Record<string, unknown>;
+    budgetSeconds: number;
+    elapsedSeconds?: number;
+    analyticsOnly?: boolean;
+  }
+): void {
+  if (!ctx.recordEvent) return;
+  ctx.recordEvent(input);
 }
 
 function readProposedContent(worktreePath: string, fileName: string): string | null {
@@ -290,11 +320,9 @@ function handleMerge(ctx: MetaOperationContext): MetaOperationResult {
       status: "active"
     });
 
-    ctx.db.appendEvent({
-      id: randomUUID(),
+    recordMetaEvent(ctx, {
       taskId: ctx.metaTaskId,
       projectId: ctx.projectId,
-      timestamp: new Date().toISOString(),
       agent: "orchestrator",
       type: "variants_merged",
       status: "done",
@@ -305,7 +333,8 @@ function handleMerge(ctx: MetaOperationContext): MetaOperationResult {
         merged_specialty: mergedSpecialty,
         tie_breaker_used: selection.tieBreakerUsed
       },
-      budgetSeconds: 0
+      budgetSeconds: 0,
+      analyticsOnly: true
     });
 
     return { ok: true, experimentId };

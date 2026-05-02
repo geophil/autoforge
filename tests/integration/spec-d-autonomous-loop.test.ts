@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { createTestService } from "../helpers/create-service";
 import { createWebServer } from "../../src/web/server";
 import type { DbClient } from "../../src/db/client";
+import type { AgentExecutor } from "../../src/executors/interface";
 
 function seedBaselineCoderVariant(db: DbClient): void {
   db.sqlite.query(`
@@ -170,6 +171,76 @@ describe("Spec D autonomous loop", () => {
         approver: "ops",
         notes: "approve proposed Spec D fork"
       });
+
+      const liveTaskIds = (db.sqlite.query("SELECT id FROM tasks ORDER BY id ASC").all() as Array<{ id: string }>)
+        .map((row) => row.id);
+      expect(liveTaskIds.length).toBe(taskIds.length);
+
+      db.rebuildProjectionsFromEvents();
+
+      const rebuiltTaskIds = (db.sqlite.query("SELECT id FROM tasks ORDER BY id ASC").all() as Array<{ id: string }>)
+        .map((row) => row.id);
+      expect(rebuiltTaskIds).toEqual(liveTaskIds);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("diagnostic executor routing", () => {
+  test("routes diagnostician to SDK executor when both executors are configured", async () => {
+    const { service, db, cleanup } = createTestService();
+    try {
+      seedBaselineCoderVariant(db);
+      for (let i = 1; i <= 30; i++) {
+        seedCompletedCoderTask(db, i);
+      }
+
+      let sdkCalls = 0;
+      let claudeCalls = 0;
+      const sdk: AgentExecutor = {
+        name: "sdk-stub",
+        async execute() {
+          sdkCalls += 1;
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: { clusters: [] },
+            metrics: { elapsedSeconds: 0.01 }
+          };
+        },
+        async healthCheck() {
+          return true;
+        }
+      };
+      const claude: AgentExecutor = {
+        name: "claude-stub",
+        async execute() {
+          claudeCalls += 1;
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: { clusters: [] },
+            metrics: { elapsedSeconds: 0.01 }
+          };
+        },
+        async healthCheck() {
+          return true;
+        }
+      };
+
+      (service as unknown as {
+        deps: { executors?: { primary: AgentExecutor; sdk: AgentExecutor; claudeCode: AgentExecutor } };
+      }).deps.executors = {
+        primary: claude,
+        sdk,
+        claudeCode: claude
+      };
+
+      const result = await service.runPopulationDiagnostic("coder", "manual");
+      expect(result.clustersProposed).toBe(0);
+      expect(sdkCalls).toBe(1);
+      expect(claudeCalls).toBe(0);
     } finally {
       cleanup();
     }

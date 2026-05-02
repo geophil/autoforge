@@ -6,11 +6,43 @@ import { join, resolve } from "node:path";
 import { DbClient } from "../../src/db/client";
 import type { AgentExecutor, AgentResult, AgentTask } from "../../src/executors/interface";
 import { parseDiagnosticOutput, proposalIdForCluster, runDiagnostic, runDiagnosticStalenessSweep } from "../../src/orchestrator/diagnostic";
+import type { AutoforgeMessage } from "../../src/nats/messages";
 
 function freshDb(): DbClient {
   const db = new DbClient(join(mkdtempSync(join(tmpdir(), "diagnostic-test-")), "db.sqlite"));
   db.initSchema(resolve(process.cwd(), "src/db/schema.sql"), resolve(process.cwd(), "src/db/migrations"));
   return db;
+}
+
+function createRecorder(db: DbClient): (input: {
+  taskId: string;
+  projectId: string;
+  agent: AutoforgeMessage["agent"];
+  type: string;
+  status: AutoforgeMessage["status"];
+  payload: Record<string, unknown>;
+  budgetSeconds: number;
+  elapsedSeconds?: number;
+  analyticsOnly?: boolean;
+}) => void {
+  return (input) => {
+    const message: AutoforgeMessage = {
+      id: randomUUID(),
+      taskId: input.taskId,
+      projectId: input.projectId,
+      timestamp: new Date().toISOString(),
+      agent: input.agent,
+      type: input.type,
+      status: input.status,
+      payload: input.analyticsOnly ? { ...input.payload, __analytics_only: true } : input.payload,
+      budgetSeconds: input.budgetSeconds,
+      elapsedSeconds: input.elapsedSeconds
+    };
+    db.appendEvent(message);
+    if (!input.analyticsOnly) {
+      db.applyEvent(message);
+    }
+  };
 }
 
 function seedTerminalSelectedTask(db: DbClient, index: number): void {
@@ -168,6 +200,7 @@ describe("diagnostic parsing and persistence helpers", () => {
     const proposed = await runDiagnostic({
       db,
       executor,
+      recordEvent: createRecorder(db),
       agentType: "coder",
       trigger: "unit_test",
       workingDirectory: process.cwd(),
@@ -205,6 +238,7 @@ describe("diagnostic parsing and persistence helpers", () => {
       "diagnostic_run_completed"
     ]);
     expect(JSON.parse(events[0].payload)).toEqual({
+      __analytics_only: true,
       fork_proposal_id: proposalId,
       agent_type: "coder",
       label: "React styling",
@@ -218,6 +252,37 @@ describe("diagnostic parsing and persistence helpers", () => {
       diagnostician_variant_id: null,
       error: null
     });
+  });
+
+  test("diagnostic events remain analytics-only after projection rebuild", async () => {
+    const db = freshDb();
+    for (let i = 1; i <= 30; i++) {
+      seedTerminalSelectedTask(db, i);
+    }
+    const executor = new DiagnosticMockExecutor();
+
+    const proposed = await runDiagnostic({
+      db,
+      executor,
+      recordEvent: createRecorder(db),
+      agentType: "coder",
+      trigger: "unit_test",
+      workingDirectory: process.cwd(),
+      now: new Date("2026-04-28T12:00:00Z")
+    });
+    expect(proposed).toBe(1);
+
+    const beforeReplay = (db.sqlite.query(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id = 'diagnostic'"
+    ).get() as { n: number }).n;
+    expect(beforeReplay).toBe(0);
+
+    db.rebuildProjectionsFromEvents();
+
+    const afterReplay = (db.sqlite.query(
+      "SELECT COUNT(*) AS n FROM tasks WHERE project_id = 'diagnostic'"
+    ).get() as { n: number }).n;
+    expect(afterReplay).toBe(0);
   });
 
   test("runDiagnostic skips duplicate stable proposal ids without cluster events", async () => {
@@ -243,6 +308,7 @@ describe("diagnostic parsing and persistence helpers", () => {
     const proposed = await runDiagnostic({
       db,
       executor,
+      recordEvent: createRecorder(db),
       agentType: "coder",
       trigger: "unit_test",
       workingDirectory: process.cwd(),
