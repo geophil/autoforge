@@ -76,6 +76,73 @@ describe("SDK compaction", () => {
     }
   });
 
+  test("preserves parallel tool-use/tool-result pairs across compaction", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-cmp-parallel-"));
+    writeFileSync(join(dir, "hello.txt"), "world");
+    writeFileSync(join(dir, "alt.txt"), "alt");
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const snapshots: Array<Array<{ role: string; content: unknown }>> = [];
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    (exec as unknown as { _testSummarize?: (input: { model: string; text: string }) => Promise<string> })
+      ._testSummarize = async ({ text }) => `summary: ${text.slice(0, 120)}`;
+    let calls = 0;
+    (exec as unknown as { _testCreate?: (opts: { messages: unknown }) => Promise<unknown> })._testCreate = async (opts) => {
+      snapshots.push(snapshotMessages(opts.messages));
+      calls += 1;
+      if (calls <= 4) {
+        return {
+          usage: { input_tokens: 80_000, output_tokens: 10 },
+          stop_reason: "tool_use",
+          content: [
+            { type: "tool_use", id: `tu_${calls}_a`, name: "read_file", input: { path: "hello.txt" } },
+            { type: "tool_use", id: `tu_${calls}_b`, name: "read_file", input: { path: "alt.txt" } },
+            { type: "tool_use", id: `tu_${calls}_c`, name: "list_directory", input: { path: "." } }
+          ]
+        };
+      }
+      return {
+        usage: { input_tokens: 10, output_tokens: 10 },
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "done" }]
+      };
+    };
+
+    const result = await exec.execute({
+      id: "cmp-parallel", type: "planner", systemPrompt: "p", prompt: "u",
+      workingDirectory: dir, budgetSeconds: 60, environment: {}, skillFiles: []
+    });
+
+    for (const snapshot of snapshots) {
+      assertNoOrphanedToolPairs(snapshot);
+      // Every assistant message with >1 tool_use must be followed by a user
+      // message whose tool_result ids cover all the tool_use ids in the same
+      // group — never a partial split.
+      for (let i = 0; i < snapshot.length; i++) {
+        const current = snapshot[i];
+        if (current.role !== "assistant" || !Array.isArray(current.content)) continue;
+        const toolUseIds = (current.content as Array<{ type: string; id?: string }>)
+          .filter((b) => b.type === "tool_use")
+          .map((b) => b.id!);
+        if (toolUseIds.length === 0) continue;
+        const next = snapshot[i + 1];
+        expect(next).toBeDefined();
+        const resultIds = (next.content as Array<{ type: string; tool_use_id?: string }>)
+          .filter((b) => b.type === "tool_result")
+          .map((b) => b.tool_use_id!);
+        for (const id of toolUseIds) {
+          expect(resultIds).toContain(id);
+        }
+      }
+    }
+
+    const compaction = result.transcript?.turns.find((turn) => turn.kind === "compaction");
+    expect(compaction).toBeDefined();
+    if (compaction && compaction.kind === "compaction") {
+      expect(compaction.droppedTurns).toBeGreaterThan(0);
+    }
+  });
+
   test("falls back to bounded extractive memory when summarizer fails", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sdk-cmp-fallback-"));
     writeFileSync(join(dir, "hello.txt"), "world");

@@ -384,6 +384,10 @@ describe("retryFromIntervention", () => {
       fromStage: "planning",
       checkpointId: String(interventionCheckpoint!.payload.checkpoint_id)
     })).rejects.toThrow("checkpoint_stage_after_retry_stage");
+
+    await expect(service.retryFromIntervention(paused.id, {
+      checkpointId: String(interventionCheckpoint!.payload.checkpoint_id)
+    })).rejects.toThrow("checkpoint_stage_after_retry_stage");
   });
 
   test("steering queued during intervention is consumed on next planner retry", async () => {

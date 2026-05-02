@@ -64,13 +64,16 @@ export function discoverLifecycleHookScripts(
       ? ((packageJson as { scripts: Record<string, unknown> }).scripts)
       : {};
 
-  const selected = ALLOWED_SCRIPTS_BY_PHASE[phase]
-    .find((script) => typeof scriptsRecord[script] === "string" && String(scriptsRecord[script]).trim().length > 0);
+  const selected = ALLOWED_SCRIPTS_BY_PHASE[phase].filter(
+    (script) =>
+      typeof scriptsRecord[script] === "string" &&
+      String(scriptsRecord[script]).trim().length > 0
+  );
 
-  if (!selected) {
+  if (selected.length === 0) {
     return { scripts: [], skipReason: "no_allowlisted_scripts_defined" };
   }
-  return { scripts: [selected], skipReason: null };
+  return { scripts: selected, skipReason: null };
 }
 
 export function runLifecycleHooks(input: {
@@ -245,6 +248,15 @@ function writeHookLog(input: {
 }): string {
   const logDir = join(input.workingDirectory, HOOK_LOG_DIR);
   mkdirSync(logDir, { recursive: true });
+  // Self-ignoring `.gitignore` so the orchestrator's hook log files don't show
+  // up as worktree mutations during the post-run dirty check, and don't get
+  // swept into post_coder_pre_review commits via `git add -A`.
+  const ignoreMarker = join(input.workingDirectory, ".autoforge", ".gitignore");
+  try {
+    writeFileSync(ignoreMarker, "*\n", { flag: "wx" });
+  } catch {
+    // Already exists — fine.
+  }
   const safeScript = input.script.replace(/[^A-Za-z0-9._-]/g, "_");
   const logPath = join(logDir, `${input.phase}-${safeScript}.log`);
   const lines = [
