@@ -322,6 +322,43 @@ describe("task_quality_score view", () => {
     }
   });
 
+  test("checkpoint, steering, rollback, and lifecycle hook events do not affect fidelity", () => {
+    const { db, cleanup } = freshDb();
+    const ignoredTypes = [
+      "checkpoint_created",
+      "rollback_applied",
+      "steering_message",
+      "steering_consumed",
+      "lifecycle_hook_completed",
+      "lifecycle_hook_failed"
+    ];
+
+    try {
+      seedTerminalTask(db, {
+        taskId: "t4d",
+        state: "completed",
+        tier: "STANDARD",
+        iteration: 0,
+        diffLines: 30,
+        totalCost: 0.03
+      });
+      for (const type of ignoredTypes) {
+        db.sqlite.query(
+          `INSERT INTO events (id, task_id, timestamp, project_id, agent, event_type, status, payload, budget_seconds)
+           VALUES (?, 't4d', '2026-04-24T00:00:00Z', 'p', 'orchestrator', ?, 'done', '{"planner_fallback":true}', 60)`
+        ).run(randomUUID(), type);
+      }
+
+      const row = db.sqlite
+        .query("SELECT r_fidelity FROM task_quality_score WHERE task_id = 't4d'")
+        .get() as { r_fidelity: number };
+
+      expect(row.r_fidelity).toBeCloseTo(1.0);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("array-shaped persisted plan with matching subtasks does not count as scope drift", () => {
     const { db, cleanup } = freshDb();
 

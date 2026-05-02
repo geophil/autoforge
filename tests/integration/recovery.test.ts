@@ -15,7 +15,12 @@ describe("event-sourced recovery", () => {
       resolve(process.cwd(), "src/db/schema.sql"),
       resolve(process.cwd(), "src/db/migrations")
     );
-    const recovery = new RecoveryService(restartedDb);
+    const recovery = new RecoveryService(restartedDb, undefined, (message) => {
+      restartedDb.transaction(() => {
+        restartedDb.appendEvent(message);
+        restartedDb.applyEvent(message);
+      });
+    });
     recovery.recover();
 
     const recoveredTask = restartedDb.getTask(created.id);

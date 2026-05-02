@@ -18,13 +18,19 @@ import { WorktreeManager } from "../git/worktrees";
 import { SkillRegistry } from "../skills/registry";
 import { PersonaRegistry } from "../personas/registry";
 import { createDispatcher, type SelectionResult } from "./dispatch";
+import { createEmbeddingProvider, serializeEmbedding, type EmbeddingProvider } from "./embedding";
 import { runShadowDispatches, type ShadowRunner } from "./shadow";
+import { defaultDispatchConfig } from "../config/dispatch";
 import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
 import type { ExecutorSet } from "../executors/factory";
 import { validateMetaOutput } from "../schemas/meta-output";
 import { handleMetaOperation } from "./meta-operations";
 import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
+import { runDiagnostic } from "./diagnostic";
+import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayload, type TaskCheckpointStage } from "./checkpoints";
+import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
+import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -36,7 +42,20 @@ interface ServiceDeps {
   testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
   prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
   dispatcher?: ReturnType<typeof createDispatcher>;
+  embeddingProvider?: EmbeddingProvider;
   shadowRunner?: ShadowRunner;
+  /**
+   * Override for the lifecycle-hook runner. Production omits this and gets
+   * `runLifecycleHooks` (which actually invokes `bun run <script>` in the
+   * task worktree). Tests inject a stub that returns a "skipped, completed"
+   * result so the orchestrator pipeline doesn't recursively execute the
+   * autoforge `lint` / `test` scripts inside the test fixture's worktree.
+   */
+  lifecycleHookRunner?: (input: {
+    phase: LifecycleHookPhase;
+    workingDirectory: string;
+    timeoutSeconds: number;
+  }) => LifecycleHooksResult;
 }
 
 /**
@@ -61,12 +80,68 @@ export class OrchestratorService {
   private readonly skills: SkillRegistry;
   private readonly personas: PersonaRegistry;
   private readonly dispatcher: ReturnType<typeof createDispatcher>;
+  private readonly embeddingProvider: EmbeddingProvider;
   private readonly autoTuner = new AutoTuner();
+  private terminalTaskCount = 0;
 
   constructor(private readonly deps: ServiceDeps) {
     this.skills = new SkillRegistry(resolve(process.cwd(), deps.env.SKILLS_DIR), deps.db);
     this.personas = new PersonaRegistry(deps.db, resolve(process.cwd(), "src/personas"));
-    this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db);
+    this.embeddingProvider = deps.embeddingProvider ?? createEmbeddingProvider(deps.env);
+    this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db, {
+      embeddingProvider: this.embeddingProvider
+    });
+  }
+
+  async backfillSpecialtyEmbeddings(): Promise<number> {
+    const rows = this.deps.db.sqlite.query(`
+      SELECT id, specialty
+        FROM skill_versions
+       WHERE specialty IS NOT NULL
+         AND specialty_embedding IS NULL
+       ORDER BY created_at ASC, id ASC
+    `).all() as Array<{ id: string; specialty: string }>;
+
+    let updated = 0;
+    for (const row of rows) {
+      try {
+        const vector = await this.embeddingProvider.embed(row.specialty);
+        this.deps.db.updateSpecialtyEmbedding(row.id, serializeEmbedding(vector));
+        updated += 1;
+      } catch (err) {
+        console.warn(
+          `[embedding] Specialty embedding backfill failed for variant=${row.id}: ${(err as Error).message ?? err}`
+        );
+      }
+    }
+    return updated;
+  }
+
+  async runPopulationDiagnostic(
+    agentType: AgentType,
+    trigger: "task_count_50" | "nightly_cron" | "manual" = "manual"
+  ): Promise<{ clustersProposed: number }> {
+    const diagnosticExecutor = this.routeExecutor("STANDARD", "diagnostician");
+    const clustersProposed = await runDiagnostic({
+      db: this.deps.db,
+      executor: diagnosticExecutor,
+      recordEvent: (event) => this.recordEvent(event),
+      agentType,
+      trigger,
+      workingDirectory: process.cwd()
+    });
+    return { clustersProposed };
+  }
+
+  startDiagnosticScheduler(): void {
+    const dayMs = 24 * 60 * 60 * 1000;
+    setInterval(() => {
+      for (const agentType of ["planner", "coder", "reviewer", "doc"] as AgentType[]) {
+        void this.runPopulationDiagnostic(agentType, "nightly_cron").catch((err) => {
+          console.warn(`[diagnostic] nightly ${agentType} failed: ${(err as Error).message}`);
+        });
+      }
+    }, dayMs).unref?.();
   }
 
   listTasks(opts?: { includeArchived?: boolean; onlyArchived?: boolean }): PipelineTask[] {
@@ -75,6 +150,36 @@ export class OrchestratorService {
 
   getTask(taskId: string): PipelineTask | null {
     return this.deps.db.getTask(taskId);
+  }
+
+  addSteeringMessage(
+    taskId: string,
+    message: string,
+    scope: SteeringScope = "next_attempt",
+    author = "operator"
+  ): PipelineTask {
+    const task = this.requireTask(taskId);
+    if (task.state === "completed" || task.state === "failed") {
+      throw new Error(`Cannot steer task ${taskId}: task is in terminal state '${task.state}'`);
+    }
+    if (scope !== "next_attempt") {
+      throw new Error("unsupported_steering_scope");
+    }
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "steering_message",
+      status: "done",
+      payload: {
+        message: message.trim(),
+        scope,
+        author,
+        created_at: new Date().toISOString()
+      },
+      budgetSeconds: 60
+    });
+    return this.requireTask(taskId);
   }
 
   async archiveTask(taskId: string): Promise<PipelineTask> {
@@ -162,6 +267,14 @@ export class OrchestratorService {
       },
       budgetSeconds: 60
     });
+    this.recordCheckpoint({
+      taskId,
+      projectId,
+      iteration: 0,
+      stage: "planning",
+      worktreePath: worktree.path,
+      label: "task-start"
+    });
 
     this.transition(taskId, projectId, "received", "assessing", { assessment, tier });
     this.transition(taskId, projectId, "assessing", "planning", {});
@@ -236,7 +349,11 @@ export class OrchestratorService {
   ): Promise<PlanSubtask[]> {
     const plannerExecutor = this.routeExecutor(tier, "planner");
     const userPrompt = this.buildPlannerPrompt(description, tier, attempt, priorPlan, critique);
-    const plannerDispatch = this.selectPersonaForDispatch("planner", { description, tier, projectId });
+    const plannerSteering = this.steeringForDispatch(taskId);
+    const plannerPrompt = plannerSteering.prompt
+      ? `${plannerSteering.prompt}\n\n${userPrompt}`
+      : userPrompt;
+    const plannerDispatch = await this.selectPersonaForDispatch("planner", { description, tier, projectId });
     const plannerPersonaId = plannerDispatch.selection.variantId;
     const plannerSkillIds = this.skills.snapshotIds("planner");
 
@@ -256,7 +373,7 @@ export class OrchestratorService {
       id: taskId,
       type: "planner",
       systemPrompt: plannerDispatch.content,
-      prompt: userPrompt,
+      prompt: plannerPrompt,
       workingDirectory: worktreePath,
       budgetSeconds: this.budgetForTier(tier, "planner"),
       environment: this.agentEnvironment(),
@@ -265,6 +382,14 @@ export class OrchestratorService {
       model: this.plannerModel(tier),
       lessons: plannerLessons.block || undefined
     } as const;
+    this.recordSteeringConsumed({
+      taskId,
+      projectId,
+      steeringEventIds: plannerSteering.eventIds,
+      agentType: "planner",
+      iteration: attempt,
+      personaVariantId: plannerPersonaId
+    });
     const plannerResult = await plannerExecutor.execute(plannerTask);
 
     await this.runShadowDispatchesSafely({
@@ -297,7 +422,7 @@ export class OrchestratorService {
       executorUsed: plannerExecutor.name,
       model: this.plannerModel(tier),
       systemPrompt: transcript?.systemPrompt ?? plannerDispatch.content,
-      userPrompt: transcript?.userPrompt ?? userPrompt,
+      userPrompt: transcript?.userPrompt ?? plannerPrompt,
       transcript: turnsJsonl,
       output: plannerResult.output ? JSON.stringify(plannerResult.output) : null,
       critique,
@@ -504,7 +629,7 @@ export class OrchestratorService {
     // Run doc agent in the task's worktree (if it still exists).
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (worktreePath) {
-      const docDispatch = this.selectPersonaForDispatch("doc", {
+      const docDispatch = await this.selectPersonaForDispatch("doc", {
         description: task.description,
         tier: task.tier,
         projectId: task.projectId
@@ -523,11 +648,16 @@ export class OrchestratorService {
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         injectedLessonIds: docLessons.ids
       });
+      const docSteering = this.steeringForDispatch(taskId);
+      const baseDocPrompt = buildDocPrompt(task.description, task.planSubtasks);
+      const docPrompt = docSteering.prompt
+        ? `${docSteering.prompt}\n\n${baseDocPrompt}`
+        : baseDocPrompt;
       const docTask = {
         id: `${taskId}-doc`,
         type: "doc",
         systemPrompt: docDispatch.content,
-        prompt: buildDocPrompt(task.description, task.planSubtasks),
+        prompt: docPrompt,
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         environment: this.agentEnvironment(),
@@ -535,6 +665,14 @@ export class OrchestratorService {
         metadata: { taskId, description: task.description },
         lessons: docLessons.block || undefined
       } as const;
+      this.recordSteeringConsumed({
+        taskId,
+        projectId: task.projectId,
+        steeringEventIds: docSteering.eventIds,
+        agentType: "doc",
+        iteration: task.iteration,
+        personaVariantId: docPersonaId
+      });
       const docResult = await docExecutor.execute(docTask);
 
       await this.runShadowDispatchesSafely({
@@ -725,16 +863,26 @@ export class OrchestratorService {
       );
     }
     try {
-      await this.runAutoTunerForTask(taskId);
+      const processedTerminalTask = await this.runAutoTunerForTask(taskId);
+      if (processedTerminalTask && !this.isMetaTask(taskId)) {
+        this.terminalTaskCount += 1;
+      }
+      if (processedTerminalTask && !this.isMetaTask(taskId) && this.terminalTaskCount % defaultDispatchConfig.diagnosticTriggerTaskCount === 0) {
+        for (const agentType of ["planner", "coder", "reviewer", "doc"] as AgentType[]) {
+          void this.runPopulationDiagnostic(agentType, "task_count_50").catch((err) => {
+            console.warn(`[diagnostic] ${agentType} failed: ${(err as Error).message}`);
+          });
+        }
+      }
     } finally {
       this.cleanupWorktree(taskId);
     }
   }
 
-  private async runAutoTunerForTask(taskId: string): Promise<void> {
+  private async runAutoTunerForTask(taskId: string): Promise<boolean> {
     const task = this.deps.db.getTask(taskId);
-    if (!task) return;
-    if (task.state !== "completed" && task.state !== "failed") return;
+    if (!task) return false;
+    if (task.state !== "completed" && task.state !== "failed") return false;
 
     try {
       const candidateIds = new Set<string>();
@@ -771,6 +919,11 @@ export class OrchestratorService {
     } catch (err) {
       this.recordAutoTunerFailed(task, err);
     }
+    return true;
+  }
+
+  private isMetaTask(taskId: string): boolean {
+    return this.deps.db.listEvents(taskId).some((event) => event.agent === "meta");
   }
 
   private variantStatus(variantId: string): string | null {
@@ -806,7 +959,7 @@ export class OrchestratorService {
    */
   async retryFromIntervention(
     taskId: string,
-    opts: { fromStage?: "planning" | "executing" } = {}
+    opts: { fromStage?: "planning" | "executing"; checkpointId?: string; operatorNote?: string } = {}
   ): Promise<PipelineTask> {
     const task = this.requireTask(taskId);
     if (task.state !== "awaiting_intervention") {
@@ -816,9 +969,65 @@ export class OrchestratorService {
     const events = this.deps.db.listEvents(taskId);
     const lastFailure = [...events].reverse().find((e) => e.type === "failure_analysis");
     const failedStage = (lastFailure?.payload.stage_failed as TaskStage | undefined) ?? "planning";
-    // `replanning` folds into `planning` for retry purposes — we re-run the
-    // planner from scratch rather than trying to resume a partial revision.
-    const targetStage = opts.fromStage ?? (failedStage === "replanning" ? "planning" : failedStage);
+    // `replanning` folds into `planning`; reviewer/rework failures retry from execution by default.
+    const defaultStage: "planning" | "executing" =
+      failedStage === "planning" || failedStage === "replanning"
+        ? "planning"
+        : "executing";
+    const targetStage = opts.fromStage ?? defaultStage;
+
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (!worktreePath) {
+      throw new Error(`Worktree missing for task ${taskId}; cannot retry`);
+    }
+    const branch = `autoforge/${taskId}`;
+    const checkpoints = events
+      .filter((event) => event.type === "checkpoint_created")
+      .map((event) => ({ eventId: event.id, payload: parseCheckpointPayload(event.payload) }))
+      .filter((event): event is { eventId: string; payload: TaskCheckpointPayload } => event.payload !== null);
+
+    let retryIteration = task.iteration;
+    if (opts.checkpointId) {
+      const checkpoint = checkpoints.find((candidate) => candidate.payload.checkpoint_id === opts.checkpointId)?.payload;
+      if (!checkpoint || checkpoint.task_id !== taskId) {
+        throw new Error("checkpoint_not_found");
+      }
+      if (
+        opts.fromStage &&
+        checkpointStageOrder(checkpoint.stage) > checkpointStageOrder(opts.fromStage)
+      ) {
+        throw new Error("checkpoint_stage_after_retry_stage");
+      }
+
+      const priorHeadSha = this.deps.worktrees.currentHead(worktreePath);
+      this.deps.worktrees.resetToCommit(worktreePath, checkpoint.git_sha);
+      retryIteration = checkpoint.iteration;
+      this.recordEvent({
+        taskId,
+        projectId: task.projectId,
+        agent: "orchestrator",
+        type: "rollback_applied",
+        status: "done",
+        payload: {
+          checkpoint_id: checkpoint.checkpoint_id,
+          prior_iteration: task.iteration,
+          target_iteration: checkpoint.iteration,
+          operator_note: opts.operatorNote ?? null,
+          prior_head_sha: priorHeadSha,
+          checkpoint_git_sha: checkpoint.git_sha
+        },
+        budgetSeconds: 60
+      });
+    }
+
+    this.recordCheckpoint({
+      taskId,
+      projectId: task.projectId,
+      iteration: retryIteration,
+      stage: "awaiting_intervention",
+      worktreePath,
+      label: "pre-retry"
+    });
 
     this.recordEvent({
       taskId,
@@ -829,19 +1038,15 @@ export class OrchestratorService {
       payload: {
         from_stage: targetStage,
         previously_failed_stage: failedStage,
-        iteration: task.iteration
+        checkpoint_id: opts.checkpointId ?? null,
+        operator_note: opts.operatorNote ?? null,
+        iteration: retryIteration
       },
       budgetSeconds: 60
     });
 
-    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
-    if (!worktreePath) {
-      throw new Error(`Worktree missing for task ${taskId}; cannot retry`);
-    }
-    const branch = `autoforge/${taskId}`;
-
     if (targetStage === "planning") {
-      this.transition(taskId, task.projectId, "awaiting_intervention", "planning", { retry: true });
+      this.transition(taskId, task.projectId, "awaiting_intervention", "planning", { retry: true, iteration: retryIteration });
       // Use the next attempt number so the failed transcript is preserved
       // for forensics and we don't collide with the UNIQUE(task_id, stage,
       // attempt) constraint.
@@ -872,11 +1077,11 @@ export class OrchestratorService {
     }
 
     if (targetStage === "executing") {
-      this.transition(taskId, task.projectId, "awaiting_intervention", "executing", { retry: true });
+      this.transition(taskId, task.projectId, "awaiting_intervention", "executing", { retry: true, iteration: retryIteration });
       try {
         await this.executeAndReview(
           taskId, task.projectId, task.description, task.tier,
-          task.planSubtasks, task.iteration, worktreePath, branch
+          task.planSubtasks, retryIteration, worktreePath, branch
         );
       } catch (err) {
         if (err instanceof StageFailedError) {
@@ -936,18 +1141,10 @@ export class OrchestratorService {
           budgetSeconds: 60
         });
 
-        // Force through valid state transitions to reach failed.
-        try {
-          this.transition(task.id, task.projectId, task.state, "failed", {
-            reason: `stalled: task stuck in '${task.state}' beyond staleness threshold`,
-            iteration: task.iteration
-          });
-        } catch {
-          // State machine may reject some transitions — update projection directly.
-          this.deps.db.sqlite.query(
-            "UPDATE tasks SET state = 'failed', updated_at = ? WHERE id = ?"
-          ).run(new Date().toISOString(), task.id);
-        }
+        this.transition(task.id, task.projectId, task.state, "failed", {
+          reason: `stalled: task stuck in '${task.state}' beyond staleness threshold`,
+          iteration: task.iteration
+        });
 
         await this.finalizeTerminalTask(task.id);
       }
@@ -993,7 +1190,7 @@ export class OrchestratorService {
         budgetSeconds: 600
       });
 
-      const metaDispatch = this.selectPersonaForDispatch("meta", {
+      const metaDispatch = await this.selectPersonaForDispatch("meta", {
         description: focus ?? "meta improvement",
         tier: "STANDARD",
         projectId
@@ -1064,6 +1261,7 @@ export class OrchestratorService {
       const operation = validation.value.operation;
       const handleResult = handleMetaOperation({
         db: this.deps.db,
+        recordEvent: (event) => this.recordEvent(event),
         operation,
         metaTaskId,
         worktreePath: worktree.path,
@@ -1126,7 +1324,74 @@ export class OrchestratorService {
    * any pending lesson retirements that were deferred by the propose_fork op
    * (see meta-operations.ts Task 7 §6.4).
    */
-  async approveFork(experimentId: string): Promise<{ variantId: string }> {
+  listPendingForkExperiments(): Array<Record<string, unknown>> {
+    return (this.deps.db.sqlite.query(`
+      SELECT id, hypothesis, change_description, metric_name, metric_before,
+             operation, evidence, status, proposed_content, created_at
+        FROM experiments
+       WHERE status = 'proposed'
+         AND operation = 'fork'
+       ORDER BY created_at DESC, id ASC
+    `).all() as Array<Record<string, unknown>>).map((row) => {
+      const evidence = typeof row.evidence === "string" && row.evidence.length > 0
+        ? JSON.parse(row.evidence) as Record<string, unknown>
+        : {};
+      return {
+        experiment_id: row.id,
+        hypothesis: row.hypothesis,
+        evidence,
+        parent_variant_id: evidence.parent_variant_id ?? null,
+        proposed_specialty: evidence.specialty ?? null,
+        proposed_content_preview: typeof row.proposed_content === "string"
+          ? row.proposed_content.slice(0, 500)
+          : "",
+        created_at: row.created_at
+      };
+    });
+  }
+
+  rejectFork(experimentId: string, reviewer?: string, reason?: string): void {
+    const row = this.deps.db.sqlite.query(`
+      SELECT id, operation, status
+        FROM experiments
+       WHERE id = ?
+    `).get(experimentId) as { id: string; operation: string; status: string } | undefined;
+
+    if (!row) throw new Error("experiment not found");
+    if (row.operation !== "fork" || row.status !== "proposed") {
+      throw new Error("experiment not a proposed fork");
+    }
+
+    this.deps.db.transaction(() => {
+      this.deps.db.sqlite.query(`
+        UPDATE experiments
+           SET status = 'discard',
+               human_notes = ?,
+               completed_at = datetime('now')
+         WHERE id = ?
+      `).run(reason ?? null, experimentId);
+
+      this.recordEvent({
+        taskId: experimentId,
+        projectId: "meta",
+        agent: "orchestrator",
+        type: "fork_rejected",
+        status: "done",
+        payload: {
+          experiment_id: experimentId,
+          reviewer: reviewer ?? null,
+          reason: reason ?? null
+        },
+        budgetSeconds: 0,
+        analyticsOnly: true
+      });
+    });
+  }
+
+  async approveFork(
+    experimentId: string,
+    opts: { approver?: string; notes?: string } = {}
+  ): Promise<{ variantId: string }> {
     const row = this.deps.db.sqlite.query(`
       SELECT id, operation, status, proposed_content, evidence
         FROM experiments
@@ -1160,11 +1425,33 @@ export class OrchestratorService {
     const pendingRetireIds = Array.isArray(evidence.pending_retire_lessons)
       ? (evidence.pending_retire_lessons as unknown[]).filter((x): x is string => typeof x === "string")
       : [];
+    const forkProposalId = typeof evidence.fork_proposal_id === "string" ? evidence.fork_proposal_id : null;
 
     const variantId = randomUUID();
     const proposedContent = row.proposed_content;
+    const lineageRootId = this.deps.db.resolveLineageRoot(parentId) ?? parentId;
+    let specialtyEmbedding: Buffer | null = null;
+    try {
+      specialtyEmbedding = serializeEmbedding(await this.embeddingProvider.embed(specialty));
+    } catch {
+      specialtyEmbedding = null;
+    }
 
     this.deps.db.transaction(() => {
+      if (forkProposalId) {
+        const proposal = this.deps.db.getForkProposal(forkProposalId);
+        if (!proposal || proposal.status !== "open") {
+          throw new Error("fork proposal not open");
+        }
+      }
+
+      const transition = this.deps.db.sqlite.query(
+        "UPDATE experiments SET status = 'active' WHERE id = ? AND status = 'proposed'"
+      ).run(experimentId);
+      if (transition.changes !== 1) {
+        throw new Error("experiment not a proposed fork");
+      }
+
       this.deps.db.sqlite.query(`
         INSERT INTO skill_versions
           (id, skill_name, version, content, experiment_id,
@@ -1182,6 +1469,10 @@ export class OrchestratorService {
         $specialty: specialty
       });
 
+      if (specialtyEmbedding) {
+        this.deps.db.updateSpecialtyEmbedding(variantId, specialtyEmbedding);
+      }
+
       this.deps.db.appendTrafficAllocatedEvent({
         variantId,
         agentType: parent.skill_name.startsWith("persona:")
@@ -1194,13 +1485,37 @@ export class OrchestratorService {
         reason: "meta_fork_approved"
       });
 
-      this.deps.db.sqlite.query(
-        "UPDATE experiments SET status = 'active' WHERE id = ?"
-      ).run(experimentId);
-
       if (pendingRetireIds.length > 0) {
         this.deps.db.retireLessons(pendingRetireIds);
       }
+
+      if (forkProposalId) {
+        const marked = this.deps.db.markForkProposalActedOn(forkProposalId, experimentId);
+        if (!marked) {
+          throw new Error("fork proposal not open");
+        }
+      }
+
+      this.recordEvent({
+        taskId: experimentId,
+        projectId: "meta",
+        agent: "orchestrator",
+        type: "fork_approved",
+        status: "done",
+        payload: {
+          experiment_id: experimentId,
+          variant_id: variantId,
+          new_variant_id: variantId,
+          parent_variant_id: parentId,
+          parent_id: parentId,
+          lineage_root_id: lineageRootId,
+          specialty,
+          approver: opts.approver ?? null,
+          notes: opts.notes ?? null
+        },
+        budgetSeconds: 0,
+        analyticsOnly: true
+      });
     });
 
     return { variantId };
@@ -1235,7 +1550,7 @@ export class OrchestratorService {
 
       for (const subtask of planSubtasks) {
         const subtaskAgentType = subtask.agentType ?? "coder";
-        const subtaskDispatch = this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
+        const subtaskDispatch = await this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
         const subtaskPersonaId = subtaskDispatch.selection.variantId;
         const subtaskSkillIds = this.skills.snapshotIds(subtaskAgentType);
         const coderExecutor = this.routeExecutor(tier, subtaskAgentType);
@@ -1254,11 +1569,16 @@ export class OrchestratorService {
           injectedLessonIds: coderLessons.ids
         });
 
+        const coderSteering = this.steeringForDispatch(taskId);
+        const baseCoderPrompt = buildCoderPrompt(description, subtask, iteration);
+        const coderPrompt = coderSteering.prompt
+          ? `${coderSteering.prompt}\n\n${baseCoderPrompt}`
+          : baseCoderPrompt;
         const liveTask = {
           id: subtask.id,
           type: subtaskAgentType,
           systemPrompt: subtaskDispatch.content,
-          prompt: buildCoderPrompt(description, subtask, iteration),
+          prompt: coderPrompt,
           workingDirectory: worktreePath,
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: this.agentEnvironment(),
@@ -1266,6 +1586,14 @@ export class OrchestratorService {
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
         };
+        this.recordSteeringConsumed({
+          taskId,
+          projectId,
+          steeringEventIds: coderSteering.eventIds,
+          agentType: subtaskAgentType,
+          iteration,
+          personaVariantId: subtaskPersonaId
+        });
         const coderResult = await coderExecutor.execute(liveTask);
 
         await this.runShadowDispatchesSafely({
@@ -1331,7 +1659,24 @@ export class OrchestratorService {
 
         // Orchestrator commits agent output — agents never push directly.
         this.deps.worktrees.commit({ branch, path: worktreePath }, `autoforge: ${subtask.description}`);
+        this.recordCheckpoint({
+          taskId,
+          projectId,
+          iteration,
+          stage: "executing",
+          worktreePath,
+          label: `subtask-${subtask.sequence}`
+        });
       }
+
+      await this.runLifecyclePhase({
+        taskId,
+        projectId,
+        fromStage: "executing",
+        phase: "post_coder_pre_review",
+        worktreePath,
+        iteration
+      });
 
       this.transition(taskId, projectId, "executing", "reviewing", { iteration });
 
@@ -1340,7 +1685,7 @@ export class OrchestratorService {
         break;
       }
 
-      const reviewerDispatch = this.selectPersonaForDispatch("reviewer", { description, tier, projectId });
+      const reviewerDispatch = await this.selectPersonaForDispatch("reviewer", { description, tier, projectId });
       const reviewerPersonaId = reviewerDispatch.selection.variantId;
       const reviewerSkillIds = this.skills.snapshotIds("reviewer");
       const reviewerExecutor = this.routeExecutor(tier, "reviewer");
@@ -1357,11 +1702,16 @@ export class OrchestratorService {
         injectedLessonIds: reviewerLessons.ids
       });
 
+      const reviewerSteering = this.steeringForDispatch(taskId);
+      const baseReviewerPrompt = buildReviewerPrompt(description, planSubtasks);
+      const reviewerPrompt = reviewerSteering.prompt
+        ? `${reviewerSteering.prompt}\n\n${baseReviewerPrompt}`
+        : baseReviewerPrompt;
       const reviewerTask = {
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
         systemPrompt: reviewerDispatch.content,
-        prompt: buildReviewerPrompt(description, planSubtasks),
+        prompt: reviewerPrompt,
         workingDirectory: worktreePath,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: this.agentEnvironment(),
@@ -1369,6 +1719,14 @@ export class OrchestratorService {
         metadata: { taskId, iteration, description },
         lessons: reviewerLessons.block || undefined
       } as const;
+      this.recordSteeringConsumed({
+        taskId,
+        projectId,
+        steeringEventIds: reviewerSteering.eventIds,
+        agentType: "reviewer",
+        iteration,
+        personaVariantId: reviewerPersonaId
+      });
       const reviewResult = await reviewerExecutor.execute(reviewerTask);
 
       await this.runShadowDispatchesSafely({
@@ -1491,6 +1849,15 @@ export class OrchestratorService {
       });
     }
 
+    await this.runLifecyclePhase({
+      taskId,
+      projectId,
+      fromStage: "reviewing",
+      phase: "pre_pr_gate",
+      worktreePath,
+      iteration
+    });
+
     const runTests = this.deps.testRunner ?? runAuthenticatedTests;
     const testResult = await runTests(worktreePath, projectId);
 
@@ -1602,6 +1969,17 @@ export class OrchestratorService {
       failure_category: failureCategory,
       failure_reason: failureReason
     });
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (worktreePath) {
+      this.recordCheckpoint({
+        taskId,
+        projectId,
+        iteration: this.requireTask(taskId).iteration,
+        stage: "awaiting_intervention",
+        worktreePath,
+        label: `${fromStage}:${failureCategory}`
+      });
+    }
     throw new StageFailedError(taskId, fromStage, failureReason);
   }
 
@@ -1649,10 +2027,10 @@ export class OrchestratorService {
     };
   }
 
-  private selectPersonaForDispatch(
+  private async selectPersonaForDispatch(
     agentType: AgentType,
     taskContext: { description: string; tier: Tier; projectId: string }
-  ): { selection: SelectionResult; content: string; specialty: string | null; baselineVariantId: string | null } {
+  ): Promise<{ selection: SelectionResult; content: string; specialty: string | null; baselineVariantId: string | null }> {
     let population = this.deps.db.loadDispatchPopulation(agentType);
     if (population.length === 0) {
       this.personas.snapshotId(agentType);
@@ -1661,7 +2039,7 @@ export class OrchestratorService {
     this.personas.ensureDispatchBaseline(agentType);
     population = this.deps.db.loadDispatchPopulation(agentType);
 
-    const selection = this.dispatcher.selectVariant(agentType, taskContext);
+    const selection = await this.dispatcher.selectVariant(agentType, taskContext);
     const selected = population.find((variant) => variant.id === selection.variantId) ?? null;
     const baseline = population.find((variant) => variant.status === "baseline") ?? null;
     return {
@@ -1776,10 +2154,12 @@ export class OrchestratorService {
     personaVersionId?: string;
     skillVersionIds?: string[];
     resumable?: boolean;
+    analyticsOnly?: boolean;
   }): void {
     const provenance: Record<string, unknown> = {};
     if (input.personaVersionId) provenance.persona_version_id = input.personaVersionId;
     if (input.skillVersionIds?.length) provenance.skill_version_ids = input.skillVersionIds;
+    if (input.analyticsOnly) provenance.__analytics_only = true;
 
     const message: AutoforgeMessage = {
       id: randomUUID(),
@@ -1799,7 +2179,9 @@ export class OrchestratorService {
 
     this.deps.db.transaction(() => {
       this.deps.db.appendEvent(message, { executorUsed: input.executorUsed });
-      this.deps.db.applyEvent(message);
+      if (!input.analyticsOnly) {
+        this.deps.db.applyEvent(message);
+      }
     });
 
     // Publish to NATS JetStream asynchronously (fire-and-forget; SQLite is the source of truth).
@@ -1852,6 +2234,9 @@ export class OrchestratorService {
     // reliably. Claude Code fallback for local dev without SDK credentials.
     if (agentType === "reflector") return set.sdk ?? set.claudeCode;
 
+    // Diagnostician should prefer SDK for structured JSON payloads.
+    if (agentType === "diagnostician") return set.sdk ?? set.claudeCode;
+
     // Meta agent always gets Claude Code — needs broad exploration.
     if (agentType === "meta") return set.claudeCode;
 
@@ -1859,6 +2244,158 @@ export class OrchestratorService {
     if (tier === "EXPRESS" && set.sdk) return set.sdk;
 
     return set.claudeCode;
+  }
+
+  private recordCheckpoint(input: {
+    taskId: string;
+    projectId: string;
+    iteration: number;
+    stage: TaskCheckpointStage;
+    worktreePath: string;
+    label: string;
+  }): void {
+    const gitSha = this.deps.worktrees.currentHead(input.worktreePath);
+    if (!gitSha) return;
+    this.recordEvent({
+      taskId: input.taskId,
+      projectId: input.projectId,
+      agent: "orchestrator",
+      type: "checkpoint_created",
+      status: "done",
+      payload: {
+        checkpoint_id: randomUUID(),
+        task_id: input.taskId,
+        iteration: input.iteration,
+        stage: input.stage,
+        git_sha: gitSha,
+        label: input.label
+      },
+      budgetSeconds: 60
+    });
+  }
+
+  private steeringForDispatch(taskId: string): { prompt: string; eventIds: string[] } {
+    const pending = collectPendingSteering(this.deps.db.listEvents(taskId));
+    return {
+      prompt: renderSteeringPrompt(pending),
+      eventIds: pending.map((message) => message.eventId)
+    };
+  }
+
+  private recordSteeringConsumed(input: {
+    taskId: string;
+    projectId: string;
+    steeringEventIds: string[];
+    agentType: AgentType;
+    iteration: number;
+    personaVariantId: string;
+  }): void {
+    if (input.steeringEventIds.length === 0) return;
+    if (!["planner", "coder", "reviewer", "doc"].includes(input.agentType)) return;
+    this.recordEvent({
+      taskId: input.taskId,
+      projectId: input.projectId,
+      agent: "orchestrator",
+      type: "steering_consumed",
+      status: "done",
+      payload: {
+        steering_event_ids: input.steeringEventIds,
+        agent_type: input.agentType,
+        iteration: input.iteration,
+        persona_variant_id: input.personaVariantId
+      },
+      budgetSeconds: 60
+    });
+  }
+
+  private async runLifecyclePhase(input: {
+    taskId: string;
+    projectId: string;
+    fromStage: TaskStage;
+    phase: LifecycleHookPhase;
+    worktreePath: string;
+    iteration: number;
+  }): Promise<void> {
+    if (this.deps.env.NODE_ENV === "test" && this.deps.env.AUTOFORGE_ENABLE_TEST_HOOKS !== "1") {
+      return;
+    }
+    const runHooks = this.deps.lifecycleHookRunner ?? runLifecycleHooks;
+    const hookResults = runHooks({
+      phase: input.phase,
+      workingDirectory: input.worktreePath,
+      timeoutSeconds: this.deps.env.AUTOFORGE_HOOK_TIMEOUT_SECONDS
+    });
+    for (const run of hookResults.runs) {
+      this.recordLifecycleHookEvent(input, run);
+      if (run.result === "failed") {
+        this.pauseForIntervention({
+          taskId: input.taskId,
+          projectId: input.projectId,
+          fromStage: input.fromStage,
+          failureCategory: "lifecycle_hook_failed",
+          failureReason: `Lifecycle hook failed (${run.phase}${run.script ? `:${run.script}` : ""})`,
+          forensics: this.lifecycleHookForensics(input.iteration, run)
+        });
+      }
+    }
+  }
+
+  private recordLifecycleHookEvent(
+    context: {
+      taskId: string;
+      projectId: string;
+      iteration: number;
+    },
+    run: LifecycleHookRun
+  ): void {
+    const payload = this.lifecycleHookForensics(context.iteration, run);
+
+    if (run.result === "failed") {
+      this.recordEvent({
+        taskId: context.taskId,
+        projectId: context.projectId,
+        agent: "orchestrator",
+        type: "lifecycle_hook_failed",
+        status: "failed",
+        payload,
+        budgetSeconds: 60
+      });
+      return;
+    }
+
+    this.recordEvent({
+      taskId: context.taskId,
+      projectId: context.projectId,
+      agent: "orchestrator",
+      type: "lifecycle_hook_completed",
+      status: run.skipped ? "done_with_concerns" : "done",
+      payload,
+      budgetSeconds: 60
+    });
+  }
+
+  private lifecycleHookForensics(iteration: number, run: LifecycleHookRun): Record<string, unknown> {
+    return {
+      phase: run.phase,
+      script: run.script,
+      command: run.command,
+      skipped: run.skipped,
+      skip_reason: run.skipReason,
+      result: run.result,
+      failure_reason: run.failureReason,
+      exit_code: run.exitCode,
+      timed_out: run.timedOut,
+      elapsed_seconds: run.elapsedSeconds,
+      stdout_excerpt: run.stdoutExcerpt,
+      stderr_excerpt: run.stderrExcerpt,
+      log_path: run.logPath,
+      changed_file_count: run.changedFileCount,
+      lines_added: run.linesAdded,
+      lines_deleted: run.linesDeleted,
+      committed: run.committed,
+      commit_sha: run.commitSha,
+      iteration
+    };
   }
 
   private cleanupWorktree(taskId: string): void {

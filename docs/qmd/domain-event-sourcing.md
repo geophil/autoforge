@@ -191,6 +191,67 @@ export function taskSubject(projectId, taskId, event): string {
 }
 ```
 
+### Spec D Population Events
+
+Population operations are still ordinary append-only `events` rows. The important event types are:
+
+| Event type | Emitted by | Purpose |
+|------------|------------|---------|
+| `variant_selected` | `OrchestratorService.emitVariantSelected()` | Records selected variant, `selection_rationale`, eligible IDs, shadow candidate IDs, specialty, and injected lesson IDs for one live dispatch. |
+| `shadow_run_completed` | `src/orchestrator/shadow.ts` | Records paired candidate-vs-baseline shadow execution, score components, injected lesson counts, and errors without affecting live task outcome. |
+| `traffic_allocated` | `adjustVariantAllocation()` and fork approval | Records every variant `status` or `traffic_share` allocation change, including graduation, promotion, demotion, retirement, fork approval, merge, and baseline swaps. |
+| `diagnostic_run_completed` | `runDiagnostic()` | Records diagnostics trigger, tasks analyzed, clusters proposed, elapsed time, and any diagnostic error. |
+| `diagnostic_cluster_detected` | `runDiagnostic()` | Records one diagnostician-discovered niche cluster and links it to a `fork_proposals` row. |
+| `fork_approved` | `OrchestratorService.approveFork()` | Records human approval of a proposed fork and the created candidate variant ID. |
+| `fork_rejected` | `OrchestratorService.rejectFork()` | Records human rejection of a proposed fork experiment with reviewer and reason metadata. |
+| `variants_merged` | `handleMerge()` | Records merge operation metadata, survivor/retired IDs, and specialty/content consolidation. |
+
+### Harness Control Events (No Schema Migration Required)
+
+The following control events use the existing type-agnostic `events` table and do not require new projection tables:
+
+| Event type | Emitted by | Purpose |
+|------------|------------|---------|
+| `checkpoint_created` | `OrchestratorService.recordCheckpoint()` | Durable rollback anchor with `checkpoint_id`, `stage`, `iteration`, and `git_sha`. |
+| `rollback_applied` | `OrchestratorService.retryFromIntervention()` | Records rollback target checkpoint and before/after iteration/head metadata. |
+| `steering_message` | `OrchestratorService.addSteeringMessage()` | Queues operator steering to be injected at next safe dispatch boundary. |
+| `steering_consumed` | `OrchestratorService.recordSteeringConsumed()` | Marks queued steering as consumed by a specific dispatch. |
+| `lifecycle_hook_completed` | `OrchestratorService.runLifecyclePhase()` | Records lifecycle hook execution details (or skip reason) per phase/script. |
+| `lifecycle_hook_failed` | `OrchestratorService.runLifecyclePhase()` | Records hook failure forensics before pausing task in `awaiting_intervention`. |
+
+NATS impact: `recordEvent()` publishes all six event types on the same `autoforge.task.{projectId}.{taskId}.{event.type}` contract, so downstream consumers should decide whether to render, aggregate, or filter these control-plane events.
+
+### `fork_proposals` Table
+
+The diagnostician writes proposed population niches into `fork_proposals`. Rows start as `open`; approval connects the proposal to an experiment and marks it acted on, while stale/dismissed rows remain searchable for operator review.
+
+```sql
+-- src/db/migrations/009_fork_proposals.sql
+CREATE TABLE IF NOT EXISTS fork_proposals (
+  id                      TEXT PRIMARY KEY,
+  agent_type              TEXT NOT NULL,
+  generator               TEXT NOT NULL DEFAULT 'diagnostician',
+  label                   TEXT NOT NULL,
+  keywords                TEXT NOT NULL,
+  suggested_specialty     TEXT NOT NULL,
+  representative_task_ids TEXT NOT NULL,
+  baseline_score_mean     REAL NOT NULL,
+  population_score_mean   REAL NOT NULL,
+  score_gap               REAL NOT NULL,
+  recommendation_strength TEXT NOT NULL CHECK (recommendation_strength IN ('weak', 'moderate', 'strong')),
+  status                  TEXT NOT NULL DEFAULT 'open'
+);
+```
+
+### `skill_versions.specialty_embedding` Column
+
+Specialist eligibility uses an opaque serialized vector on each variant. `filterSpecialtyEligible()` compares task-description embeddings to `skill_versions.specialty_embedding`; if no comparable embedding exists, it falls back to keyword matching against `specialty`.
+
+```sql
+-- src/db/migrations/010_specialty_embedding.sql
+ALTER TABLE skill_versions ADD COLUMN specialty_embedding BLOB;
+```
+
 ## Integration Points
 
 - **Task Orchestration**: Every `transition()` and `recordEvent()` call in `OrchestratorService` writes through this domain.
@@ -203,7 +264,9 @@ export function taskSubject(projectId, taskId, event): string {
 |------|---------|
 | `src/db/client.ts` | `DbClient` — SQLite wrapper, `appendEvent`, `applyEvent`, `rebuildProjectionsFromEvents` |
 | `src/db/projections.ts` | `applyEventProjection` — upsert logic for tasks/subtasks/findings from event payloads |
-| `src/db/schema.sql` | Full schema: events, tasks, subtasks, review_findings, experiments, skill_versions, routing_calibration |
+| `src/db/schema.sql` | Base schema: events, tasks, subtasks, review_findings, experiments, skill_versions, routing_calibration |
+| `src/db/migrations/009_fork_proposals.sql` | `fork_proposals` table for diagnostician-generated fork niches |
+| `src/db/migrations/010_specialty_embedding.sql` | `skill_versions.specialty_embedding` BLOB for specialty classifier eligibility |
 | `src/nats/client.ts` | `NatsClient` — connect, `publishTaskEvent`, `replayTaskEvents` |
 | `src/nats/streams.ts` | `ensureJetStreamStreams` — TASKS, META, SYSTEM stream provisioning |
 | `src/nats/messages.ts` | `AutoforgeMessage` schema (Zod), `taskSubject` helper |

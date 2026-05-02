@@ -1,6 +1,6 @@
 # Data Models
 
-Complete type and schema reference across all Autoforge domains.
+Core type and schema reference across Autoforge domains. This document highlights the tables, views, and TypeScript types most often needed for QMD retrieval; consult `src/db/schema.sql` and `src/db/migrations/*.sql` for exhaustive DDL.
 
 ## PipelineTask
 
@@ -21,12 +21,14 @@ export interface PipelineTask {
   prUrl?: string;
   createdAt: string;   // ISO 8601
   updatedAt: string;
+  archivedAt?: string;
 }
 
 export type TaskStage =
-  | "received" | "assessing" | "planning" | "executing"
-  | "reviewing" | "reworking" | "pr_created" | "awaiting_approval"
-  | "documenting" | "completed" | "failed";
+  | "received" | "assessing" | "planning" | "awaiting_plan_approval"
+  | "replanning" | "executing" | "reviewing" | "reworking"
+  | "pr_created" | "awaiting_approval" | "documenting"
+  | "awaiting_intervention" | "completed" | "failed";
 
 export type Tier = "EXPRESS" | "STANDARD" | "THOROUGH";
 ```
@@ -44,7 +46,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   iteration   INTEGER NOT NULL DEFAULT 0,
   pr_url      TEXT,
   created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
+  updated_at  TEXT NOT NULL,
+  archived_at TEXT
 );
 ```
 
@@ -174,9 +177,14 @@ export type AutoforgeMessage<T = unknown> = {
   tokenUsage?: { input: number; output: number; estimatedCost: number };
 };
 
-export type AgentType = "planner" | "coder" | "reviewer" | "doc" | "doc-review" | "pr" | "orchestrator" | "meta";
+export type AgentType =
+  | "planner" | "coder" | "reviewer" | "doc" | "doc-review"
+  | "pr" | "orchestrator" | "meta"
+  | "reflector" | "diagnostician";
 export type TaskStatus = "pending" | "in_progress" | "done" | "done_with_concerns" | "blocked" | "needs_context" | "failed" | "timeout";
 ```
+
+Spec D event types stored in `events.event_type` include `variant_selected`, `shadow_run_completed`, `traffic_allocated`, `diagnostic_run_completed`, `diagnostic_cluster_detected`, `fork_approved`, `fork_rejected`, and `variants_merged`. See `domain-event-sourcing.md` > Spec D Population Events.
 
 ## ProjectConfig
 
@@ -233,7 +241,7 @@ export interface RejectionFeedback {
 
 ## Experiment (Meta-Loop)
 
-**Owned by**: (planned meta-loop domain)
+**Owned by**: `domain-task-orchestration.md`, `domain-web-api.md`
 **Storage**: `experiments` table
 
 ```sql
@@ -252,11 +260,49 @@ CREATE TABLE IF NOT EXISTS experiments (
   created_at           TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at         TEXT
 );
+
+-- src/db/migrations/004_experiments_evidence.sql
+ALTER TABLE experiments ADD COLUMN operation TEXT NOT NULL DEFAULT 'edit';
+ALTER TABLE experiments ADD COLUMN evidence TEXT;
+
+-- src/db/migrations/008_experiments_proposed_content.sql
+ALTER TABLE experiments ADD COLUMN proposed_content TEXT;
 ```
 
-## SkillVersion
+`operation` records curator/meta operation kind (`edit`, `fork`, `merge`, `promote`, `demote`, `retire`). `evidence` stores JSON evidence plus `meta_task_id`; `proposed_content` stores proposed prompt content for approval workflows where a file artifact would not survive.
 
-**Owned by**: (planned meta-loop domain)
+## AgentTranscript
+
+**Owned by**: `domain-agent-execution.md`, `domain-web-api.md`
+**Storage**: `agent_transcripts` table
+
+```sql
+-- src/db/schema.sql plus src/db/migrations/003_transcripts_variant.sql
+CREATE TABLE IF NOT EXISTS agent_transcripts (
+  id              TEXT PRIMARY KEY,
+  task_id         TEXT NOT NULL,
+  stage           TEXT NOT NULL,
+  attempt         INTEGER NOT NULL,
+  created_at      TEXT NOT NULL,
+  executor_used   TEXT NOT NULL,
+  model           TEXT,
+  system_prompt   TEXT NOT NULL,
+  user_prompt     TEXT NOT NULL,
+  transcript      TEXT NOT NULL,
+  output          TEXT,
+  critique        TEXT,
+  token_input     INTEGER,
+  token_output    INTEGER,
+  elapsed_seconds REAL,
+  persona_version_id TEXT
+);
+```
+
+`persona_version_id` links planner attempts and other captured transcripts back to the selected population variant. `GET /api/transcripts/by-task/:taskId` lists rows, and `GET /api/transcripts/:id` fetches a single transcript.
+
+## SkillVersion Population Variant
+
+**Owned by**: `domain-agent-execution.md`, `domain-task-orchestration.md`
 **Storage**: `skill_versions` table
 
 ```sql
@@ -269,7 +315,110 @@ CREATE TABLE IF NOT EXISTS skill_versions (
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   is_active     INTEGER NOT NULL DEFAULT 0
 );
+
+-- src/db/migrations/001_population_schema.sql
+ALTER TABLE skill_versions ADD COLUMN parent_version_id TEXT;
+ALTER TABLE skill_versions ADD COLUMN specialty TEXT;
+ALTER TABLE skill_versions ADD COLUMN status TEXT NOT NULL DEFAULT 'candidate';
+ALTER TABLE skill_versions ADD COLUMN traffic_share REAL NOT NULL DEFAULT 0.0;
+
+-- src/db/migrations/010_specialty_embedding.sql
+ALTER TABLE skill_versions ADD COLUMN specialty_embedding BLOB;
 ```
+
+`skill_versions` is population-shaped. Each `skill_name` such as `persona:coder` has one `baseline`, may have live `active` variants receiving weighted traffic, may have `candidate` variants evaluated by `shadow_run_completed`, and may retain `demoted` or `retired` variants for history. `specialty` describes the niche; `specialty_embedding` stores serialized vector bytes used by `filterSpecialtyEligible()` before keyword fallback. `is_active` remains only for compatibility and is synced from `status IN ('baseline', 'active')`.
+
+## ForkProposal
+
+**Owned by**: `domain-event-sourcing.md`, `domain-web-api.md`
+**Storage**: `fork_proposals` table
+
+```sql
+-- src/db/migrations/009_fork_proposals.sql
+CREATE TABLE IF NOT EXISTS fork_proposals (
+  id                      TEXT PRIMARY KEY,
+  agent_type              TEXT NOT NULL,
+  generated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+  generator               TEXT NOT NULL DEFAULT 'diagnostician',
+  label                   TEXT NOT NULL,
+  keywords                TEXT NOT NULL,
+  suggested_specialty     TEXT NOT NULL,
+  representative_task_ids TEXT NOT NULL,
+  baseline_score_mean     REAL NOT NULL,
+  population_score_mean   REAL NOT NULL,
+  score_gap               REAL NOT NULL,
+  recommendation_strength TEXT NOT NULL CHECK (recommendation_strength IN ('weak', 'moderate', 'strong')),
+  status                  TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'acted_on', 'stale', 'dismissed')),
+  acted_on_experiment_id  TEXT REFERENCES experiments(id),
+  closed_at               TEXT
+);
+```
+
+`diagnostician` creates these rows from recent task histories. `GET /api/experiments?status=proposed&operation=fork` exposes matching fork experiments for approval, while `POST /api/experiments/:id/approve-fork` turns an approved first fork into a `candidate` variant.
+
+## Lesson
+
+**Owned by**: `domain-agent-execution.md`, `domain-task-orchestration.md`
+**Storage**: `lessons` table
+
+```sql
+-- src/db/migrations/007_lessons.sql
+CREATE TABLE IF NOT EXISTS lessons (
+  id                 TEXT PRIMARY KEY,
+  agent_type         TEXT NOT NULL,
+  lineage_root_id    TEXT NOT NULL REFERENCES skill_versions(id),
+  source_task_id     TEXT NOT NULL REFERENCES tasks(id),
+  source_variant_id  TEXT NOT NULL REFERENCES skill_versions(id),
+  trigger_pattern    TEXT NOT NULL,
+  failure_category   TEXT,
+  finding_categories TEXT,
+  body               TEXT NOT NULL,
+  outcome_kind       TEXT NOT NULL CHECK (outcome_kind IN ('corrective', 'reinforcing')),
+  retrieval_keywords TEXT,
+  status             TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'superseded', 'retired')),
+  superseded_by      TEXT REFERENCES lessons(id),
+  created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  retired_at         TEXT
+);
+```
+
+`reflectOnTask()` inserts active lineage lessons after terminal task states. Dispatch retrieves active lessons for the selected variant lineage and injects them into the agent prompt.
+
+## TaskDiffStats and TaskIterationDiffs
+
+**Owned by**: `domain-task-orchestration.md`
+**Storage**: `task_diff_stats`, `task_iteration_diffs`
+
+```sql
+-- src/db/migrations/002_task_diff_stats.sql
+CREATE TABLE IF NOT EXISTS task_diff_stats (
+  task_id            TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id),
+  files_changed      INTEGER NOT NULL,
+  files_added        INTEGER NOT NULL,
+  files_modified     INTEGER NOT NULL,
+  files_deleted      INTEGER NOT NULL,
+  lines_added        INTEGER NOT NULL,
+  lines_deleted      INTEGER NOT NULL,
+  test_files_changed INTEGER NOT NULL,
+  captured_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS task_iteration_diffs (
+  task_id            TEXT NOT NULL REFERENCES tasks(id),
+  from_iteration     INTEGER NOT NULL,
+  to_iteration       INTEGER NOT NULL,
+  files_changed      INTEGER NOT NULL,
+  lines_added        INTEGER NOT NULL,
+  lines_deleted      INTEGER NOT NULL,
+  test_files_changed INTEGER NOT NULL,
+  diff_summary       TEXT,
+  captured_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (task_id, from_iteration, to_iteration)
+);
+```
+
+`task_diff_stats` captures cumulative task change size for reward scoring; `task_iteration_diffs` captures rework deltas.
 
 ## RoutingCalibration
 
@@ -293,7 +442,7 @@ CREATE TABLE IF NOT EXISTS routing_calibration (
 
 ## Materialized Views
 
-Two read-only views aggregate event and task data for performance analysis. Both are queried by the development workflow (see `development-workflow.md`).
+Read-only views aggregate task outcomes, agent attribution, reward signals, and population health. They are queried by the dashboard, meta/diagnostic workflows, and development scripts.
 
 ### task_outcomes
 
@@ -344,6 +493,15 @@ WHERE e.agent IN ('planner', 'coder', 'reviewer', 'doc')
 GROUP BY json_extract(e.payload, '$.persona_version_id'), e.agent;
 ```
 
+### Reward Views
+
+Spec D reward views are defined in `src/db/migrations/005_reward_views.sql` and refined by later migrations:
+
+- `task_quality_score` — per-task reward components: `r_correctness`, `r_simplicity`, `r_alignment`, `r_fidelity`, `r_efficiency`.
+- `variant_performance` — average reward components per selected `variant_id` and `agent_type` from `variant_selected` events.
+- `niche_performance` — variant performance grouped by tier, project, and finding category dimensions.
+- `population_health` — active/candidate/retired variant counts, allocated traffic share, and ensemble reward averages per agent type.
+
 ## Entity Relationship Summary
 
 ```
@@ -352,9 +510,19 @@ tasks                (1) ──< subtasks (N)
 tasks                (1) ──< review_findings (N)
 tasks                (1) ──< events (N)
 tasks                (1) ──< routing_calibration (N)
+tasks                (1) ──< agent_transcripts (N)
+tasks                (1) ──< task_diff_stats (0/1)
+tasks                (1) ──< task_iteration_diffs (N)
 experiments          (1) ──< skill_versions (N)
+experiments          (1) ──< fork_proposals (N, via acted_on_experiment_id)
+skill_versions       (1) ──< skill_versions (N, via parent_version_id)
+skill_versions       (1) ──< lessons (N, via lineage/source variant)
 task_outcomes        — view over tasks + events + review_findings
 agent_performance    — view over events + tasks + skill_versions
+task_quality_score   — reward view over tasks + findings + diff stats
+variant_performance  — reward view over variant_selected events
+niche_performance    — reward view by tier/project/finding category
+population_health    — reward view by agent population
 ```
 
-Tasks are the central entity. Every other table references `task_id`. Events are the authoritative record; `tasks`, `subtasks`, and `review_findings` are materialized projections rebuilt by replaying events.
+Tasks are the central entity for feature delivery. Events are the authoritative record; `tasks`, `subtasks`, and `review_findings` are materialized projections rebuilt by replaying events. Population state lives in `skill_versions`, `experiments`, `lessons`, and `fork_proposals`, with reward views deriving selection and outcome quality from event payloads.

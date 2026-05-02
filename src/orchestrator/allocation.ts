@@ -4,7 +4,7 @@ export type VariantStatus = "baseline" | "candidate" | "active" | "demoted" | "r
 
 export type AllocationReason =
   | "auto_graduation" | "auto_promote" | "auto_demote" | "auto_retire"
-  | "meta_promote" | "meta_demote" | "meta_retire" | "meta_fork_approved"
+  | "meta_promote" | "meta_demote" | "meta_retire" | "meta_fork_approved" | "meta_merge"
   | "baseline_swap" | "dispatch_bootstrap";
 
 export type AllocationOp =

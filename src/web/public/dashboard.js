@@ -174,17 +174,50 @@ async function refreshTaskDetail(taskId) {
     // render forensics without a second round trip.
     if (eventsRes.ok) {
       const allEvents = await eventsRes.json();
+      const checkpoints = [];
       for (let i = allEvents.length - 1; i >= 0; i--) {
         if (allEvents[i].type === "failure_analysis") {
           task.latestFailureAnalysis = allEvents[i];
           break;
         }
       }
+      for (const event of allEvents) {
+        if (event.type === "checkpoint_created") {
+          checkpoints.push(event);
+        }
+      }
+      task.checkpoints = checkpoints
+        .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+        .slice(0, 10);
+      task.pendingSteering = collectPendingSteeringEvents(allEvents);
     }
     renderTaskDetail(task);
   } catch {
     detailContent.innerHTML = `<div class="empty-state">Failed to load task.</div>`;
   }
+}
+
+function collectPendingSteeringEvents(events) {
+  const consumed = new Set();
+  for (const event of events) {
+    if (event.type !== "steering_consumed") continue;
+    const ids = event.payload?.steering_event_ids;
+    if (Array.isArray(ids)) {
+      for (const id of ids) {
+        if (typeof id === "string") consumed.add(id);
+      }
+    }
+  }
+
+  return events
+    .filter((event) => event.type === "steering_message")
+    .filter((event) => !consumed.has(event.id))
+    .map((event) => ({
+      id: event.id,
+      timestamp: event.timestamp,
+      message: event.payload?.message || "",
+      author: event.payload?.author || "operator"
+    }));
 }
 
 function renderTaskDetail(task) {
@@ -194,6 +227,24 @@ function renderTaskDetail(task) {
   const terminalStates = ["completed", "failed"];
   const nonTerminalStates = ["received", "assessing", "planning", "awaiting_plan_approval", "replanning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting", "awaiting_intervention"];
   let actionsHtml = "";
+  const pendingSteering = Array.isArray(task.pendingSteering) ? task.pendingSteering : [];
+  const pendingSteeringHtml = pendingSteering.length > 0
+    ? `<div class="forensic-row"><span class="forensic-label">Pending steering</span>
+        <span class="forensic-value">${pendingSteering.map((item) =>
+          `<div style="margin-bottom:0.35rem;"><code>${esc(item.author || "operator")}</code> · ${esc(timeAgo(item.timestamp))}<br>${esc(item.message)}</div>`
+        ).join("")}</span></div>`
+    : `<div class="forensic-row"><span class="forensic-label">Pending steering</span><span class="forensic-value">none</span></div>`;
+  const steeringComposer = `
+    <div class="intervention-rollback">
+      <label for="steering-input" class="forensic-label">Steer next attempt</label>
+      <textarea id="steering-input" class="critique-input" rows="2" maxlength="4000"
+        placeholder="Guidance for the next agent attempt (not the currently running process)."></textarea>
+      ${pendingSteeringHtml}
+      <div style="margin-top:0.5rem;">
+        <button class="btn btn-secondary" onclick="submitSteering('${task.id}', this)">Queue Steering</button>
+      </div>
+    </div>
+  `;
 
   if (task.state === "awaiting_intervention") {
     const fa = task.latestFailureAnalysis?.payload ?? {};
@@ -217,6 +268,17 @@ function renderTaskDetail(task) {
     // with the current plan, or go back and re-plan from scratch.
     const canRetryFromPlanning = stageFailed === "planning" || stageFailed === "replanning" || stageFailed === "executing" || stageFailed === "reviewing";
     const canRetryFromExecuting = stageFailed === "executing" || stageFailed === "reviewing";
+    const checkpoints = Array.isArray(task.checkpoints) ? task.checkpoints : [];
+    const checkpointOptions = checkpoints.length
+      ? checkpoints.map((checkpoint) => {
+        const cp = checkpoint.payload || {};
+        const label = cp.label ?? "checkpoint";
+        const stage = cp.stage ?? "unknown";
+        const iterationLabel = cp.iteration != null ? `iter ${cp.iteration}` : "iter ?";
+        const shortSha = typeof cp.git_sha === "string" ? cp.git_sha.slice(0, 10) : "sha?";
+        return `<option value="${esc(cp.checkpoint_id)}">${esc(iterationLabel)} · ${esc(stage)} · ${esc(label)} · ${esc(shortSha)}</option>`;
+      }).join("")
+      : "";
     const retryButtons = [];
     if (canRetryFromPlanning) {
       retryButtons.push(`<button class="btn btn-approve" onclick="retryTask('${task.id}', 'planning', this)">Retry from Planning</button>`);
@@ -241,6 +303,18 @@ function renderTaskDetail(task) {
           ${toolStats}
           ${transcriptLink}
         </div>
+        <div class="intervention-rollback">
+          <label for="retry-checkpoint-id" class="forensic-label">Rollback checkpoint (optional)</label>
+          ${checkpoints.length > 0
+            ? `<select id="retry-checkpoint-id" class="critique-input" style="min-height: 40px;">
+                <option value="">No rollback (use current worktree state)</option>
+                ${checkpointOptions}
+              </select>`
+            : `<div class="forensic-value" style="margin-bottom: 0.5rem;">No checkpoints available yet.</div>`}
+          <textarea id="retry-operator-note" class="critique-input" rows="2" maxlength="4000"
+            placeholder="Optional operator note (saved on rollback/retry events)"></textarea>
+        </div>
+        ${steeringComposer}
         <div class="intervention-buttons">
           ${retryButtons.join("")}
           <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel task</button>
@@ -304,6 +378,7 @@ function renderTaskDetail(task) {
             maxlength="4000"></textarea>
           <div class="critique-counter" id="critique-counter">0 / 4000</div>
         </div>
+        ${steeringComposer}
         <div class="plan-review-buttons">
           <button class="btn btn-approve" onclick="approvePlan('${task.id}', this)">Approve &amp; Continue</button>
           <button class="btn btn-secondary" id="btn-critique"
@@ -323,6 +398,7 @@ function renderTaskDetail(task) {
   } else if (nonTerminalStates.includes(task.state)) {
     actionsHtml = `
       <div class="task-detail-actions">
+        ${steeringComposer}
         <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')">Cancel task</button>
       </div>`;
   }
@@ -784,23 +860,73 @@ async function critiquePlan(taskId, btnEl) {
 
 async function retryTask(taskId, fromStage, btnEl) {
   const label = fromStage === "planning" ? "Re-planning…" : "Retrying execution…";
+  const checkpointSelect = document.getElementById("retry-checkpoint-id");
+  const noteInput = document.getElementById("retry-operator-note");
+  const checkpointId = checkpointSelect?.value?.trim();
+  const operatorNote = noteInput?.value?.trim();
   await runAction(btnEl, label, btnEl?.closest(".intervention-buttons"), async () => {
     try {
+      const payload = {
+        fromStage,
+        ...(checkpointId ? { checkpointId } : {}),
+        ...(operatorNote ? { operatorNote } : {})
+      };
       const res = await fetch(`${API}/api/tasks/${taskId}/retry`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fromStage })
+        body: JSON.stringify(payload)
       });
+      const body = await res.json().catch(() => null);
       if (res.status === 409) {
+        if (body?.error === "checkpoint_unreachable") {
+          toast("Rollback failed: checkpoint is unreachable from current HEAD.", "error");
+          return;
+        }
+        if (body?.error === "checkpoint_not_found") {
+          toast("Rollback failed: checkpoint not found.", "error");
+          return;
+        }
         toast("Task is no longer paused for intervention.", "error");
         return;
       }
-      if (!res.ok) throw new Error(await res.text());
+      if (res.status === 400 && body?.error === "checkpoint_stage_after_retry_stage") {
+        toast("Checkpoint stage is later than the selected retry stage.", "error");
+        return;
+      }
+      if (!res.ok) throw new Error(body?.message ?? JSON.stringify(body) ?? "Retry failed");
       toast(`Retry started from ${fromStage}.`, "success");
       refreshTasks();
       refreshTaskDetail(taskId);
     } catch (err) {
       toast(`Retry failed: ${err.message}`, "error");
+    }
+  });
+}
+
+async function submitSteering(taskId, btnEl) {
+  const input = document.getElementById("steering-input");
+  const message = input?.value?.trim();
+  if (!message) {
+    toast("Enter steering guidance first.", "error");
+    return;
+  }
+  await runAction(btnEl, "Queueing…", btnEl?.closest(".intervention-rollback"), async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/steer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, scope: "next_attempt" })
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(body?.message ?? JSON.stringify(body) ?? "Failed to queue steering");
+      }
+      if (input) input.value = "";
+      toast("Steering queued for the next agent attempt.", "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Steering failed: ${err.message}`, "error");
     }
   });
 }
@@ -849,6 +975,7 @@ window.cancelTask = cancelTask;
 window.approvePlan = approvePlan;
 window.critiquePlan = critiquePlan;
 window.retryTask = retryTask;
+window.submitSteering = submitSteering;
 window.archiveTask = archiveTask;
 window.unarchiveTask = unarchiveTask;
 window.deleteTask = deleteTask;

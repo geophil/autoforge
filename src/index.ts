@@ -21,7 +21,12 @@ getRewardWeights();
 const nats = new NatsClient(env.NATS_URL);
 await nats.connect(); // logs a warning and continues if unavailable
 
-const recovery = new RecoveryService(db, nats);
+const recovery = new RecoveryService(db, nats, (message) => {
+  db.transaction(() => {
+    db.appendEvent(message);
+    db.applyEvent(message);
+  });
+});
 await recovery.recover();
 
 const executors = createExecutors(env);
@@ -34,6 +39,8 @@ const service = new OrchestratorService({
   worktrees,
   nats
 });
+await service.backfillSpecialtyEmbeddings();
+service.startDiagnosticScheduler();
 
 // Mark any tasks that were stuck in non-terminal states (e.g. from a crashed
 // previous run or a timed-out executor) as failed with a failure_analysis event.

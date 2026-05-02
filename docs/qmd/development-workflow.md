@@ -32,7 +32,7 @@ bun run dev
 # Start with NATS + QMD knowledge base via Docker Compose (recommended)
 docker-compose up
 # → QMD embeds docs/qmd/ on first boot, re-indexes every 3 hours
-# → QMD_MCP_URL=http://qmd:8181/mcp passed to planner automatically
+# → QMD_MCP_URL=http://qmd:8181/mcp passed to task-facing agents automatically
 ```
 
 The dashboard is available at `http://localhost:3000`. Submit tasks via:

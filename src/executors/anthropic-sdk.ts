@@ -5,11 +5,17 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { AgentExecutor, AgentResult, AgentTask, AgentTranscript, AgentTranscriptTurn } from "./interface";
+import { buildStatusReportingPrompt, loadSkillFiles, readStatusFile } from "./status-convention";
 
-const STATUS_FILE = ".autoforge-status.json";
 const MAX_TOOL_ITERATIONS = 50;
 const PER_CALL_TIMEOUT_MS = 120_000;
 const CIRCUIT_BREAKER_READ_THRESHOLD = 12;
+const COMPACTION_THRESHOLD_FRACTION = 0.7;
+const DEFAULT_MODEL_CONTEXT_TOKENS = 180_000;
+const CHARS_PER_TOKEN_HEURISTIC = 4;
+const FALLBACK_SUMMARY_MAX_BYTES = 8 * 1024;
+const FALLBACK_SUMMARY_MAX_SEGMENTS = 30;
+const DEFAULT_COMPACTION_MODEL = "claude-haiku-4";
 
 // ---------------------------------------------------------------------------
 // MCP integration (client-side)
@@ -179,7 +185,7 @@ const TOOLS: Anthropic.Tool[] = [
 // Tool stats (for circuit breaker and failure attribution)
 // ---------------------------------------------------------------------------
 
-interface ToolStats {
+interface ExecutorToolStats {
   readCount: number;
   writeCount: number;
   bashCount: number;
@@ -195,7 +201,7 @@ async function executeTool(
   input: Record<string, unknown>,
   cwd: string,
   env: Record<string, string>,
-  stats: ToolStats,
+  stats: ExecutorToolStats,
   mcp: McpConnection | null
 ): Promise<string> {
   if (mcp && mcp.toolNames.has(name)) {
@@ -233,7 +239,7 @@ async function executeTool(
         stats.readCount++;
         const abs = resolve(cwd, sinput.path);
         if (!existsSync(abs)) return `Error: directory not found: ${sinput.path}`;
-        const recursive = sinput.recursive === "true";
+        const recursive = input.recursive === true || input.recursive === "true";
         if (recursive) {
           return listRecursive(abs, cwd, 0, 3);
         }
@@ -313,6 +319,91 @@ function listRecursive(absPath: string, rootCwd: string, depth: number, maxDepth
   return lines.join("\n");
 }
 
+function modelContextTokens(model: string): number {
+  const lower = model.toLowerCase();
+  if (lower.includes("sonnet")) return 200_000;
+  if (lower.includes("opus")) return 200_000;
+  if (lower.includes("haiku")) return 200_000;
+  return DEFAULT_MODEL_CONTEXT_TOKENS;
+}
+
+function estimateMessagesCharCount(messages: Anthropic.MessageParam[]): number {
+  return messages.reduce((sum, message) => {
+    const content = message.content;
+    if (typeof content === "string") return sum + content.length;
+    try {
+      return sum + JSON.stringify(content).length;
+    } catch {
+      return sum;
+    }
+  }, 0);
+}
+
+function hasToolUse(content: Anthropic.MessageParam["content"]): boolean {
+  return Array.isArray(content) && content.some((block) => (block as { type?: string }).type === "tool_use");
+}
+
+function hasToolResult(content: Anthropic.MessageParam["content"]): boolean {
+  return Array.isArray(content) && content.some((block) => (block as { type?: string }).type === "tool_result");
+}
+
+interface ExchangeGroup {
+  assistantIndex: number;
+  userIndex: number;
+}
+
+function collectExchangeGroups(messages: Anthropic.MessageParam[]): ExchangeGroup[] {
+  const groups: ExchangeGroup[] = [];
+  for (let i = 0; i < messages.length - 1; i++) {
+    const assistant = messages[i];
+    const toolResult = messages[i + 1];
+    if (assistant.role !== "assistant" || toolResult.role !== "user") continue;
+    if (!hasToolUse(assistant.content)) continue;
+    if (!hasToolResult(toolResult.content)) continue;
+    groups.push({ assistantIndex: i, userIndex: i + 1 });
+  }
+  return groups;
+}
+
+function renderCompactionInput(messages: Anthropic.MessageParam[], groups: ExchangeGroup[]): string {
+  const lines: string[] = [];
+  for (const group of groups) {
+    const assistant = messages[group.assistantIndex];
+    const user = messages[group.userIndex];
+    lines.push("## Assistant Tool Use");
+    lines.push(typeof assistant.content === "string" ? assistant.content : JSON.stringify(assistant.content));
+    lines.push("## Tool Results");
+    lines.push(typeof user.content === "string" ? user.content : JSON.stringify(user.content));
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function extractiveSummaryFallback(input: string): string {
+  const lines = input
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  const mustKeep = lines.filter((line) => /reviewer|operator feedback|operator steering/i.test(line)).slice(-3);
+  const segments: string[] = [];
+  for (const line of lines) {
+    if (segments.length >= FALLBACK_SUMMARY_MAX_SEGMENTS) break;
+    segments.push(line.length > 280 ? `${line.slice(0, 277)}...` : line);
+  }
+  for (const line of mustKeep) {
+    if (segments.length >= FALLBACK_SUMMARY_MAX_SEGMENTS) {
+      segments.pop();
+    }
+    if (!segments.includes(line)) segments.push(line);
+  }
+
+  const joined = segments.join("\n");
+  return joined.length <= FALLBACK_SUMMARY_MAX_BYTES
+    ? joined
+    : joined.slice(0, FALLBACK_SUMMARY_MAX_BYTES);
+}
+
 // ---------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------
@@ -337,6 +428,12 @@ export class AnthropicSdkExecutor implements AgentExecutor {
    * declared in `McpClientLike` — no transport or server required.
    */
   private _testMcpClient?: McpClientLike;
+
+  /**
+   * Test hook used by sdk-compaction tests to control the compaction summary
+   * output without invoking a real model call.
+   */
+  private _testSummarize?: (input: { model: string; text: string }) => Promise<string>;
 
   constructor(
     private readonly apiKey: string,
@@ -384,8 +481,11 @@ export class AnthropicSdkExecutor implements AgentExecutor {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let timedOut = false;
+    let completedIterations = 0;
+    let inputTokensSinceCompaction = 0;
+    let lastKnownInputTokens = 0;
     const deadlineMs = Date.now() + task.budgetSeconds * 1000;
-    const stats: ToolStats = { readCount: 0, writeCount: 0, bashCount: 0, searchCount: 0 };
+    const stats: ExecutorToolStats = { readCount: 0, writeCount: 0, bashCount: 0, searchCount: 0 };
 
     // Open a client-side MCP connection if the task is configured for QMD.
     // Tools are merged once and reused for every iteration.
@@ -413,14 +513,32 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           stats.readCount = 0;
         }
 
-        // Context window management: compress after 20 iterations to prevent bloat.
-        if (iteration === 20 && messages.length > 14) {
-          const droppedTurns = messages.length - 13;
-          turns.push({ kind: "compaction", droppedTurns });
-          const first = messages.slice(0, 1);
-          const recent = messages.slice(-12);
-          messages.length = 0;
-          messages.push(...first, ...recent);
+        const modelContext = modelContextTokens(task.model ?? this.model);
+        const projectedNextInputTokens =
+          inputTokensSinceCompaction +
+          Math.max(
+            lastKnownInputTokens,
+            Math.ceil(estimateMessagesCharCount(messages) / CHARS_PER_TOKEN_HEURISTIC)
+          );
+        if (projectedNextInputTokens >= COMPACTION_THRESHOLD_FRACTION * modelContext) {
+          const compaction = await this.compactMessages({
+            client,
+            model: task.model ?? this.model,
+            messages
+          });
+          if (compaction) {
+            inputTokensSinceCompaction = 0;
+            turns.push({
+              kind: "compaction",
+              droppedTurns: compaction.droppedTurns,
+              retainedRecentTurns: compaction.retainedRecentTurns,
+              triggerInputTokens: projectedNextInputTokens,
+              summaryInputCharCount: compaction.summaryInputCharCount,
+              summaryOutputCharCount: compaction.summaryOutputCharCount,
+              summaryModel: compaction.summaryModel,
+              usedFallback: compaction.usedFallback
+            });
+          }
         }
 
         // Prompt caching: place an ephemeral cache breakpoint on the system
@@ -474,6 +592,9 @@ export class AnthropicSdkExecutor implements AgentExecutor {
 
         totalInputTokens += response.usage.input_tokens;
         totalOutputTokens += response.usage.output_tokens;
+        completedIterations += 1;
+        inputTokensSinceCompaction += response.usage.input_tokens;
+        lastKnownInputTokens = response.usage.input_tokens;
 
         messages.push({ role: "assistant", content: response.content });
         turns.push({ kind: "assistant", content: response.content });
@@ -523,7 +644,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           elapsedSeconds,
           tokenInput: totalInputTokens,
           tokenOutput: totalOutputTokens,
-          toolStats: { ...stats, iterations: MAX_TOOL_ITERATIONS }
+          toolStats: { ...stats, iterations: completedIterations }
         },
         transcript: buildTranscript()
       };
@@ -537,7 +658,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
     }
 
     const elapsedSeconds = (Date.now() - start) / 1000;
-    const totalIterations = messages.filter((m) => m.role === "assistant").length;
+    const totalIterations = completedIterations;
 
     if (timedOut) {
       return {
@@ -585,6 +706,127 @@ export class AnthropicSdkExecutor implements AgentExecutor {
     };
   }
 
+  private async compactMessages(input: {
+    client: Anthropic;
+    model: string;
+    messages: Anthropic.MessageParam[];
+  }): Promise<{
+    droppedTurns: number;
+    retainedRecentTurns: number;
+    summaryInputCharCount: number;
+    summaryOutputCharCount: number;
+    summaryModel: string | null;
+    usedFallback: boolean;
+  } | null> {
+    const groups = collectExchangeGroups(input.messages);
+    if (groups.length < 2) {
+      return null;
+    }
+    const groupsToCompact = groups.slice(0, -1);
+    if (groupsToCompact.length === 0) {
+      return null;
+    }
+
+    const summaryInput = renderCompactionInput(input.messages, groupsToCompact);
+    const summaryInputCharCount = summaryInput.length;
+    if (summaryInputCharCount === 0) {
+      return null;
+    }
+
+    const { memoryBlock, summaryModel, usedFallback } = await this.summarizeCompactionSlice({
+      client: input.client,
+      text: summaryInput
+    });
+    const summaryOutputCharCount = memoryBlock.length;
+
+    const dropIndices = new Set<number>();
+    for (const group of groupsToCompact) {
+      dropIndices.add(group.assistantIndex);
+      dropIndices.add(group.userIndex);
+    }
+    const retained = input.messages.filter((_, index) => !dropIndices.has(index));
+    if (retained.length === input.messages.length) return null;
+
+    const memoryMessage: Anthropic.MessageParam = {
+      role: "user",
+      content: `# Conversation Memory\n${memoryBlock}`
+    };
+    retained.splice(1, 0, memoryMessage);
+    const droppedTurns = input.messages.length - retained.length;
+
+    input.messages.length = 0;
+    input.messages.push(...retained);
+
+    return {
+      droppedTurns,
+      retainedRecentTurns: retained.length,
+      summaryInputCharCount,
+      summaryOutputCharCount,
+      summaryModel,
+      usedFallback
+    };
+  }
+
+  private async summarizeCompactionSlice(input: {
+    client: Anthropic;
+    text: string;
+  }): Promise<{ memoryBlock: string; summaryModel: string | null; usedFallback: boolean }> {
+    const summaryModel = process.env.AUTOFORGE_COMPACTION_MODEL ?? DEFAULT_COMPACTION_MODEL;
+    const summarizerContext = modelContextTokens(summaryModel);
+    const maxInputChars = Math.floor((summarizerContext / 2) * CHARS_PER_TOKEN_HEURISTIC);
+    const chunks: string[] = [];
+    for (let offset = 0; offset < input.text.length; offset += maxInputChars) {
+      chunks.push(input.text.slice(offset, offset + maxInputChars));
+    }
+
+    try {
+      const partials: string[] = [];
+      for (const chunk of chunks) {
+        partials.push(await this.callCompactionSummarizer(input.client, summaryModel, chunk));
+      }
+      const merged = partials.join("\n\n");
+      const memoryBlock =
+        merged.length > maxInputChars
+          ? await this.callCompactionSummarizer(input.client, summaryModel, merged.slice(0, maxInputChars))
+          : merged;
+      return { memoryBlock, summaryModel, usedFallback: false };
+    } catch {
+      return {
+        memoryBlock: extractiveSummaryFallback(input.text),
+        summaryModel: null,
+        usedFallback: true
+      };
+    }
+  }
+
+  private async callCompactionSummarizer(client: Anthropic, model: string, text: string): Promise<string> {
+    if (this._testSummarize) {
+      return this._testSummarize({ model, text });
+    }
+
+    const response = await client.messages.create({
+      model,
+      max_tokens: 1200,
+      system: `You compress coding-agent history into durable memory.
+Output concise markdown with these headings exactly:
+- Task goal
+- Current plan / next step
+- Files read and key findings
+- Files changed
+- Commands run and outcomes
+- Failed attempts and why
+- Reviewer or operator feedback
+- Assumptions and constraints`,
+      messages: [{ role: "user", content: text }]
+    });
+    const textBlocks = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+    return textBlocks.length > 0 ? textBlocks : extractiveSummaryFallback(text);
+  }
+
   async healthCheck(): Promise<boolean> {
     try {
       const client = new Anthropic({ apiKey: this.apiKey });
@@ -617,59 +859,9 @@ function buildSystemPrompt(task: AgentTask): string {
     sections.push(`# Skills\n\n${skillContents}`);
   }
 
-  sections.push(`# Status Reporting (required)
-
-When you have finished the task you MUST write \`${STATUS_FILE}\` in the working directory using the write_file tool with this exact JSON format:
-
-\`\`\`json
-{
-  "status": "DONE",
-  "artifacts": ["relative/path/to/changed/file1", "relative/path/to/changed/file2"]
-}
-\`\`\`
-
-Valid status values:
-- **"DONE"** — completed successfully, all criteria met
-- **"DONE_WITH_CONCERNS"** — completed but add a "concerns" field explaining what was imperfect
-- **"BLOCKED"** — cannot proceed; add a "blockReason" field with a clear explanation
-- **"NEEDS_CONTEXT"** — missing information; add a "blockReason" field specifying what is needed
-
-Time budget: ${task.budgetSeconds} seconds. Work efficiently. Use search_files to find relevant code rather than reading every file. Use read_multiple_files to read several files at once.`);
+  sections.push(buildStatusReportingPrompt(task.budgetSeconds));
 
   return sections.join("\n\n");
-}
-
-function loadSkillFiles(skillFiles: string[]): string {
-  const parts: string[] = [];
-  for (const filePath of skillFiles) {
-    try {
-      if (existsSync(filePath)) {
-        parts.push(readFileSync(filePath, "utf8").trim());
-      }
-    } catch {
-      // skip unreadable skill files
-    }
-  }
-  return parts.join("\n\n---\n\n");
-}
-
-interface AgentStatusFile {
-  status: "DONE" | "DONE_WITH_CONCERNS" | "BLOCKED" | "NEEDS_CONTEXT";
-  artifacts: string[];
-  concerns?: string;
-  blockReason?: string;
-  // Extra fields (e.g. "meta" from the meta agent, "subtasks" from the planner) pass through as output.
-  [key: string]: unknown;
-}
-
-function readStatusFile(workingDirectory: string): AgentStatusFile | null {
-  const statusPath = join(workingDirectory, STATUS_FILE);
-  try {
-    if (!existsSync(statusPath)) return null;
-    return JSON.parse(readFileSync(statusPath, "utf8")) as AgentStatusFile;
-  } catch {
-    return null;
-  }
 }
 
 /**

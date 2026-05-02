@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execSync, spawnSync } from "node:child_process";
 
@@ -24,7 +24,7 @@ export class WorktreeManager {
   create(taskId: string): WorktreeRef {
     const branch = `autoforge/${taskId}`;
     const path = join(this.rootDir, `${taskId}-${randomUUID().slice(0, 8)}`);
-    const baseRef = this.currentHead();
+    const baseRef = this.repoHead();
 
     if (this.isGitRepo()) {
       // Ensure branch exists from current HEAD.
@@ -102,6 +102,53 @@ export class WorktreeManager {
     }
   }
 
+  currentHead(worktreePath: string): string | null {
+    if (!this.isGitRepo()) {
+      return null;
+    }
+    try {
+      return execSync("git rev-parse HEAD", {
+        cwd: worktreePath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * WARNING: this intentionally discards uncommitted work in the task
+   * worktree. Any scratch files, partial writes, and generated artifacts are
+   * removed to guarantee deterministic rollback behavior.
+   */
+  resetToCommit(worktreePath: string, sha: string): void {
+    if (!this.isGitRepo()) {
+      throw new Error("checkpoint_unreachable");
+    }
+
+    const resolvedRoot = resolve(this.rootDir);
+    const resolvedWorktree = resolve(worktreePath);
+    if (resolvedWorktree === resolvedRoot || !resolvedWorktree.startsWith(`${resolvedRoot}/`)) {
+      throw new Error("invalid_worktree_path");
+    }
+    if (!existsSync(join(resolvedWorktree, METADATA_FILE))) {
+      throw new Error("invalid_worktree_path");
+    }
+
+    const reachability = spawnSync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], {
+      cwd: resolvedWorktree,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    if (reachability.status !== 0) {
+      throw new Error("checkpoint_unreachable");
+    }
+
+    run("git", ["reset", "--hard", sha], { cwd: resolvedWorktree, ignore: false });
+    run("git", ["clean", "-fd"], { cwd: resolvedWorktree, ignore: false });
+  }
+
   /**
    * Remove the worktree and delete the branch.
    */
@@ -151,7 +198,7 @@ export class WorktreeManager {
     }
   }
 
-  private currentHead(): string {
+  private repoHead(): string {
     if (!this.isGitRepo()) {
       return "HEAD";
     }

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DbClient } from "../../src/db/client";
@@ -13,8 +13,12 @@ import { createDispatcher } from "../../src/orchestrator/dispatch";
 import { AutoTuner } from "../../src/orchestrator/auto-tuner";
 import { PersonaRegistry } from "../../src/personas/registry";
 import type { AgentResult, AgentTask } from "../../src/executors/interface";
+import type { LifecycleHookPhase, LifecycleHooksResult } from "../../src/orchestrator/lifecycle-hooks";
 
 type Handlers = Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult | Promise<AgentResult>>>;
+type HookRunner = (input: { phase: LifecycleHookPhase; workingDirectory: string; timeoutSeconds: number }) => LifecycleHooksResult;
+
+const skipAllHooks: HookRunner = ({ phase }) => ({ phase, runs: [], failedRun: null });
 
 const REWARD_KEYS = [
   "r_correctness",
@@ -28,6 +32,14 @@ function createLifecycleService(input: {
   randomValues?: number[];
   handlers?: Handlers;
   prCreator?: (payload: { branch: string }) => Promise<string>;
+  enableTestHooks?: boolean;
+  /**
+   * When omitted, lifecycle hooks are stubbed to a no-op so test fixtures
+   * don't recursively run autoforge's own `bun run lint` / `bun run test`
+   * inside their worktree. Set explicitly to `undefined` (or pass a custom
+   * runner) when a test needs the real hook runner to fire.
+   */
+  lifecycleHookRunner?: HookRunner | null;
 } = {}): { service: OrchestratorService; db: DbClient; cleanup: () => void } {
   const baseDir = realpathSync(mkdtempSync(join(tmpdir(), "autoforge-spec-c-lifecycle-")));
   const dbPath = join(baseDir, `${randomUUID()}.sqlite`);
@@ -42,13 +54,17 @@ function createLifecycleService(input: {
     DATABASE_PATH: dbPath,
     EXECUTOR_DEFAULT: "mock",
     REVIEW_SCORE_THRESHOLD: "0.7",
-    TEST_PASS_THRESHOLD: "1"
+    TEST_PASS_THRESHOLD: "1",
+    AUTOFORGE_ENABLE_TEST_HOOKS: input.enableTestHooks ? "1" : "0"
   });
   let randomIndex = 0;
   const dispatcher = createDispatcher(db, {
     random: () => input.randomValues?.[randomIndex++] ?? 0
   });
   const worktrees = new WorktreeManager(join(baseDir, "worktrees"));
+  const hookRunner: HookRunner | undefined = input.lifecycleHookRunner === null
+    ? undefined // null = use real runner (production default)
+    : (input.lifecycleHookRunner ?? skipAllHooks);
   const service = new OrchestratorService({
     env,
     db,
@@ -57,7 +73,8 @@ function createLifecycleService(input: {
     dispatcher,
     testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
     prCreator: input.prCreator ?? (async (payload) =>
-      `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`)
+      `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`),
+    lifecycleHookRunner: hookRunner
   });
 
   return {
@@ -177,6 +194,57 @@ function variantState(db: DbClient, id: string): { status: string; traffic_share
 }
 
 describe("Spec C lifecycle auto-tuner hook", () => {
+  test("post_coder_pre_review hook failure pauses task in awaiting_intervention", async () => {
+    const { service, db, cleanup } = createLifecycleService({
+      randomValues: [0],
+      enableTestHooks: true,
+      // null = use the real lifecycle hook runner so the failing `lint`
+      // script the coder writes actually fails the post_coder_pre_review hook.
+      lifecycleHookRunner: null,
+      handlers: {
+        coder: async (agentTask) => {
+          const packageJsonPath = join(agentTask.workingDirectory, "package.json");
+          const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+            scripts?: Record<string, string>;
+          };
+          pkg.scripts = {
+            ...(pkg.scripts ?? {}),
+            lint: "node -e \"process.stderr.write('hook-failed'); process.exit(1)\""
+          };
+          writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2));
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: {},
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+      }
+    });
+    try {
+      const task = await service.submitTask("autoforge", "trigger hook failure", {
+        forceTier: "EXPRESS",
+        reviewPlan: false
+      });
+      expect(task.state).toBe("awaiting_intervention");
+
+      const events = db.listEvents(task.id);
+      const hookFailure = events.find((event) => event.type === "lifecycle_hook_failed");
+      expect(hookFailure).toBeDefined();
+      expect(hookFailure?.payload.phase).toBe("post_coder_pre_review");
+      expect(hookFailure?.payload.script).toBe("lint");
+      expect(hookFailure?.payload.exit_code).toBe(1);
+      expect(typeof hookFailure?.payload.log_path).toBe("string");
+
+      const failureAnalysis = [...events].reverse().find((event) => event.type === "failure_analysis");
+      expect(failureAnalysis).toBeDefined();
+      expect(failureAnalysis?.payload.failure_category).toBe("lifecycle_hook_failed");
+      expect(failureAnalysis?.payload.stage_failed).toBe("executing");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("terminal completion evaluates shadow candidates and graduates a candidate with enough evidence", async () => {
     const { service, db, cleanup } = createLifecycleService({ randomValues: [0] });
     try {
@@ -250,15 +318,18 @@ describe("Spec C lifecycle auto-tuner hook", () => {
     try {
       ensureBaseline(db, "coder", 0.5);
       seedVariant(db, { id: "coder-active", agentType: "coder", status: "active", share: 0.8 });
+      (service as unknown as { terminalTaskCount: number }).terminalTaskCount = 49;
 
       await expect(
         service.submitTask("autoforge", "frontend non-terminal crash", { forceTier: "EXPRESS" })
       ).rejects.toThrow("synthetic PR creation failure");
+      await Bun.sleep(10);
 
       const task = db.listTasks().find((candidate) => candidate.description === "frontend non-terminal crash");
       expect(task?.state).toBe("reviewing");
       expect((service as unknown as { deps: { worktrees: WorktreeManager } }).deps.worktrees.findWorktreePath(task!.id)).toBeNull();
       expect(db.listEvents(task!.id).some((event) => event.type === "auto_tuner_failed")).toBe(false);
+      expect(db.sqlite.query("SELECT id FROM events WHERE event_type = 'diagnostic_run_completed'").all()).toHaveLength(0);
       const allocations = db.sqlite
         .query(`SELECT id FROM events
           WHERE event_type = 'traffic_allocated'

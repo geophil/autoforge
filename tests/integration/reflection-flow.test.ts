@@ -81,6 +81,58 @@ describe("reflection flow", () => {
     }
   });
 
+  test("rollback_applied clears prior failure_analysis from reflection context", async () => {
+    let reflectorCalled = false;
+    const { service, db, cleanup } = createTestService({
+      reflector: async () => {
+        reflectorCalled = true;
+        return {
+          status: "DONE",
+          artifacts: [],
+          output: { lesson: { skip: true, reason: "rolled-forward" } },
+          metrics: { elapsedSeconds: 0.1 }
+        };
+      }
+    });
+    try {
+      const taskId = "rolled-back-1";
+      const now = new Date().toISOString();
+      db.sqlite
+        .query(
+          `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
+           VALUES (?, 'p', 'd', 'completed', 'STANDARD', '{}', '[]', 0, ?, ?)`
+        )
+        .run(taskId, now, now);
+      db.sqlite
+        .query(
+          `INSERT INTO events (id, task_id, timestamp, project_id, agent, event_type, status, payload, budget_seconds)
+           VALUES ('f1', ?, ?, 'p', 'orchestrator', 'failure_analysis', 'failed',
+                   json_object('failure_category', 'stalled', 'elapsed_seconds', 10, 'planner_fallback', 0), 60)`
+        )
+        .run(taskId, now);
+      db.sqlite
+        .query(
+          `INSERT INTO events (id, task_id, timestamp, project_id, agent, event_type, status, payload, budget_seconds)
+           VALUES ('r1', ?, datetime(?, '+1 second'), 'p', 'orchestrator', 'rollback_applied', 'done',
+                   json_object('checkpoint_id', 'cp-1'), 60)`
+        )
+        .run(taskId, now);
+
+      const result = await service.reflectOnTask(taskId);
+      expect(reflectorCalled).toBe(true);
+      expect(result.reason).not.toBe("stalled");
+      const skipped = db.sqlite
+        .query(
+          "SELECT json_extract(payload, '$.reason') AS reason FROM events WHERE task_id = ? AND event_type = 'reflector_skipped'"
+        )
+        .get(taskId) as { reason: string } | null;
+      expect(skipped).not.toBeNull();
+      expect(skipped!.reason).toBe("rolled-forward");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("happy path with non-skip reflector output inserts a lesson row", async () => {
     const { service, db, cleanup } = createTestService({
       reflector: async () => ({

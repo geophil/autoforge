@@ -25,7 +25,17 @@ const CritiqueSchema = z.object({
 });
 
 const RetrySchema = z.object({
-  fromStage: z.enum(["planning", "executing"]).optional()
+  fromStage: z.enum(["planning", "executing"]).optional(),
+  checkpointId: z.string().min(1).optional(),
+  operatorNote: z.string().min(1).max(4000).optional()
+});
+
+const SteerSchema = z.object({
+  message: z.string().min(1).max(4000),
+  // V1 supports next_attempt only. Reserved future values:
+  // - task_lifetime: apply on every dispatch until task terminates.
+  // - until_revoked: apply until a dedicated steering_revoked event.
+  scope: z.literal("next_attempt")
 });
 
 export function createApprovalRoutes(service: OrchestratorService, events: LiveEventHub): Hono {
@@ -73,14 +83,18 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
 
   app.post("/:id/retry", async (ctx) => {
     let fromStage: "planning" | "executing" | undefined;
+    let checkpointId: string | undefined;
+    let operatorNote: string | undefined;
     try {
       const body = RetrySchema.parse(await ctx.req.json().catch(() => ({})));
       fromStage = body.fromStage;
+      checkpointId = body.checkpointId;
+      operatorNote = body.operatorNote;
     } catch (err) {
       return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
     }
     try {
-      const task = await service.retryFromIntervention(ctx.req.param("id"), { fromStage });
+      const task = await service.retryFromIntervention(ctx.req.param("id"), { fromStage, checkpointId, operatorNote });
       events.publish({ type: "task.updated", data: task });
       return ctx.json(task);
     } catch (err) {
@@ -88,10 +102,39 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
       if (msg.startsWith("Cannot retry:")) {
         return ctx.json({ error: "invalid_state", message: msg }, 409);
       }
+      if (msg === "checkpoint_unreachable" || msg === "checkpoint_not_found") {
+        return ctx.json({ error: msg, message: msg }, 409);
+      }
+      if (msg === "checkpoint_stage_after_retry_stage") {
+        return ctx.json({ error: msg, message: msg }, 400);
+      }
       if (msg.startsWith("Retry from stage")) {
         return ctx.json({ error: "unsupported_stage", message: msg }, 400);
       }
       return ctx.json({ error: "retry_failed", message: msg }, 400);
+    }
+  });
+
+  app.post("/:id/steer", async (ctx) => {
+    let body: { message: string; scope: "next_attempt" };
+    try {
+      body = SteerSchema.parse(await ctx.req.json());
+    } catch (err) {
+      return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    try {
+      const task = service.addSteeringMessage(ctx.req.param("id"), body.message, body.scope);
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot steer")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      if (msg === "unsupported_steering_scope") {
+        return ctx.json({ error: "unsupported_scope", message: msg }, 400);
+      }
+      return ctx.json({ error: "steer_failed", message: msg }, 400);
     }
   });
 

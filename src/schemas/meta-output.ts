@@ -9,7 +9,8 @@ const Evidence = z.object({
     lines: z.string()
   })).optional(),
   metric_name: z.string().optional(),
-  metric_before: z.number().optional()
+  metric_before: z.number().optional(),
+  fork_proposal_id: z.string().optional()
 });
 
 const RetireLessonEntry = z.object({ id: z.string(), reason: z.string() });

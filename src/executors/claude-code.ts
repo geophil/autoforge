@@ -1,21 +1,10 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
-
-/** Convention file written by the agent to report status and artifacts. */
-const STATUS_FILE = ".autoforge-status.json";
-
-interface AgentStatusFile {
-  status: "DONE" | "DONE_WITH_CONCERNS" | "BLOCKED" | "NEEDS_CONTEXT";
-  artifacts: string[];
-  concerns?: string;
-  blockReason?: string;
-  // Extra fields (e.g. "meta" from the meta agent) pass through as output.
-  [key: string]: unknown;
-}
+import { buildStatusReportingPrompt, loadSkillFiles, readStatusFile } from "./status-convention";
 
 export class ClaudeCodeExecutor implements AgentExecutor {
   readonly name = "claude-code";
@@ -132,54 +121,9 @@ function buildPrompt(task: AgentTask): string {
 
   sections.push(`# Task\n\n${task.prompt}`);
 
-  sections.push(`# Status Reporting (required)
-
-When you have finished the task you MUST write \`${STATUS_FILE}\` in the working directory with this exact JSON format:
-
-\`\`\`json
-{
-  "status": "DONE",
-  "artifacts": ["relative/path/to/changed/file1", "relative/path/to/changed/file2"]
-}
-\`\`\`
-
-Valid status values:
-- **"DONE"** — completed successfully, all criteria met
-- **"DONE_WITH_CONCERNS"** — completed but add a "concerns" field explaining what was imperfect
-- **"BLOCKED"** — cannot proceed; add a "blockReason" field with a clear explanation
-- **"NEEDS_CONTEXT"** — missing information; add a "blockReason" field specifying what is needed
-
-Time budget: ${task.budgetSeconds} seconds. Work efficiently.`);
+  sections.push(buildStatusReportingPrompt(task.budgetSeconds));
 
   return sections.join("\n\n");
-}
-
-function loadSkillFiles(skillFiles: string[]): string {
-  const parts: string[] = [];
-  for (const filePath of skillFiles) {
-    try {
-      if (existsSync(filePath)) {
-        parts.push(readFileSync(filePath, "utf8").trim());
-      }
-    } catch {
-      // Skip unreadable skill files silently.
-    }
-  }
-  return parts.join("\n\n---\n\n");
-}
-
-// ---------------------------------------------------------------------------
-// Status file reading
-// ---------------------------------------------------------------------------
-
-function readStatusFile(workingDirectory: string): AgentStatusFile | null {
-  const statusPath = join(workingDirectory, STATUS_FILE);
-  try {
-    if (!existsSync(statusPath)) return null;
-    return JSON.parse(readFileSync(statusPath, "utf8")) as AgentStatusFile;
-  } catch {
-    return null;
-  }
 }
 
 // ---------------------------------------------------------------------------

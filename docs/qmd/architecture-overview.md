@@ -30,17 +30,19 @@ Human → HTTP POST /api/tasks
 
 Human → HTTP POST /api/meta
           ↓
-    Meta Agent — queries agent_performance, proposes persona/skill edit
+    Meta Agent — proposes edit/fork/merge/promote/demote/retire operation
           ↓
-    Experiment activated in skill_versions (PersonaRegistry DB-first)
+    Task outcomes → reward views → lessons/reflection
           ↓
-    Canary: next N tasks use new version → compare outcomes → keep or revert
+    Diagnostic fork proposals → first-fork approval
+          ↓
+    Shadow evaluation → graduation/promotion/demotion/merge/retirement
 ```
 
-**Composition**: Every agent — planner, coder, reviewer, doc, meta — is composed the same way: `persona(type) + skills(type) + task_context`, resolved through `PersonaRegistry` and `SkillRegistry`, dispatched through `AgentExecutor`. No special paths per agent type.
+**Composition**: Every agent — planner, coder, reviewer, doc, meta, plus utility `reflector` and `diagnostician` personas — uses the same composition primitives: `persona(type) + skills(type) + task_context + AgentExecutor`. Runtime selection and environment exposure are policy-driven per agent and tier through `OrchestratorService.routeExecutor()` and `agentEnvironment()`.
 
 **Storage**:
-- `SQLite` — append-only event log + materialized projections (source of truth); includes `skill_versions` for persona/skill versioning and `experiments` for improvement history
+- `SQLite` — append-only event log + materialized projections (source of truth); includes `skill_versions` as a population of persona/skill variants, `experiments` for improvement history, `lessons` for lineage memory, and `fork_proposals` for diagnostician-discovered niches
 - `NATS JetStream` — event streaming, optional (system runs without it)
 - `Git worktrees` — per-task isolated working directories under `.runtime-worktrees/`
 - `QMD index` — vector + BM25 index of `docs/qmd/` served via HTTP MCP on port 8181
@@ -71,7 +73,7 @@ Human → HTTP POST /api/meta
         model: plannerModel(tier),                  ← tier-aware planner model
         systemPrompt: personas.resolve("planner"),  ← persona injected
         skillFiles: skills.skillsForAgent("planner"),
-        environment: { QMD_MCP_URL }                ← knowledge base access
+        environment: agentEnvironment()             ← QMD_MCP_URL if configured
       }) → PlanSubtask[] + AgentTranscript (captured turn-by-turn)
         db.insertTranscript({ taskId, stage: "planner", attempt, turns, ... })
    f. if pausePolicy(tier, opts.reviewPlan):
@@ -82,10 +84,11 @@ Human → HTTP POST /api/meta
                       (up to PLANNER_MAX_ITERATIONS revisions, default 3),
                       append a new agent_transcripts row, stay at (f).
    g. for each subtask:
-        executor.execute({
+        routeExecutor(tier, agentType).execute({
           type: subtask.agentType ?? "coder",
           systemPrompt: personas.resolve(agentType),  ← specialist persona
-          skillFiles: skills.skillsForAgent(agentType)
+          skillFiles: skills.skillsForAgent(agentType),
+          environment: agentEnvironment()
         })
         worktrees.commit(branch, message)
         recordEvent("subtask_done", { persona_version_id, skill_version_ids, token_usage })
@@ -123,11 +126,17 @@ Human → HTTP POST /api/meta
 
 **Brain / Hands / Session separation**: The orchestrator (brain) is stateless — it can crash and recover by replaying events. Agent runtimes (hands) are disposable subprocesses with no persistent state. The event log (session) is the single source of truth.
 
-**Composition over configuration**: Every agent type — including the meta agent — is composed identically from a persona and skills. There are no special code paths per agent type. Adding a new specialist means adding a persona file and a skills mapping entry.
+**Shared composition primitives**: Every agent type — including the meta agent and utility personas — is built from persona content, skill files, task context, and the `AgentExecutor` contract. Runtime routing and environment exposure are explicit orchestrator policies: `routeExecutor()` special-cases planner, reflector, meta, and EXPRESS work, while `agentEnvironment()` controls which task-facing agents receive `QMD_MCP_URL`. Adding a new specialist still starts with a persona file and skills mapping entry, then any routing policy it needs.
 
-**Agents never hold credentials**: `GITHUB_TOKEN` and `ANTHROPIC_API_KEY` live only in the orchestrator process. Git push and PR operations happen after the agent completes, in the orchestrator. The exception is `QMD_MCP_URL`, which the planner receives to query the knowledge base.
+**Agents never hold credentials**: `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY` live only in the orchestrator process. Git push, PR operations, Anthropic SDK construction, and embedding calls happen in orchestrator-owned code. The exception is non-secret `QMD_MCP_URL`, which `agentEnvironment()` forwards to task-facing planner/coder/reviewer/doc/doc-review runs so they can query the knowledge base.
 
-**Unified prompt asset versioning**: Personas and skills are both stored in `skill_versions` under a naming convention (`persona:coder`, `skill:tdd`). `PersonaRegistry` resolves the DB-active version first, enabling the meta-loop to activate improvements without file changes. Each agent execution records its `persona_version_id` and `skill_version_ids` in the event payload for outcome attribution.
+**Executor routing is per dispatch**: Startup builds an `ExecutorSet` containing the primary executor, optional Anthropic SDK executor, and Claude Code executor. `OrchestratorService.routeExecutor()` then routes planner and reflector to SDK when available, meta to Claude Code, EXPRESS work to SDK when available, and STANDARD/THOROUGH filesystem-heavy work to Claude Code.
+
+**Population-shaped prompt asset versioning**: Personas and skills are both stored in `skill_versions` under a naming convention (`persona:coder`, `skill:tdd`). The table now represents a population per persona or skill type: one `baseline`, zero or more `active` traffic variants, and `candidate` variants evaluated by shadow runs before graduation. Legacy `is_active` is compatibility state derived from `status`; it no longer means "the only active row." Each agent execution records the selected `persona_version_id` and `skill_version_ids` in the event payload for outcome attribution.
+
+**Spec D population operations loop**: Completed and failed task outcomes feed reward views such as `task_quality_score`, `variant_performance`, and `population_health`. The `reflector` extracts lineage-scoped `lessons`; the `diagnostician` analyzes recent histories and writes `fork_proposals`; the meta agent turns proposals into operations; operators approve the first fork through `/api/experiments/:id/approve-fork`; candidates run in shadow via `shadow_run_completed`; auto-tuning and meta operations then graduate, promote, demote, merge, or retire variants.
+
+Searchable flow summary: Task outcomes -> reward views -> lessons/reflection -> diagnostic fork proposals -> meta operation -> first-fork approval -> shadow evaluation -> graduation/promotion/demotion/merge/retirement.
 
 **Sequential agent pipeline by default**: Each stage waits for the previous to complete. This lets the output of planning inform coding, and the output of coding inform review. Parallelism is a future opt-in.
 
@@ -157,4 +166,11 @@ services:
       qmd: { condition: service_healthy }
     environment:
       - QMD_MCP_URL=http://qmd:8181/mcp
+```
+
+After changing `docs/qmd/`, re-index the knowledge base manually:
+
+```bash
+qmd update
+qmd embed
 ```

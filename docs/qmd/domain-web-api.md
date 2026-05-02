@@ -74,15 +74,32 @@ publish(event: { type: string; data: unknown }): void {
 |--------|------|---------|-------------|
 | `GET`  | `/` | `server.ts` | Static HTML dashboard (`src/web/public/index.html`) |
 | `GET`  | `/api/health` | `server.ts` | Health check — returns `{ status, uptime }` |
-| `POST` | `/api/tasks` | `tasks.ts` | Submit a new task |
-| `GET`  | `/api/tasks` | `tasks.ts` | List all tasks |
+| `GET`  | `/api/config` | `server.ts` | Dashboard config such as `{ plannerMaxIterations }` |
+| `POST` | `/api/tasks` | `tasks.ts` | Submit a new task; returns the task object directly |
+| `GET`  | `/api/tasks` | `tasks.ts` | List tasks; supports `archived=true` and `includeArchived=true` |
 | `GET`  | `/api/tasks/:id` | `tasks.ts` | Get single task |
 | `GET`  | `/api/tasks/:id/events` | `tasks.ts` | Task event log (ordered by timestamp) |
-| `POST` | `/api/tasks/:id/approve` | `approvals.ts` | Approve awaiting task |
-| `POST` | `/api/tasks/:id/reject` | `approvals.ts` | Reject awaiting task with reason; response body is the **new restart task**, not the original |
-| `POST` | `/api/tasks/:id/cancel` | `approvals.ts` | Cancel a task (operator action) |
+| `POST` | `/api/tasks/:id/archive` | `tasks.ts` | Archive a terminal task; returns the task object directly |
+| `POST` | `/api/tasks/:id/unarchive` | `tasks.ts` | Restore an archived task; returns the task object directly |
+| `DELETE` | `/api/tasks/:id` | `tasks.ts` | Permanently delete an archived task |
+| `POST` | `/api/tasks/:id/approve` | `approvals.ts` | Approve awaiting task; returns the task object directly |
+| `POST` | `/api/tasks/:id/reject` | `approvals.ts` | Reject awaiting task with reason; returns the **new restart task** directly |
+| `POST` | `/api/tasks/:id/cancel` | `approvals.ts` | Cancel a task; returns the task object directly |
+| `POST` | `/api/tasks/:id/approve-plan` | `approvals.ts` | Approve a task paused in `awaiting_plan_approval` |
+| `POST` | `/api/tasks/:id/critique-plan` | `approvals.ts` | Submit plan critique and rerun planner |
+| `POST` | `/api/tasks/:id/retry` | `approvals.ts` | Retry from `awaiting_intervention` with optional `fromStage`, `checkpointId`, and `operatorNote` |
+| `POST` | `/api/tasks/:id/steer` | `approvals.ts` | Queue boundary-safe steering for the next attempt (`scope: next_attempt`) |
 | `POST` | `/api/meta` | `meta.ts` | Trigger meta-loop analysis; returns `experimentId` |
 | `POST` | `/api/meta/:experimentId/conclude` | `meta.ts` | Conclude experiment (keep or revert) |
+| `GET`  | `/api/transcripts/by-task/:taskId` | `transcripts.ts` | List transcripts for a task |
+| `GET`  | `/api/transcripts/:id` | `transcripts.ts` | Fetch a single transcript |
+| `GET`  | `/api/experiments?status=proposed&operation=fork` | `experiments.ts` | List proposed fork experiments awaiting first-fork approval |
+| `POST` | `/api/experiments/:id/approve-fork` | `experiments.ts` | Approve a proposed fork and create a `candidate` variant |
+| `POST` | `/api/experiments/:id/reject-fork` | `experiments.ts` | Reject a proposed fork and emit `fork_rejected` |
+| `GET`  | `/api/variants/:agentType` | `variants.ts` | List dispatch population variants by agent type |
+| `GET`  | `/api/variants/:id/scores` | `variants.ts` | Recent selected-task scores for a variant |
+| `GET`  | `/api/variants/:id/shadow` | `variants.ts` | Recent shadow runs for a candidate variant |
+| `POST` | `/api/diagnostic/run` | `diagnostic.ts` | Manually run the diagnostician for an agent type |
 | `GET`  | `/api/metrics/:projectId` | `metrics.ts` | Project metrics (total/completed tasks, unresolved findings) |
 | `GET`  | `/api/metrics/:projectId/trends` | `metrics.ts` | Trend data (stub, returns empty points) |
 | `GET`  | `/api/events` | `server.ts` | SSE stream for live updates |
@@ -97,7 +114,7 @@ POST /api/tasks
   → Zod validation (projectId, description)
   → service.submitTask(projectId, description)
   → events.publish({ type: "task.updated", data: task })
-  → 201 { task }
+  → 201 <task object>
 ```
 
 `submitTask` runs the full pipeline synchronously — the HTTP response is not returned until the task reaches `awaiting_approval` or fails.
@@ -108,8 +125,18 @@ POST /api/tasks
 POST /api/tasks/:id/approve
   → service.approveTask(id)   (runs doc agent, merges PR)
   → events.publish({ type: "task.updated", data: task })
-  → 200 { task }
+  → 200 <task object>
 ```
+
+`POST /api/tasks/:id/reject` closes and fails the old task, spawns a fresh restart task with feedback appended, emits `restart_spawned`, and returns the new task object directly.
+
+### Intervention Retry and Steering Flow
+
+- `POST /api/tasks/:id/retry` accepts optional rollback inputs:
+  - `checkpointId`: rewind worktree to a recorded checkpoint before retrying
+  - `operatorNote`: attached to `rollback_applied` / `retry_requested` for forensics
+  - `fromStage`: `planning` or `executing`
+- `POST /api/tasks/:id/steer` queues an operator message as `steering_message`; the next planner/coder/reviewer/doc dispatch injects it and emits `steering_consumed`.
 
 ### SSE Dashboard Flow
 
@@ -120,6 +147,51 @@ The static dashboard at `GET /` polls `/api/tasks` on load, then subscribes to `
 const stream = new EventSource('/api/events');
 stream.addEventListener('task.updated', refresh);
 ```
+
+### Fork Approval and Diagnostic Routes
+
+Population operation endpoints are intentionally narrow and operator-facing:
+
+```typescript
+// src/web/routes/experiments.ts
+app.get("/", (ctx) => {
+  if (ctx.req.query("status") === "proposed" && ctx.req.query("operation") === "fork") {
+    return ctx.json({ experiments: service.listPendingForkExperiments() });
+  }
+  return ctx.json({ experiments: [] });
+});
+
+app.post("/:id/approve-fork", async (ctx) => {
+  const body = await ctx.req.json().catch(() => ({})) as { approver?: unknown; notes?: unknown };
+  const result = await service.approveFork(ctx.req.param("id"), {
+    approver: typeof body.approver === "string" ? body.approver : undefined,
+    notes: typeof body.notes === "string" ? body.notes : undefined
+  });
+  return ctx.json({ ok: true, variantId: result.variantId }, 200);
+});
+
+app.post("/:id/reject-fork", async (ctx) => {
+  const body = await ctx.req.json().catch(() => ({})) as { reviewer?: unknown; reason?: unknown };
+  service.rejectFork(
+    ctx.req.param("id"),
+    typeof body.reviewer === "string" ? body.reviewer : undefined,
+    typeof body.reason === "string" ? body.reason : undefined
+  );
+  return ctx.json({ ok: true }, 200);
+});
+```
+
+```typescript
+// src/web/routes/diagnostic.ts
+app.post("/run", async (ctx) => {
+  const body = await ctx.req.json().catch(() => ({})) as { agentType?: unknown };
+  const agentType = body.agentType ?? "coder";
+  const result = await service.runPopulationDiagnostic(agentType, "manual");
+  return ctx.json({ ok: true, agentType, clustersProposed: result.clustersProposed });
+});
+```
+
+`POST /api/diagnostic/run` accepts `agentType` values `planner`, `coder`, `reviewer`, or `doc`; invalid values return 400. Approval emits `fork_approved` and `traffic_allocated` (`reason: "meta_fork_approved"`), while rejection emits `fork_rejected`.
 
 ## Data Entities
 
@@ -136,11 +208,16 @@ stream.addEventListener('task.updated', refresh);
 
 ## Integration Points
 
-- **Task Orchestration**: All task routes delegate to `OrchestratorService` methods (`submitTask`, `approveTask`, `rejectTask`, `listTasks`, `getTask`).
-- **Meta-Loop**: Meta routes delegate to `OrchestratorService.submitMetaTask()` and `concludeExperiment()`.
+- **Task Orchestration**: Task routes delegate to `OrchestratorService` methods (`submitTask`, `approveTask`, `rejectTask`, `archiveTask`, `unarchiveTask`, `deleteTaskPermanently`, `approvePlan`, `critiquePlan`, `retryFromIntervention`, `listTasks`, `getTask`).
+- **Meta-Loop**: Meta and experiment routes delegate to `OrchestratorService.submitMetaTask()`, `concludeExperiment()`, `listPendingForkExperiments()`, `approveFork()`, and `rejectFork()`.
+- **Diagnostics**: `POST /api/diagnostic/run` delegates to `OrchestratorService.runPopulationDiagnostic()`.
 - **Event Log**: `GET /api/tasks/:id/events` delegates to `DbClient.listEvents(taskId)`.
 - **Event Sourcing**: `DbClient.metricsForProject()` queries the materialized `tasks` and `review_findings` tables.
 - **Live Events**: `LiveEventHub` is instantiated once in `createWebServer` and passed to both task and approval route factories.
+
+## Known Limitation (V1)
+
+Approval-surface mutating routes (including retry/rollback and steering) currently have no built-in authentication middleware. Deploy behind a trusted network boundary or reverse proxy that enforces operator auth until route-level auth is added.
 
 ## File Map
 
@@ -149,8 +226,12 @@ stream.addEventListener('task.updated', refresh);
 | `src/web/server.ts` | `createWebServer` — Hono app, static asset serving, SSE endpoint, health check |
 | `src/web/public/index.html` | Static dashboard HTML |
 | `src/web/public/dashboard.js` | Dashboard client JS — SSE subscription, task list rendering |
-| `src/web/routes/tasks.ts` | `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/:id`, `GET /api/tasks/:id/events` |
-| `src/web/routes/approvals.ts` | `POST /api/tasks/:id/approve`, `POST /api/tasks/:id/reject`, `POST /api/tasks/:id/cancel` |
+| `src/web/routes/tasks.ts` | Task creation/list/get/events/archive/unarchive/permanent delete |
+| `src/web/routes/approvals.ts` | Approve/reject/cancel/approve-plan/critique-plan/retry task operations |
 | `src/web/routes/meta.ts` | `POST /api/meta`, `POST /api/meta/:experimentId/conclude` |
+| `src/web/routes/transcripts.ts` | `GET /api/transcripts/by-task/:taskId`, `GET /api/transcripts/:id` |
+| `src/web/routes/experiments.ts` | `GET /api/experiments?status=proposed&operation=fork`, `POST /api/experiments/:id/approve-fork`, `POST /api/experiments/:id/reject-fork` |
+| `src/web/routes/variants.ts` | `GET /api/variants/:agentType`, `GET /api/variants/:id/scores`, `GET /api/variants/:id/shadow` |
+| `src/web/routes/diagnostic.ts` | `POST /api/diagnostic/run` |
 | `src/web/routes/metrics.ts` | `GET /api/metrics/:projectId`, `GET /api/metrics/:projectId/trends` |
 | `src/web/events.ts` | `LiveEventHub` — in-memory SSE fan-out |

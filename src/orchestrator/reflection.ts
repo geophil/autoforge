@@ -101,13 +101,7 @@ export async function reflectOnTask(
     return { lessonId: null, skipped: true, reason: "already_reflected" };
   }
 
-  const faRow = deps.db.sqlite
-    .query(
-      "SELECT payload FROM events WHERE task_id = ? AND event_type = 'failure_analysis' ORDER BY timestamp DESC LIMIT 1"
-    )
-    .get(taskId) as { payload: string } | undefined;
-
-  const fa = faRow ? (safeJsonParse(faRow.payload) as Record<string, unknown> | null) : null;
+  const fa = latestFailureAnalysisForReflection(deps.db.listEvents(taskId));
 
   if (fa) {
     if (
@@ -400,6 +394,24 @@ function safeJsonParse(input: string): unknown {
   } catch {
     return null;
   }
+}
+
+function latestFailureAnalysisForReflection(
+  events: Array<{ type: string; payload: Record<string, unknown> }>
+): Record<string, unknown> | null {
+  let latest: Record<string, unknown> | null = null;
+  for (const event of events) {
+    if (event.type === "rollback_applied") {
+      // A rollback marks the prior failure trajectory as superseded; reflection
+      // should focus on the post-rollback outcome instead of double-counting.
+      latest = null;
+      continue;
+    }
+    if (event.type === "failure_analysis") {
+      latest = event.payload;
+    }
+  }
+  return latest;
 }
 
 /**

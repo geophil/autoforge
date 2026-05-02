@@ -13,12 +13,14 @@ import { OrchestratorService } from "../../src/orchestrator/service";
 import { MockExecutor } from "../../src/executors/mock";
 import type { AgentTask, AgentResult } from "../../src/executors/interface";
 import { createDispatcher } from "../../src/orchestrator/dispatch";
+import { serializeEmbedding, type EmbeddingProvider } from "../../src/orchestrator/embedding";
 
 type Handlers = Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult | Promise<AgentResult>>>;
 
 function createDispatchTestService(
   randomValues: number[],
-  handlers: Handlers = {}
+  handlers: Handlers = {},
+  options: { embeddingProvider?: EmbeddingProvider; useServiceConstructedDispatcher?: boolean } = {}
 ): { service: OrchestratorService; db: DbClient; cleanup: () => void } {
   const baseDir = realpathSync(mkdtempSync(join(tmpdir(), "autoforge-dispatch-test-")));
   const dbPath = join(baseDir, `${randomUUID()}.sqlite`);
@@ -45,7 +47,8 @@ function createDispatchTestService(
     db,
     executor: new MockExecutor(handlers),
     worktrees,
-    dispatcher,
+    ...(options.useServiceConstructedDispatcher ? {} : { dispatcher }),
+    embeddingProvider: options.embeddingProvider,
     testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
     prCreator: async (payload) => `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`
   });
@@ -234,6 +237,61 @@ describe("lesson injection at dispatch", () => {
       expect(coderPayload.injected_lesson_ids).toContain(activeLessonId);
       expect(observedPrompts).toContain("ACTIVE CODER PERSONA");
       expect(observedPrompts).not.toContain("BASE CODER PERSONA");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("service-constructed dispatcher uses injected embedding provider for eligibility", async () => {
+    let embedCalls = 0;
+    const embeddingProvider: EmbeddingProvider = {
+      async embed(): Promise<number[]> {
+        embedCalls += 1;
+        return [1, 0];
+      }
+    };
+    const { service, db, cleanup } = createDispatchTestService([], {}, {
+      embeddingProvider,
+      useServiceConstructedDispatcher: true
+    });
+
+    try {
+      seedPersonaVariant(db, {
+        id: "planner-base",
+        agentType: "planner",
+        content: "BASE PLANNER PERSONA",
+        status: "baseline",
+        share: 1
+      });
+      seedPersonaVariant(db, {
+        id: "coder-base",
+        agentType: "coder",
+        content: "BASE CODER PERSONA",
+        status: "baseline",
+        share: 0.5
+      });
+      seedPersonaVariant(db, {
+        id: "coder-active-embedding",
+        agentType: "coder",
+        content: "ACTIVE EMBEDDING CODER PERSONA",
+        status: "active",
+        share: 0.5,
+        specialty: "watercolor illustration"
+      });
+      db.sqlite.query("UPDATE skill_versions SET specialty_embedding = ? WHERE id = ?")
+        .run(serializeEmbedding([1, 0]), "coder-active-embedding");
+
+      const task = await service.submitTask(
+        "autoforge",
+        "fix React button styling",
+        { reviewPlan: false, forceTier: "EXPRESS" }
+      );
+
+      const [coderPayload] = payloadsFor(db, task.id, "coder");
+      expect(embedCalls).toBeGreaterThanOrEqual(1);
+      expect(coderPayload.eligible_variant_ids).toEqual(
+        expect.arrayContaining(["coder-base", "coder-active-embedding"])
+      );
     } finally {
       cleanup();
     }

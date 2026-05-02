@@ -58,6 +58,22 @@ curl -X POST http://127.0.0.1:3000/api/tasks/<TASK_ID>/reject \
   -d '{"reason":"Needs follow-up changes"}'
 ```
 
+Retry paused task from a checkpoint:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tasks/<TASK_ID>/retry \
+  -H "Content-Type: application/json" \
+  -d '{"fromStage":"planning","checkpointId":"<CHECKPOINT_ID>","operatorNote":"Retry with narrower scope"}'
+```
+
+Queue steering for next attempt:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tasks/<TASK_ID>/steer \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Prefer a minimal patch and keep API surface unchanged."}'
+```
+
 Trigger a meta agent improvement session:
 
 ```bash
