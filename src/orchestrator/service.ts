@@ -28,6 +28,7 @@ import { validateMetaOutput } from "../schemas/meta-output";
 import { handleMetaOperation } from "./meta-operations";
 import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
 import { runDiagnostic } from "./diagnostic";
+import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayload, type TaskCheckpointStage } from "./checkpoints";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -221,6 +222,14 @@ export class OrchestratorService {
         iteration: 0
       },
       budgetSeconds: 60
+    });
+    this.recordCheckpoint({
+      taskId,
+      projectId,
+      iteration: 0,
+      stage: "planning",
+      worktreePath: worktree.path,
+      label: "task-start"
     });
 
     this.transition(taskId, projectId, "received", "assessing", { assessment, tier });
@@ -881,7 +890,7 @@ export class OrchestratorService {
    */
   async retryFromIntervention(
     taskId: string,
-    opts: { fromStage?: "planning" | "executing" } = {}
+    opts: { fromStage?: "planning" | "executing"; checkpointId?: string; operatorNote?: string } = {}
   ): Promise<PipelineTask> {
     const task = this.requireTask(taskId);
     if (task.state !== "awaiting_intervention") {
@@ -891,9 +900,65 @@ export class OrchestratorService {
     const events = this.deps.db.listEvents(taskId);
     const lastFailure = [...events].reverse().find((e) => e.type === "failure_analysis");
     const failedStage = (lastFailure?.payload.stage_failed as TaskStage | undefined) ?? "planning";
-    // `replanning` folds into `planning` for retry purposes — we re-run the
-    // planner from scratch rather than trying to resume a partial revision.
-    const targetStage = opts.fromStage ?? (failedStage === "replanning" ? "planning" : failedStage);
+    // `replanning` folds into `planning`; reviewer/rework failures retry from execution by default.
+    const defaultStage: "planning" | "executing" =
+      failedStage === "planning" || failedStage === "replanning"
+        ? "planning"
+        : "executing";
+    const targetStage = opts.fromStage ?? defaultStage;
+
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (!worktreePath) {
+      throw new Error(`Worktree missing for task ${taskId}; cannot retry`);
+    }
+    const branch = `autoforge/${taskId}`;
+    const checkpoints = events
+      .filter((event) => event.type === "checkpoint_created")
+      .map((event) => ({ eventId: event.id, payload: parseCheckpointPayload(event.payload) }))
+      .filter((event): event is { eventId: string; payload: TaskCheckpointPayload } => event.payload !== null);
+
+    let retryIteration = task.iteration;
+    if (opts.checkpointId) {
+      const checkpoint = checkpoints.find((candidate) => candidate.payload.checkpoint_id === opts.checkpointId)?.payload;
+      if (!checkpoint || checkpoint.task_id !== taskId) {
+        throw new Error("checkpoint_not_found");
+      }
+      if (
+        opts.fromStage &&
+        checkpointStageOrder(checkpoint.stage) > checkpointStageOrder(opts.fromStage)
+      ) {
+        throw new Error("checkpoint_stage_after_retry_stage");
+      }
+
+      const priorHeadSha = this.deps.worktrees.currentHead(worktreePath);
+      this.deps.worktrees.resetToCommit(worktreePath, checkpoint.git_sha);
+      retryIteration = checkpoint.iteration;
+      this.recordEvent({
+        taskId,
+        projectId: task.projectId,
+        agent: "orchestrator",
+        type: "rollback_applied",
+        status: "done",
+        payload: {
+          checkpoint_id: checkpoint.checkpoint_id,
+          prior_iteration: task.iteration,
+          target_iteration: checkpoint.iteration,
+          operator_note: opts.operatorNote ?? null,
+          prior_head_sha: priorHeadSha,
+          checkpoint_git_sha: checkpoint.git_sha
+        },
+        budgetSeconds: 60
+      });
+    }
+
+    this.recordCheckpoint({
+      taskId,
+      projectId: task.projectId,
+      iteration: retryIteration,
+      stage: "awaiting_intervention",
+      worktreePath,
+      label: "pre-retry"
+    });
 
     this.recordEvent({
       taskId,
@@ -904,19 +969,15 @@ export class OrchestratorService {
       payload: {
         from_stage: targetStage,
         previously_failed_stage: failedStage,
-        iteration: task.iteration
+        checkpoint_id: opts.checkpointId ?? null,
+        operator_note: opts.operatorNote ?? null,
+        iteration: retryIteration
       },
       budgetSeconds: 60
     });
 
-    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
-    if (!worktreePath) {
-      throw new Error(`Worktree missing for task ${taskId}; cannot retry`);
-    }
-    const branch = `autoforge/${taskId}`;
-
     if (targetStage === "planning") {
-      this.transition(taskId, task.projectId, "awaiting_intervention", "planning", { retry: true });
+      this.transition(taskId, task.projectId, "awaiting_intervention", "planning", { retry: true, iteration: retryIteration });
       // Use the next attempt number so the failed transcript is preserved
       // for forensics and we don't collide with the UNIQUE(task_id, stage,
       // attempt) constraint.
@@ -947,11 +1008,11 @@ export class OrchestratorService {
     }
 
     if (targetStage === "executing") {
-      this.transition(taskId, task.projectId, "awaiting_intervention", "executing", { retry: true });
+      this.transition(taskId, task.projectId, "awaiting_intervention", "executing", { retry: true, iteration: retryIteration });
       try {
         await this.executeAndReview(
           taskId, task.projectId, task.description, task.tier,
-          task.planSubtasks, task.iteration, worktreePath, branch
+          task.planSubtasks, retryIteration, worktreePath, branch
         );
       } catch (err) {
         if (err instanceof StageFailedError) {
@@ -1516,6 +1577,14 @@ export class OrchestratorService {
 
         // Orchestrator commits agent output — agents never push directly.
         this.deps.worktrees.commit({ branch, path: worktreePath }, `autoforge: ${subtask.description}`);
+        this.recordCheckpoint({
+          taskId,
+          projectId,
+          iteration,
+          stage: "executing",
+          worktreePath,
+          label: `subtask-${subtask.sequence}`
+        });
       }
 
       this.transition(taskId, projectId, "executing", "reviewing", { iteration });
@@ -1787,6 +1856,17 @@ export class OrchestratorService {
       failure_category: failureCategory,
       failure_reason: failureReason
     });
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (worktreePath) {
+      this.recordCheckpoint({
+        taskId,
+        projectId,
+        iteration: this.requireTask(taskId).iteration,
+        stage: "awaiting_intervention",
+        worktreePath,
+        label: `${fromStage}:${failureCategory}`
+      });
+    }
     throw new StageFailedError(taskId, fromStage, failureReason);
   }
 
@@ -2051,6 +2131,34 @@ export class OrchestratorService {
     if (tier === "EXPRESS" && set.sdk) return set.sdk;
 
     return set.claudeCode;
+  }
+
+  private recordCheckpoint(input: {
+    taskId: string;
+    projectId: string;
+    iteration: number;
+    stage: TaskCheckpointStage;
+    worktreePath: string;
+    label: string;
+  }): void {
+    const gitSha = this.deps.worktrees.currentHead(input.worktreePath);
+    if (!gitSha) return;
+    this.recordEvent({
+      taskId: input.taskId,
+      projectId: input.projectId,
+      agent: "orchestrator",
+      type: "checkpoint_created",
+      status: "done",
+      payload: {
+        checkpoint_id: randomUUID(),
+        task_id: input.taskId,
+        iteration: input.iteration,
+        stage: input.stage,
+        git_sha: gitSha,
+        label: input.label
+      },
+      budgetSeconds: 60
+    });
   }
 
   private cleanupWorktree(taskId: string): void {

@@ -174,12 +174,21 @@ async function refreshTaskDetail(taskId) {
     // render forensics without a second round trip.
     if (eventsRes.ok) {
       const allEvents = await eventsRes.json();
+      const checkpoints = [];
       for (let i = allEvents.length - 1; i >= 0; i--) {
         if (allEvents[i].type === "failure_analysis") {
           task.latestFailureAnalysis = allEvents[i];
           break;
         }
       }
+      for (const event of allEvents) {
+        if (event.type === "checkpoint_created") {
+          checkpoints.push(event);
+        }
+      }
+      task.checkpoints = checkpoints
+        .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+        .slice(0, 10);
     }
     renderTaskDetail(task);
   } catch {
@@ -217,6 +226,17 @@ function renderTaskDetail(task) {
     // with the current plan, or go back and re-plan from scratch.
     const canRetryFromPlanning = stageFailed === "planning" || stageFailed === "replanning" || stageFailed === "executing" || stageFailed === "reviewing";
     const canRetryFromExecuting = stageFailed === "executing" || stageFailed === "reviewing";
+    const checkpoints = Array.isArray(task.checkpoints) ? task.checkpoints : [];
+    const checkpointOptions = checkpoints.length
+      ? checkpoints.map((checkpoint) => {
+        const cp = checkpoint.payload || {};
+        const label = cp.label ?? "checkpoint";
+        const stage = cp.stage ?? "unknown";
+        const iterationLabel = cp.iteration != null ? `iter ${cp.iteration}` : "iter ?";
+        const shortSha = typeof cp.git_sha === "string" ? cp.git_sha.slice(0, 10) : "sha?";
+        return `<option value="${esc(cp.checkpoint_id)}">${esc(iterationLabel)} · ${esc(stage)} · ${esc(label)} · ${esc(shortSha)}</option>`;
+      }).join("")
+      : "";
     const retryButtons = [];
     if (canRetryFromPlanning) {
       retryButtons.push(`<button class="btn btn-approve" onclick="retryTask('${task.id}', 'planning', this)">Retry from Planning</button>`);
@@ -240,6 +260,17 @@ function renderTaskDetail(task) {
           <div class="forensic-row"><span class="forensic-label">Tokens</span><span class="forensic-value">${esc(tokens)}</span></div>
           ${toolStats}
           ${transcriptLink}
+        </div>
+        <div class="intervention-rollback">
+          <label for="retry-checkpoint-id" class="forensic-label">Rollback checkpoint (optional)</label>
+          ${checkpoints.length > 0
+            ? `<select id="retry-checkpoint-id" class="critique-input" style="min-height: 40px;">
+                <option value="">No rollback (use current worktree state)</option>
+                ${checkpointOptions}
+              </select>`
+            : `<div class="forensic-value" style="margin-bottom: 0.5rem;">No checkpoints available yet.</div>`}
+          <textarea id="retry-operator-note" class="critique-input" rows="2" maxlength="4000"
+            placeholder="Optional operator note (saved on rollback/retry events)"></textarea>
         </div>
         <div class="intervention-buttons">
           ${retryButtons.join("")}
@@ -784,18 +815,40 @@ async function critiquePlan(taskId, btnEl) {
 
 async function retryTask(taskId, fromStage, btnEl) {
   const label = fromStage === "planning" ? "Re-planning…" : "Retrying execution…";
+  const checkpointSelect = document.getElementById("retry-checkpoint-id");
+  const noteInput = document.getElementById("retry-operator-note");
+  const checkpointId = checkpointSelect?.value?.trim();
+  const operatorNote = noteInput?.value?.trim();
   await runAction(btnEl, label, btnEl?.closest(".intervention-buttons"), async () => {
     try {
+      const payload = {
+        fromStage,
+        ...(checkpointId ? { checkpointId } : {}),
+        ...(operatorNote ? { operatorNote } : {})
+      };
       const res = await fetch(`${API}/api/tasks/${taskId}/retry`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fromStage })
+        body: JSON.stringify(payload)
       });
+      const body = await res.json().catch(() => null);
       if (res.status === 409) {
+        if (body?.error === "checkpoint_unreachable") {
+          toast("Rollback failed: checkpoint is unreachable from current HEAD.", "error");
+          return;
+        }
+        if (body?.error === "checkpoint_not_found") {
+          toast("Rollback failed: checkpoint not found.", "error");
+          return;
+        }
         toast("Task is no longer paused for intervention.", "error");
         return;
       }
-      if (!res.ok) throw new Error(await res.text());
+      if (res.status === 400 && body?.error === "checkpoint_stage_after_retry_stage") {
+        toast("Checkpoint stage is later than the selected retry stage.", "error");
+        return;
+      }
+      if (!res.ok) throw new Error(body?.message ?? JSON.stringify(body) ?? "Retry failed");
       toast(`Retry started from ${fromStage}.`, "success");
       refreshTasks();
       refreshTaskDetail(taskId);
