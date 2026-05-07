@@ -1,0 +1,17 @@
+** Creating prompt should be interactive
+    - 
+I want to improve my planning agent to be more interactive. I want to be able to create a sound solid plan from the beginning by creating a shared understanding of the problem space first. 
+There are patters such as:
+https://github.com/satya-janghu/agent-skills/tree/main/skills/grill-me or interactive patterns of requriement gathering from @/Users/jophie/.cursor/plugins/cache/cursor-public/superpowers/b7a8f76985f1e93e75dd2f2a3b424dc731bd9d37/skills/using-superpowers/SKILL.md 
+there maybe other similar patterns of skills we can use as inspiration. 
+But the end goal is to create a spec artifact that the subsequent personas can take and execute and verify. But to have that crafted well, the most crucial thing to have is a clear understanding of the problem space, but interactively checking with the human developer. of course it can take pragmatic steps such as giving recommendations where it makes sense to help the process go through smoothly than to slow down with hard interrogation. 
+
+Planning agent can optimize for shared understanding, correctness and simplicity. Then with each stage, it should provide clean handoff for the next step. 
+
+When there are clear signals available for correctness and simplicity, agents are allowed to challenge, but ultimately human decision takes priority.
+
+When the complexity is high, going deeper maybe important.
+Capturing verifiability data points during this phase is also important.  
+
+I also want to compare this approach with what we already have in place for planning. I know its super minimal, but our goal is to make this our standard skill to start a new task/project.
+Also, Do you have any other recommendation, considering other planning skill or agent examples that are popular and considered proven good practice, with the goal of creating a balanced well rounded robust planning phase? 

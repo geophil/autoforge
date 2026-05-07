@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { AgentExecutor, AgentResult, AgentTask, AgentTranscript, AgentTranscriptTurn } from "./interface";
 import { buildStatusReportingPrompt, loadSkillFiles, readStatusFile } from "./status-convention";
+import { AnthropicProvider, toToolDefinition } from "../runtime/anthropic-provider";
 
 const MAX_TOOL_ITERATIONS = 50;
 const PER_CALL_TIMEOUT_MS = 120_000;
@@ -466,6 +467,13 @@ export class AnthropicSdkExecutor implements AgentExecutor {
   async execute(task: AgentTask): Promise<AgentResult> {
     const start = Date.now();
     const client = new Anthropic({ apiKey: this.apiKey });
+    const provider = new AnthropicProvider({
+      apiKey: this.apiKey,
+      client,
+      createMessage: this._testCreate
+        ? async (params) => this._testCreate!(params)
+        : undefined
+    });
 
     const systemPrompt = buildSystemPrompt(task);
     const messages: Anthropic.MessageParam[] = [
@@ -541,40 +549,30 @@ export class AnthropicSdkExecutor implements AgentExecutor {
           }
         }
 
-        // Prompt caching: place an ephemeral cache breakpoint on the system
-        // prompt. The breakpoint caches everything before it in the prompt
-        // prefix order — that's `tools` + `system` here, which together
-        // amount to ~5–15K stable tokens per iteration. Cache writes cost
-        // 1.25× normal input tokens; reads cost 0.1×. Break-even after 2
-        // reads, and a planner run typically does 5–20 iterations within the
-        // 5-minute TTL window. Expected ~80% reduction in prefix input cost
-        // per planner run; misses fall back to normal pricing automatically.
-        const params: Anthropic.MessageCreateParamsNonStreaming = {
-          model: task.model ?? this.model,
-          max_tokens: 8192,
-          system: [
-            {
-              type: "text",
-              text: systemPrompt,
-              cache_control: { type: "ephemeral" }
-            }
-          ],
-          tools: apiTools,
-          messages
-        };
-
         const perCallTimeout = Math.min(PER_CALL_TIMEOUT_MS, remainingMs);
 
-        let response: Anthropic.Message;
+        let response: {
+          usage: { input_tokens: number; output_tokens: number };
+          stop_reason: string;
+          content: Anthropic.ContentBlock[];
+        };
         try {
-          if (this._testCreate) {
-            response = (await this._testCreate(params)) as Anthropic.Message;
-          } else {
-            response = await client.messages.create(params, {
-              timeout: perCallTimeout,
-              signal: AbortSignal.timeout(perCallTimeout)
-            });
-          }
+          const modelResponse = await provider.message({
+            model: task.model ?? this.model,
+            systemPrompt,
+            history: messages as unknown as Parameters<typeof provider.message>[0]["history"],
+            tools: apiTools.map(toToolDefinition),
+            maxTokens: 8192,
+            timeoutSeconds: perCallTimeout / 1000
+          });
+          response = {
+            usage: {
+              input_tokens: modelResponse.usage.input,
+              output_tokens: modelResponse.usage.output
+            },
+            stop_reason: modelResponse.stopReason,
+            content: modelResponse.content as unknown as Anthropic.ContentBlock[]
+          };
         } catch (callErr) {
           // Treat any per-call timeout/abort as overall budget exhaustion.
           if (
@@ -599,7 +597,15 @@ export class AnthropicSdkExecutor implements AgentExecutor {
         messages.push({ role: "assistant", content: response.content });
         turns.push({ kind: "assistant", content: response.content });
 
-        if (response.stop_reason === "end_turn") {
+        if (response.stop_reason === "error") {
+          throw new Error("Model provider returned error stop reason");
+        }
+
+        if (
+          response.stop_reason === "end_turn" ||
+          response.stop_reason === "stop_sequence" ||
+          response.stop_reason === "refusal"
+        ) {
           break;
         }
 

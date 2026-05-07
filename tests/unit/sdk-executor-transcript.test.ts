@@ -351,6 +351,54 @@ describe("SDK executor MCP wiring", () => {
 });
 
 describe("SDK executor return-path transcript invariants", () => {
+  test("terminal non-tool stop reasons do not spin another model iteration", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-refusal-"));
+    writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    let calls = 0;
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      calls++;
+      return {
+        usage: { input_tokens: 1, output_tokens: 1 },
+        stop_reason: "refusal",
+        content: [{ type: "text", text: "refused" }]
+      };
+    };
+
+    const result = await exec.execute({
+      id: "tr", type: "planner", systemPrompt: "p-refusal", prompt: "u-refusal",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    expect(calls).toBe(1);
+  });
+
+  test("provider error stop reason fails without spinning another model iteration", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sdk-provider-error-"));
+
+    const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
+    let calls = 0;
+    (exec as unknown as { _testCreate?: () => Promise<unknown> })._testCreate = async () => {
+      calls++;
+      return {
+        usage: { input_tokens: 1, output_tokens: 1 },
+        stop_reason: null,
+        content: [{ type: "text", text: "unknown stop" }]
+      };
+    };
+
+    const result = await exec.execute({
+      id: "te", type: "planner", systemPrompt: "p-error", prompt: "u-error",
+      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+    });
+
+    expect(result.status).toBe("FAILED");
+    expect(result.blockReason).toContain("error stop reason");
+    expect(calls).toBe(1);
+  });
+
   test("FAILED return path includes transcript", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sdk-fail-"));
     writeFileSync(join(dir, ".autoforge-status.json"), JSON.stringify({ status: "DONE", artifacts: [] }));
