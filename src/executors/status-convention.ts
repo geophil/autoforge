@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Workspace } from "../runtime/workspace";
 
 export const STATUS_FILE = ".autoforge-status.json";
 
@@ -30,6 +31,14 @@ export function readStatusFile(workingDirectory: string): AgentStatusFile | null
   try {
     if (!existsSync(statusPath)) return null;
     return JSON.parse(readFileSync(statusPath, "utf8")) as AgentStatusFile;
+  } catch {
+    return null;
+  }
+}
+
+export async function readStatusFileFromWorkspace(workspace: Workspace): Promise<AgentStatusFile | null> {
+  try {
+    return JSON.parse(await workspace.readFile(STATUS_FILE)) as AgentStatusFile;
   } catch {
     return null;
   }

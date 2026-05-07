@@ -5,6 +5,7 @@ import type { SkillRegistry } from "../skills/registry";
 import type { AgentType, PipelineTask } from "../types/core";
 import type { AgentTranscriptRow } from "../types/transcripts";
 import { REFLECTION_CONFIG } from "../config/reflection";
+import { LocalWorkspace } from "../runtime/local-workspace";
 
 /**
  * Whitelist of agent types the reflector is allowed to emit lessons for.
@@ -140,7 +141,11 @@ export async function reflectOnTask(
       type: "reflector",
       systemPrompt: deps.personas.resolve("reflector"),
       prompt: userPrompt,
-      workingDirectory: deps.workingDirectory,
+      workspace: new LocalWorkspace({
+        rootPath: deps.workingDirectory,
+        taskId,
+        dispatchId: "reflector"
+      }),
       budgetSeconds: REFLECTION_CONFIG.budgetSeconds,
       environment: {},
       skillFiles: deps.skills.skillsForAgent("reflector"),

@@ -3,6 +3,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentTask, AgentResult } from "../../src/executors/interface";
+import { requireLocalWorkspaceRoot } from "../../src/runtime/local-workspace";
 import { createTestService } from "../helpers/create-service";
 
 describe("iteration diff capture wiring", () => {
@@ -12,7 +13,7 @@ describe("iteration diff capture wiring", () => {
     const handlers: Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult>> = {
       coder: (task) => {
         coderCalls += 1;
-        const srcDir = join(task.workingDirectory, "src");
+        const srcDir = join(requireLocalWorkspaceRoot(task.workspace), "src");
         mkdirSync(srcDir, { recursive: true });
         writeFileSync(join(srcDir, "feature.ts"), `export const version = ${coderCalls};\n`);
         return {

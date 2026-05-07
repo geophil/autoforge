@@ -3,6 +3,11 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AnthropicSdkExecutor } from "../../src/executors/anthropic-sdk";
+import { LocalWorkspace } from "../../src/runtime/local-workspace";
+
+function workspace(rootPath: string): LocalWorkspace {
+  return new LocalWorkspace({ rootPath, taskId: "test-task", dispatchId: "test-dispatch" });
+}
 
 function buildExecutor(captured: { model?: string }): AnthropicSdkExecutor {
   const exec = new AnthropicSdkExecutor("test-key", "default-sonnet");
@@ -28,7 +33,7 @@ describe("SDK executor model override", () => {
 
     await exec.execute({
       id: "t1", type: "planner", systemPrompt: "you are x", prompt: "do y",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: [],
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: [],
       model: "claude-opus-override"
     });
 
@@ -44,7 +49,7 @@ describe("SDK executor model override", () => {
 
     await exec.execute({
       id: "t2", type: "planner", systemPrompt: "you are x", prompt: "do y",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(captured.model).toBe("default-sonnet");
@@ -65,7 +70,7 @@ describe("SDK executor transcript capture", () => {
 
     const result = await exec.execute({
       id: "tx", type: "planner", systemPrompt: "persona", prompt: "do thing",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(result.transcript).toBeDefined();
@@ -103,7 +108,7 @@ describe("SDK executor transcript capture", () => {
 
     const result = await exec.execute({
       id: "tx2", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     const kinds = result.transcript!.turns.map((t) => t.kind);
@@ -145,7 +150,7 @@ describe("SDK executor transcript capture", () => {
 
     const result = await exec.execute({
       id: "tx-list", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     const toolResult = result.transcript!.turns.find((t) => t.kind === "tool_result");
@@ -226,7 +231,7 @@ describe("SDK executor prompt caching", () => {
 
     await exec.execute({
       id: "tc", type: "planner", systemPrompt: "persona-text", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(Array.isArray(captured.system)).toBe(true);
@@ -261,7 +266,7 @@ describe("SDK executor MCP wiring", () => {
 
     await exec.execute({
       id: "tm", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 30,
+      workspace: workspace(dir), budgetSeconds: 30,
       environment: { QMD_MCP_URL: "http://localhost:8181/mcp" },
       skillFiles: []
     });
@@ -308,7 +313,7 @@ describe("SDK executor MCP wiring", () => {
 
     const result = await exec.execute({
       id: "tm-disp", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 30,
+      workspace: workspace(dir), budgetSeconds: 30,
       environment: { QMD_MCP_URL: "http://localhost:8181/mcp" },
       skillFiles: []
     });
@@ -339,7 +344,7 @@ describe("SDK executor MCP wiring", () => {
 
     await exec.execute({
       id: "tm2", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     const toolNames = (captured.tools ?? []).map((t) => t.name);
@@ -368,7 +373,7 @@ describe("SDK executor return-path transcript invariants", () => {
 
     const result = await exec.execute({
       id: "tr", type: "planner", systemPrompt: "p-refusal", prompt: "u-refusal",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(result.status).toBe("DONE");
@@ -391,7 +396,7 @@ describe("SDK executor return-path transcript invariants", () => {
 
     const result = await exec.execute({
       id: "te", type: "planner", systemPrompt: "p-error", prompt: "u-error",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(result.status).toBe("FAILED");
@@ -410,7 +415,7 @@ describe("SDK executor return-path transcript invariants", () => {
 
     const result = await exec.execute({
       id: "tf", type: "planner", systemPrompt: "p-fail", prompt: "u-fail",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(result.status).toBe("FAILED");
@@ -449,7 +454,7 @@ describe("SDK executor return-path transcript invariants", () => {
 
     const result = await exec.execute({
       id: "tf-iter", type: "planner", systemPrompt: "p-fail", prompt: "u-fail",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(result.status).toBe("FAILED");
@@ -469,7 +474,7 @@ describe("SDK executor return-path transcript invariants", () => {
 
     const result = await exec.execute({
       id: "tt", type: "planner", systemPrompt: "p-to", prompt: "u-to",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(result.status).toBe("TIMEOUT");
@@ -491,7 +496,7 @@ describe("SDK executor return-path transcript invariants", () => {
 
     const result = await exec.execute({
       id: "tdwc", type: "planner", systemPrompt: "p-dwc", prompt: "u-dwc",
-      workingDirectory: dir, budgetSeconds: 30, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 30, environment: {}, skillFiles: []
     });
 
     expect(result.status).toBe("DONE_WITH_CONCERNS");
@@ -531,7 +536,7 @@ describe("SDK executor compaction marker", () => {
 
     const result = await exec.execute({
       id: "tcmp", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 60, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 60, environment: {}, skillFiles: []
     });
 
     expect(result.transcript).toBeDefined();

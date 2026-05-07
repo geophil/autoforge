@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
-import { buildStatusReportingPrompt, loadSkillFiles, readStatusFile } from "./status-convention";
+import { buildStatusReportingPrompt, loadSkillFiles, readStatusFileFromWorkspace } from "./status-convention";
+import { requireLocalWorkspaceRoot } from "../runtime/local-workspace";
 
 export class ClaudeCodeExecutor implements AgentExecutor {
   readonly name = "claude-code";
@@ -13,6 +14,7 @@ export class ClaudeCodeExecutor implements AgentExecutor {
     const start = Date.now();
     const command = process.env.CLAUDE_COMMAND ?? "claude";
     const prompt = buildPrompt(task);
+    const cwd = requireLocalWorkspaceRoot(task.workspace);
 
     // Write a temporary MCP config if QMD is configured, so the claude session
     // has access to the QMD query/get/multi_get/status tools via HTTP MCP.
@@ -23,7 +25,7 @@ export class ClaudeCodeExecutor implements AgentExecutor {
     let timedOut = false;
 
     try {
-      await spawnClaude(command, prompt, task.workingDirectory, task.environment, task.budgetSeconds, mcpConfigPath, () => {
+      await spawnClaude(command, prompt, cwd, task.environment, task.budgetSeconds, mcpConfigPath, () => {
         timedOut = true;
       });
     } catch (err) {
@@ -44,7 +46,7 @@ export class ClaudeCodeExecutor implements AgentExecutor {
     }
 
     const elapsedSeconds = (Date.now() - start) / 1000;
-    const statusFile = readStatusFile(task.workingDirectory);
+    const statusFile = await readStatusFileFromWorkspace(task.workspace);
 
     if (!statusFile) {
       // Agent completed but didn't write the convention file — treat as DONE_WITH_CONCERNS.

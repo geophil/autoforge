@@ -31,6 +31,7 @@ import { runDiagnostic } from "./diagnostic";
 import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayload, type TaskCheckpointStage } from "./checkpoints";
 import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
 import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
+import { LocalWorkspace } from "../runtime/local-workspace";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -91,6 +92,10 @@ export class OrchestratorService {
     this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db, {
       embeddingProvider: this.embeddingProvider
     });
+  }
+
+  private localWorkspace(rootPath: string, taskId: string, dispatchId: string): LocalWorkspace {
+    return new LocalWorkspace({ rootPath, taskId, dispatchId });
   }
 
   async backfillSpecialtyEmbeddings(): Promise<number> {
@@ -374,7 +379,7 @@ export class OrchestratorService {
       type: "planner",
       systemPrompt: plannerDispatch.content,
       prompt: plannerPrompt,
-      workingDirectory: worktreePath,
+      workspace: this.localWorkspace(worktreePath, taskId, "planner"),
       budgetSeconds: this.budgetForTier(tier, "planner"),
       environment: this.agentEnvironment(),
       skillFiles: this.skills.skillsForAgent("planner"),
@@ -658,7 +663,7 @@ export class OrchestratorService {
         type: "doc",
         systemPrompt: docDispatch.content,
         prompt: docPrompt,
-        workingDirectory: worktreePath,
+        workspace: this.localWorkspace(worktreePath, taskId, "doc"),
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("doc"),
@@ -1210,7 +1215,7 @@ export class OrchestratorService {
         type: "meta",
         systemPrompt: metaDispatch.content,
         prompt,
-        workingDirectory: worktree.path,
+        workspace: this.localWorkspace(worktree.path, metaTaskId, "meta"),
         budgetSeconds: 600,
         environment: {},
         skillFiles: this.skills.skillsForAgent("meta"),
@@ -1576,7 +1581,7 @@ export class OrchestratorService {
           type: subtaskAgentType,
           systemPrompt: subtaskDispatch.content,
           prompt: coderPrompt,
-          workingDirectory: worktreePath,
+          workspace: this.localWorkspace(worktreePath, taskId, subtask.id),
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
@@ -1709,7 +1714,7 @@ export class OrchestratorService {
         type: "reviewer",
         systemPrompt: reviewerDispatch.content,
         prompt: reviewerPrompt,
-        workingDirectory: worktreePath,
+        workspace: this.localWorkspace(worktreePath, taskId, `reviewer-${iteration}`),
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("reviewer"),

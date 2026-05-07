@@ -7,6 +7,7 @@ import { DbClient } from "../../src/db/client";
 import type { AgentExecutor, AgentResult, AgentTask } from "../../src/executors/interface";
 import { parseDiagnosticOutput, proposalIdForCluster, runDiagnostic, runDiagnosticStalenessSweep } from "../../src/orchestrator/diagnostic";
 import type { AutoforgeMessage } from "../../src/nats/messages";
+import { LocalWorkspace } from "../../src/runtime/local-workspace";
 
 function freshDb(): DbClient {
   const db = new DbClient(join(mkdtempSync(join(tmpdir(), "diagnostic-test-")), "db.sqlite"));
@@ -210,6 +211,8 @@ describe("diagnostic parsing and persistence helpers", () => {
     expect(proposed).toBe(1);
     expect(executor.task?.type).toBe("diagnostician");
     expect(executor.task?.budgetSeconds).toBe(90);
+    expect(executor.task?.workspace).toBeInstanceOf(LocalWorkspace);
+    expect((executor.task?.workspace as LocalWorkspace | undefined)?.rootPath).toBe(process.cwd());
     const diagnosticPrompt = JSON.parse(executor.task?.prompt ?? "{}") as {
       baseline_score_mean?: unknown;
       tasks?: unknown[];

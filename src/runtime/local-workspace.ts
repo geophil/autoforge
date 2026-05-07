@@ -105,6 +105,13 @@ export class LocalWorkspace implements Workspace {
   }
 }
 
+export function requireLocalWorkspaceRoot(workspace: Workspace): string {
+  if (workspace instanceof LocalWorkspace) {
+    return workspace.rootPath;
+  }
+  throw new Error(`Executor requires a local workspace, got provider: ${workspace.provider}`);
+}
+
 function isPathInside(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${sep}`);
 }

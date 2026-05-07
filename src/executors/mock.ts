@@ -1,5 +1,3 @@
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
 import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
 import type { PlanSubtask, ReviewFinding } from "../types/core";
 
@@ -37,14 +35,14 @@ export class MockExecutor implements AgentExecutor {
       nextMetaResult = null;
       nextProposedContent = null;
 
-      if (content !== null && task.workingDirectory) {
+      if (content !== null) {
         const op = (output as Record<string, unknown> | null)?.operation as
           | Record<string, unknown>
           | undefined;
         const filename = typeof op?.proposed_content_file === "string"
           ? op.proposed_content_file
           : "proposed.md";
-        writeFileSync(join(task.workingDirectory, filename), content);
+        await task.workspace.writeFile(filename, content);
       }
 
       return {

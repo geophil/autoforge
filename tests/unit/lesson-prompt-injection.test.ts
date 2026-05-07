@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildSystemPromptForTest } from "../../src/executors/anthropic-sdk";
 import type { AgentTask } from "../../src/executors/interface";
+import { MockWorkspace } from "../../src/runtime/mock-workspace";
 
 function makeTask(overrides: Partial<AgentTask> = {}): AgentTask {
   return {
@@ -8,7 +9,7 @@ function makeTask(overrides: Partial<AgentTask> = {}): AgentTask {
     type: "coder",
     systemPrompt: "You are the coder.",
     prompt: "user prompt",
-    workingDirectory: "/tmp/wd",
+    workspace: new MockWorkspace({ id: "test-workspace" }),
     budgetSeconds: 60,
     environment: {},
     skillFiles: [],

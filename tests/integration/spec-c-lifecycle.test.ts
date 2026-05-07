@@ -14,6 +14,7 @@ import { AutoTuner } from "../../src/orchestrator/auto-tuner";
 import { PersonaRegistry } from "../../src/personas/registry";
 import type { AgentResult, AgentTask } from "../../src/executors/interface";
 import type { LifecycleHookPhase, LifecycleHooksResult } from "../../src/orchestrator/lifecycle-hooks";
+import { requireLocalWorkspaceRoot } from "../../src/runtime/local-workspace";
 
 type Handlers = Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult | Promise<AgentResult>>>;
 type HookRunner = (input: { phase: LifecycleHookPhase; workingDirectory: string; timeoutSeconds: number }) => LifecycleHooksResult;
@@ -203,7 +204,7 @@ describe("Spec C lifecycle auto-tuner hook", () => {
       lifecycleHookRunner: null,
       handlers: {
         coder: async (agentTask) => {
-          const packageJsonPath = join(agentTask.workingDirectory, "package.json");
+          const packageJsonPath = join(requireLocalWorkspaceRoot(agentTask.workspace), "package.json");
           const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
             scripts?: Record<string, string>;
           };

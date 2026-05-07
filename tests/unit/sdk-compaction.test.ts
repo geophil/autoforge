@@ -3,6 +3,11 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AnthropicSdkExecutor } from "../../src/executors/anthropic-sdk";
+import { LocalWorkspace } from "../../src/runtime/local-workspace";
+
+function workspace(rootPath: string): LocalWorkspace {
+  return new LocalWorkspace({ rootPath, taskId: "test-task", dispatchId: "test-dispatch" });
+}
 
 function snapshotMessages(messages: unknown): Array<{ role: string; content: unknown }> {
   return JSON.parse(JSON.stringify(messages ?? [])) as Array<{ role: string; content: unknown }>;
@@ -57,7 +62,7 @@ describe("SDK compaction", () => {
 
     const result = await exec.execute({
       id: "cmp-a", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 60, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 60, environment: {}, skillFiles: []
     });
 
     for (const snapshot of snapshots) {
@@ -110,7 +115,7 @@ describe("SDK compaction", () => {
 
     const result = await exec.execute({
       id: "cmp-parallel", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 60, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 60, environment: {}, skillFiles: []
     });
 
     for (const snapshot of snapshots) {
@@ -172,7 +177,7 @@ describe("SDK compaction", () => {
 
     const result = await exec.execute({
       id: "cmp-b", type: "planner", systemPrompt: "p", prompt: "u",
-      workingDirectory: dir, budgetSeconds: 60, environment: {}, skillFiles: []
+      workspace: workspace(dir), budgetSeconds: 60, environment: {}, skillFiles: []
     });
 
     const compaction = result.transcript?.turns.find((turn) => turn.kind === "compaction");

@@ -5,6 +5,7 @@ import type { DbClient } from "../db/client";
 import type { AgentExecutor } from "../executors/interface";
 import type { AgentType } from "../types/core";
 import type { AutoforgeMessage } from "../nats/messages";
+import { LocalWorkspace } from "../runtime/local-workspace";
 
 export interface DiagnosticCluster {
   label: string;
@@ -98,7 +99,11 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
       type: "diagnostician",
       systemPrompt: input.systemPrompt ?? resolveDiagnosticianPrompt(input.workingDirectory),
       prompt,
-      workingDirectory: input.workingDirectory ?? process.cwd(),
+      workspace: new LocalWorkspace({
+        rootPath: input.workingDirectory ?? process.cwd(),
+        taskId: diagnosticTaskId(input.agentType, generatedAt),
+        dispatchId: "diagnostician"
+      }),
       budgetSeconds: DIAGNOSTIC_BUDGET_SECONDS,
       environment: {},
       skillFiles: [],

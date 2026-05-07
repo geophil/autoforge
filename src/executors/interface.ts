@@ -1,11 +1,12 @@
 import type { AgentType, SubtaskReportStatus } from "../types/core";
+import type { Workspace } from "../runtime/workspace";
 
 export interface AgentTask {
   id: string;
   type: AgentType;
   systemPrompt: string;
   prompt: string;
-  workingDirectory: string;
+  workspace: Workspace;
   budgetSeconds: number;
   environment: Record<string, string>;
   skillFiles: string[];

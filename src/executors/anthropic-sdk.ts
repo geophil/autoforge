@@ -5,8 +5,9 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { AgentExecutor, AgentResult, AgentTask, AgentTranscript, AgentTranscriptTurn } from "./interface";
-import { buildStatusReportingPrompt, loadSkillFiles, readStatusFile } from "./status-convention";
+import { buildStatusReportingPrompt, loadSkillFiles, readStatusFileFromWorkspace } from "./status-convention";
 import { AnthropicProvider, toToolDefinition } from "../runtime/anthropic-provider";
+import { requireLocalWorkspaceRoot } from "../runtime/local-workspace";
 
 const MAX_TOOL_ITERATIONS = 50;
 const PER_CALL_TIMEOUT_MS = 120_000;
@@ -467,6 +468,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
   async execute(task: AgentTask): Promise<AgentResult> {
     const start = Date.now();
     const client = new Anthropic({ apiKey: this.apiKey });
+    const workspaceRoot = requireLocalWorkspaceRoot(task.workspace);
     const provider = new AnthropicProvider({
       apiKey: this.apiKey,
       client,
@@ -617,7 +619,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
             const result = await executeTool(
               block.name,
               block.input as Record<string, unknown>,
-              task.workingDirectory,
+              workspaceRoot,
               task.environment,
               stats,
               mcp
@@ -680,7 +682,7 @@ export class AnthropicSdkExecutor implements AgentExecutor {
       };
     }
 
-    const statusFile = readStatusFile(task.workingDirectory);
+    const statusFile = await readStatusFileFromWorkspace(task.workspace);
     if (!statusFile) {
       return {
         status: "DONE_WITH_CONCERNS",
