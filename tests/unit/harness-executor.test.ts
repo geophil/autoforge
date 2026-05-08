@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { HarnessExecutor } from "../../src/runtime/harness-executor";
+import { SkillRegistry } from "../../src/skills/registry";
 import { ToolRegistry } from "../../src/runtime/tool-registry";
 import type { ModelMessage, ModelProvider, ModelResponse } from "../../src/runtime/model-provider";
 import { MockWorkspace } from "../../src/runtime/mock-workspace";
 import type { Workspace } from "../../src/runtime/workspace";
 import type { ToolExecutionContext } from "../../src/runtime/tool-registry";
+import { createRuntimeToolRegistry } from "../../src/runtime/tools";
 
 class ScriptedProvider implements ModelProvider {
   readonly name = "scripted";
@@ -357,5 +362,173 @@ describe("HarnessExecutor", () => {
     if (assistantTurn?.kind === "assistant") {
       expect((assistantTurn.content[0] as { input: { status: string } }).input.status).toBe("DONE");
     }
+  });
+
+  test("records skills loaded through the runtime skill tool", async () => {
+    const skillsDir = mkdtempSync(join(tmpdir(), "harness-skills-"));
+    writeFileSync(join(skillsDir, "tdd.md"), "# TDD\nWrite tests first.");
+    const workspace = new MockWorkspace({ id: "workspace-skill" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "load-1", name: "load_skill", input: { name: "tdd" } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-1", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry({ skillRegistry: new SkillRegistry(skillsDir) }),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-skill",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    expect(result.transcript?.loadedSkills).toEqual(["tdd"]);
+    expect(result.transcript?.turns).toContainEqual({ kind: "loaded_skills", skills: ["tdd"] });
+  });
+
+  test("returns recoverable tool errors as tool_result content", async () => {
+    const skillsDir = mkdtempSync(join(tmpdir(), "harness-missing-skill-"));
+    const workspace = new MockWorkspace({ id: "workspace-missing-skill" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "load-missing", name: "load_skill", input: { name: "missing" } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-after-error", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry({ skillRegistry: new SkillRegistry(skillsDir) }),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-missing-skill",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    expect(provider.calls[1].history.at(-1)).toEqual({
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "load-missing", content: "Error: Skill not found: missing" }]
+    });
+  });
+
+  test("returns unknown tool names as recoverable tool_result errors", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-unknown-tool" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "missing-tool", name: "missing_tool", input: {} }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-after-unknown", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-unknown-tool",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    expect(provider.calls[1].history.at(-1)).toEqual({
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "missing-tool", content: "Error: Unknown tool: missing_tool" }]
+    });
+  });
+
+  test("does not start tool execution after the task deadline expires", async () => {
+    let toolRan = false;
+    const provider: ModelProvider = {
+      name: "slow-provider",
+      supportedModels: ["test-model"],
+      async message() {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return {
+          stopReason: "tool_use",
+          content: [{ type: "tool_use", id: "late-tool", name: "late_tool", input: {} }],
+          usage: { input: 1, output: 1 }
+        };
+      }
+    };
+    const tools = new ToolRegistry().register({
+      name: "late_tool",
+      description: "Should not run after deadline.",
+      inputSchema: { type: "object", properties: {} },
+      statsBucket: "read",
+      execute: async () => {
+        toolRan = true;
+        return { ok: true };
+      }
+    });
+
+    const result = await new HarnessExecutor({ provider, tools, defaultModel: "test-model" }).execute({
+      id: "task-late-tool",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace: new MockWorkspace({ id: "workspace-late-tool" }),
+      budgetSeconds: 0.001,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("TIMEOUT");
+    expect(toolRan).toBe(false);
+    expect(result.metrics.toolStats?.readCount).toBe(0);
   });
 });

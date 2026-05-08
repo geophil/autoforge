@@ -30,6 +30,7 @@ export class HarnessExecutor implements AgentExecutor {
     const systemPrompt = buildSystemPrompt(task);
     const history: ModelMessage[] = [{ role: "user", content: [{ type: "text", text: task.prompt }] }];
     const turns: AgentTranscriptTurn[] = [];
+    const loadedSkills: string[] = [];
     const toolStats: ToolStats = { readCount: 0, writeCount: 0, bashCount: 0, searchCount: 0, iterations: 0 };
     let tokenInput = 0;
     let tokenOutput = 0;
@@ -37,7 +38,10 @@ export class HarnessExecutor implements AgentExecutor {
     const transcript = (): AgentTranscript => ({
       systemPrompt,
       userPrompt: task.prompt,
-      turns
+      turns: loadedSkills.length > 0
+        ? [...turns, { kind: "loaded_skills", skills: [...loadedSkills] }]
+        : turns,
+      ...(loadedSkills.length > 0 ? { loadedSkills: [...loadedSkills] } : {})
     });
 
     try {
@@ -66,14 +70,32 @@ export class HarnessExecutor implements AgentExecutor {
         if (response.stopReason === "tool_use") {
           const toolResults: ModelContentBlock[] = [];
           for (const toolUse of toolUsesIn(responseContent)) {
-            const tool = this.options.tools.get(toolUse.name);
-            const toolRemainingMs = Math.max(0, deadlineMs - Date.now());
-            const result = await tool.execute(toolUse.input, task.workspace, {
-              environment: task.environment,
-              deadlineMs,
-              timeoutSeconds: toolRemainingMs / 1000
-            });
-            recordToolStat(toolStats, statsBucketForTool(tool));
+            let tool: ReturnType<ToolRegistry["get"]> | null = null;
+            let toolStarted = false;
+            let result: unknown;
+            try {
+              tool = this.options.tools.get(toolUse.name);
+              const toolRemainingMs = deadlineMs - Date.now();
+              if (toolRemainingMs <= 0) {
+                const error = new Error("Task budget exhausted before tool execution");
+                error.name = "AbortError";
+                throw error;
+              }
+              toolStarted = true;
+              result = await tool.execute(toolUse.input, task.workspace, {
+                environment: task.environment,
+                deadlineMs,
+                timeoutSeconds: toolRemainingMs / 1000,
+                recordLoadedSkill: (name) => {
+                  if (!loadedSkills.includes(name)) loadedSkills.push(name);
+                }
+              });
+            } catch (error) {
+              if (isTimeoutError(error)) throw error;
+              result = error instanceof Error ? error : new Error(String(error));
+            } finally {
+              if (tool && toolStarted) recordToolStat(toolStats, statsBucketForTool(tool));
+            }
             const serialized = serializeToolResult(result);
             toolResults.push({
               type: "tool_result",

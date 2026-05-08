@@ -43,7 +43,7 @@ export class LocalWorkspace implements Workspace {
 
     yield* spawnStreaming(cmd, args, {
       cwd,
-      env: { ...process.env, ...opts.env },
+      env: childProcessEnv(opts.env),
       timeoutSeconds: opts.timeoutSeconds
     });
   }
@@ -118,6 +118,17 @@ function isPathInside(candidate: string, root: string): boolean {
 
 function isMissingPathError(error: Error): boolean {
   return "code" in error && error.code === "ENOENT";
+}
+
+function childProcessEnv(env: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  const allowedFromParent = ["PATH", "HOME", "TMPDIR", "SHELL"];
+  const childEnv: NodeJS.ProcessEnv = {};
+  for (const key of allowedFromParent) {
+    if (process.env[key] !== undefined) {
+      childEnv[key] = process.env[key];
+    }
+  }
+  return { ...childEnv, ...(env ?? {}) };
 }
 
 async function* spawnStreaming(

@@ -35,6 +35,7 @@ export interface ToolStats {
 export type AgentTranscriptTurn =
   | { kind: "assistant"; content: unknown[] }
   | { kind: "tool_result"; toolUseId: string; content: string }
+  | { kind: "loaded_skills"; skills: string[] }
   | {
       kind: "compaction";
       droppedTurns: number;
@@ -51,6 +52,7 @@ export interface AgentTranscript {
   systemPrompt: string;
   userPrompt: string;
   turns: AgentTranscriptTurn[];
+  loadedSkills?: string[];
 }
 
 export interface AgentResult {

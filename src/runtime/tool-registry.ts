@@ -7,6 +7,7 @@ export interface ToolExecutionContext {
   environment: Record<string, string>;
   deadlineMs: number;
   timeoutSeconds: number;
+  recordLoadedSkill?: (name: string) => void;
 }
 
 export interface ToolImpl extends ToolDefinition {

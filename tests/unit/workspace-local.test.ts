@@ -67,6 +67,26 @@ describe("LocalWorkspace", () => {
     await rm(rootPath, { recursive: true, force: true });
   });
 
+  test("exec does not inherit orchestrator secrets from process.env", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "autoforge-local-workspace-"));
+    const workspace = new LocalWorkspace({ rootPath, taskId: "task-1", dispatchId: "dispatch-1" });
+    const previousSecret = process.env.AUTOFORGE_TEST_SECRET;
+    process.env.AUTOFORGE_TEST_SECRET = "super-secret";
+
+    try {
+      const events = await collectExec(workspace.exec("sh", ["-c", "printf ${AUTOFORGE_TEST_SECRET:-missing}"]));
+
+      expect(events.some((event) => event.kind === "stdout" && event.chunk === "missing")).toBe(true);
+    } finally {
+      if (previousSecret === undefined) {
+        delete process.env.AUTOFORGE_TEST_SECRET;
+      } else {
+        process.env.AUTOFORGE_TEST_SECRET = previousSecret;
+      }
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   test("exec rejects cwd values that escape through symlinks", async () => {
     const rootPath = await mkdtemp(join(tmpdir(), "autoforge-local-workspace-"));
     const outsidePath = await mkdtemp(join(tmpdir(), "autoforge-outside-workspace-"));
