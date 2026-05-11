@@ -6,6 +6,7 @@ let currentTaskId = null;
 let plannerMaxIterations = 3;
 let plannerSpecMaxIterations = 3;
 let taskListTab = 'active'; // 'active' | 'archived'
+const pendingReviewSubmissions = new Map();
 
 // --- DOM refs ---
 const badge = document.getElementById("connection-badge");
@@ -200,6 +201,7 @@ async function refreshTaskDetail(taskId) {
         .slice(0, 10);
       task.pendingSteering = collectPendingSteeringEvents(allEvents);
     }
+    reconcilePendingReviewSubmissions(task);
     renderTaskDetail(task);
   } catch {
     detailContent.innerHTML = `<div class="empty-state">Failed to load task.</div>`;
@@ -227,6 +229,37 @@ function collectPendingSteeringEvents(events) {
       message: event.payload?.message || "",
       author: event.payload?.author || "operator"
     }));
+}
+
+function reviewSubmissionKey(taskId, phase) {
+  return `${taskId}:${phase}`;
+}
+
+function getPendingReviewSubmission(taskId, phase) {
+  return pendingReviewSubmissions.get(reviewSubmissionKey(taskId, phase)) ?? null;
+}
+
+function setPendingReviewSubmission(taskId, phase, payload) {
+  pendingReviewSubmissions.set(reviewSubmissionKey(taskId, phase), payload);
+}
+
+function clearPendingReviewSubmission(taskId, phase) {
+  pendingReviewSubmissions.delete(reviewSubmissionKey(taskId, phase));
+}
+
+function reconcilePendingReviewSubmissions(task) {
+  const spec = getPendingReviewSubmission(task.id, "spec");
+  if (spec) {
+    if (task.state !== "awaiting_spec_approval" || (task.specAttempt ?? 0) !== spec.attempt) {
+      clearPendingReviewSubmission(task.id, "spec");
+    }
+  }
+  const plan = getPendingReviewSubmission(task.id, "plan");
+  if (plan) {
+    if (task.state !== "awaiting_plan_approval" || (task.planAttempt ?? 0) !== plan.attempt) {
+      clearPendingReviewSubmission(task.id, "plan");
+    }
+  }
 }
 
 function renderTaskDetail(task) {
@@ -344,138 +377,27 @@ function renderTaskDetail(task) {
         </div>
       </div>`;
   } else if (task.state === "awaiting_spec_approval") {
-    const attemptCount = task.specAttempt ?? 0;
     const maxAttempts = plannerSpecMaxIterations + 1;
-    const specNum = attemptCount + 1;
-    const reviseDisabled = attemptCount >= maxAttempts - 1;
-    const transcripts = task.specTranscripts ?? [];
-    const latestTranscript = transcripts.slice(-1)[0];
-    const viewLink = latestTranscript
-      ? `<a href="#" onclick="openTranscript('${latestTranscript.id}'); return false;" class="view-transcript-link">View transcript →</a>`
-      : "";
-
-    const stepper = transcripts.map((t, idx) => `
-      <button class="step-dot ${idx === transcripts.length - 1 ? "current" : ""}"
-        onclick="openTranscript('${t.id}')"
-        title="View transcript for spec #${idx + 1}">
-        ${idx + 1}
-      </button>
-    `).join("");
-    const futureDots = Array.from({ length: maxAttempts - transcripts.length }, (_, i) => `
-      <span class="step-dot future" title="Spec #${transcripts.length + i + 1} (not attempted)">${transcripts.length + i + 1}</span>
-    `).join("");
-
-    const priorCritique = latestTranscript?.critique;
-    const critiqueCallout = priorCritique
-      ? `<div class="prior-critique">
-          <div class="prior-critique-label">Your critique from spec #${specNum - 1}:</div>
-          <div class="prior-critique-body">${esc(priorCritique)}</div>
-        </div>`
-      : "";
-
-    const specMarkdown =
-      typeof window.renderSpecMarkdown === "function" ? window.renderSpecMarkdown(task) : "";
-    const specHtml =
-      typeof window.markdownToHtml === "function" && specMarkdown
-        ? window.markdownToHtml(specMarkdown)
-        : "";
-    const specDocBlock = specHtml
-      ? `<section class="plan-review-markdown" aria-label="Proposed spec">${specHtml}</section>`
-      : "";
-
-    actionsHtml = `
-      <div class="task-detail-actions plan-review">
-        <div class="plan-review-header">
-          <h3 class="plan-review-title">Spec Review — spec #${specNum} of ${maxAttempts}</h3>
-          ${viewLink}
-        </div>
-        <div class="plan-review-stepper">${stepper}${futureDots}</div>
-        ${specDocBlock}
-        ${critiqueCallout}
-        <div class="critique-wrapper">
-          <textarea id="critique-spec-input" class="critique-input" rows="4"
-            placeholder="Optional: critique the discovery/spec before approving. Cmd/Ctrl+Enter to submit."
-            maxlength="4000"></textarea>
-          <div class="critique-counter" id="critique-spec-counter">0 / 4000</div>
-        </div>
-        ${steeringComposer}
-        <div class="plan-review-buttons">
-          <button class="btn btn-approve" onclick="approveSpec('${task.id}', this)">Approve Spec &amp; Plan Next</button>
-          <button class="btn btn-secondary" id="btn-critique-spec"
-            onclick="critiqueSpec('${task.id}', this)" ${reviseDisabled ? "disabled" : ""}>
-            Revise Spec${reviseDisabled ? " (limit reached)" : ""}
-          </button>
-          <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel</button>
-        </div>
-      </div>`;
+    const pendingSubmission = getPendingReviewSubmission(task.id, "spec");
+    if (window.PlanningWizard?.renderSpecReviewPanel) {
+      actionsHtml = window.PlanningWizard.renderSpecReviewPanel(task, {
+        maxAttempts,
+        pendingSubmission
+      });
+    } else {
+      actionsHtml = `<div class="task-detail-actions"><span class="empty-state">Spec review UI module failed to load.</span></div>`;
+    }
   } else if (task.state === "awaiting_plan_approval") {
-    const attemptCount = task.planAttempt ?? 0;
     const maxAttempts = plannerMaxIterations + 1;
-    const planNum = attemptCount + 1;
-    const reviseDisabled = attemptCount >= (maxAttempts - 1);
-    const transcripts = task.planTranscripts ?? [];
-    const latestTranscript = transcripts.slice(-1)[0];
-    const viewLink = latestTranscript
-      ? `<a href="#" onclick="openTranscript('${latestTranscript.id}'); return false;" class="view-transcript-link">View transcript →</a>`
-      : "";
-
-    // Attempt stepper: one dot per attempt (so far), clickable to open that attempt's transcript
-    const stepper = transcripts.map((t, idx) => `
-      <button class="step-dot ${idx === transcripts.length - 1 ? "current" : ""}"
-        onclick="openTranscript('${t.id}')"
-        title="View transcript for plan #${idx + 1}">
-        ${idx + 1}
-      </button>
-    `).join("");
-    // Fill remaining dots up to maxAttempts as disabled "future" slots
-    const futureDots = Array.from({ length: maxAttempts - transcripts.length }, (_, i) => `
-      <span class="step-dot future" title="Plan #${transcripts.length + i + 1} (not attempted)">${transcripts.length + i + 1}</span>
-    `).join("");
-
-    // Prior critique callout — show the critique that triggered this attempt (if any)
-    const priorCritique = latestTranscript?.critique;
-    const critiqueCallout = priorCritique
-      ? `<div class="prior-critique">
-          <div class="prior-critique-label">Your critique from plan #${planNum - 1}:</div>
-          <div class="prior-critique-body">${esc(priorCritique)}</div>
-        </div>`
-      : "";
-
-    const planMarkdown = typeof window.renderPlanMarkdown === "function"
-      ? window.renderPlanMarkdown(task)
-      : "";
-    const planHtml = typeof window.markdownToHtml === "function" && planMarkdown
-      ? window.markdownToHtml(planMarkdown)
-      : "";
-    const planDocBlock = planHtml
-      ? `<section class="plan-review-markdown" aria-label="Proposed plan">${planHtml}</section>`
-      : "";
-
-    actionsHtml = `
-      <div class="task-detail-actions plan-review">
-        <div class="plan-review-header">
-          <h3 class="plan-review-title">Plan Review — plan #${planNum} of ${maxAttempts}</h3>
-          ${viewLink}
-        </div>
-        <div class="plan-review-stepper">${stepper}${futureDots}</div>
-        ${planDocBlock}
-        ${critiqueCallout}
-        <div class="critique-wrapper">
-          <textarea id="critique-input" class="critique-input" rows="4"
-            placeholder="Optional: leave a natural-language critique to revise the plan. Cmd/Ctrl+Enter to submit."
-            maxlength="4000"></textarea>
-          <div class="critique-counter" id="critique-counter">0 / 4000</div>
-        </div>
-        ${steeringComposer}
-        <div class="plan-review-buttons">
-          <button class="btn btn-approve" onclick="approvePlan('${task.id}', this)">Approve &amp; Continue</button>
-          <button class="btn btn-secondary" id="btn-critique"
-            onclick="critiquePlan('${task.id}', this)" ${reviseDisabled ? "disabled" : ""}>
-            Revise Plan${reviseDisabled ? " (limit reached)" : ""}
-          </button>
-          <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel</button>
-        </div>
-      </div>`;
+    const pendingSubmission = getPendingReviewSubmission(task.id, "plan");
+    if (window.PlanningWizard?.renderPlanReviewPanel) {
+      actionsHtml = window.PlanningWizard.renderPlanReviewPanel(task, {
+        maxAttempts,
+        pendingSubmission
+      });
+    } else {
+      actionsHtml = `<div class="task-detail-actions"><span class="empty-state">Plan review UI module failed to load.</span></div>`;
+    }
   } else if (task.state === "awaiting_approval") {
     actionsHtml = `
       <div class="task-detail-actions">
@@ -585,6 +507,7 @@ function renderTaskDetail(task) {
 
   wireCritiqueInput(task);
   wireSpecCritiqueInput(task);
+  wireWizardPromptChips();
   loadEvents(task.id);
 }
 
@@ -630,6 +553,25 @@ function wireSpecCritiqueInput(task) {
       const btn = document.getElementById("btn-critique-spec");
       if (btn && !btn.disabled) critiqueSpec(task.id, btn);
     }
+  });
+}
+
+function wireWizardPromptChips() {
+  const chipButtons = document.querySelectorAll(".wizard-suggest-chip");
+  chipButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const targetId = button.getAttribute("data-chip-target");
+      const chip = button.getAttribute("data-chip");
+      if (!targetId || !chip) return;
+      const input = document.getElementById(targetId);
+      if (!input) return;
+      const next = input.value.trim()
+        ? `${input.value.trim()}\n- ${chip}`
+        : chip;
+      input.value = next;
+      input.dispatchEvent(new Event("input"));
+      input.focus();
+    });
   });
 }
 
@@ -931,6 +873,7 @@ async function approvePlan(taskId, btnEl) {
     try {
       const res = await fetch(`${API}/api/tasks/${taskId}/approve-plan`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
+      clearPendingReviewSubmission(taskId, "plan");
       toast("Plan approved — execution starting…", "success");
       refreshTasks();
       refreshTaskDetail(taskId);
@@ -945,6 +888,7 @@ async function approveSpec(taskId, btnEl) {
     try {
       const res = await fetch(`${API}/api/tasks/${taskId}/approve-spec`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
+      clearPendingReviewSubmission(taskId, "spec");
       toast("Spec approved — generating execution plan…", "success");
       refreshTasks();
       refreshTaskDetail(taskId);
@@ -962,6 +906,7 @@ async function critiquePlan(taskId, btnEl) {
     return;
   }
   const button = btnEl ?? document.getElementById("btn-critique");
+  const attempt = Number(input?.dataset?.attempt ?? 0);
   await runAction(button, "Re-planning… (up to a few minutes)", button.closest(".plan-review-buttons"), async () => {
     try {
       const res = await fetch(`${API}/api/tasks/${taskId}/critique-plan`, {
@@ -974,10 +919,12 @@ async function critiquePlan(taskId, btnEl) {
         return;
       }
       if (!res.ok) throw new Error(await res.text());
+      setPendingReviewSubmission(taskId, "plan", { text: critique, attempt, submittedAt: Date.now() });
       toast("Critique submitted — re-planning…", "success");
       refreshTasks();
       refreshTaskDetail(taskId);
     } catch (err) {
+      clearPendingReviewSubmission(taskId, "plan");
       toast(`Critique failed: ${err.message}`, "error");
     }
   });
@@ -986,11 +933,18 @@ async function critiquePlan(taskId, btnEl) {
 async function critiqueSpec(taskId, btnEl) {
   const input = document.getElementById("critique-spec-input");
   const critique = (input?.value ?? "").trim();
+  const mode = input?.dataset?.mode === "blocking_question" ? "blocking_question" : "critique";
   if (!critique) {
-    toast("Please enter a critique to revise the spec.", "error");
+    toast(
+      mode === "blocking_question"
+        ? "Please answer the blocking question before submitting."
+        : "Please enter a critique to revise the spec.",
+      "error"
+    );
     return;
   }
   const button = btnEl ?? document.getElementById("btn-critique-spec");
+  const attempt = Number(input?.dataset?.attempt ?? 0);
   await runAction(button, "Re-planning spec…", button.closest(".plan-review-buttons"), async () => {
     try {
       const res = await fetch(`${API}/api/tasks/${taskId}/critique-spec`, {
@@ -1003,10 +957,17 @@ async function critiqueSpec(taskId, btnEl) {
         return;
       }
       if (!res.ok) throw new Error(await res.text());
-      toast("Critique submitted — revising spec…", "success");
+      setPendingReviewSubmission(taskId, "spec", { text: critique, attempt, submittedAt: Date.now(), mode });
+      toast(
+        mode === "blocking_question"
+          ? "Answer submitted — revising spec…"
+          : "Critique submitted — revising spec…",
+        "success"
+      );
       refreshTasks();
       refreshTaskDetail(taskId);
     } catch (err) {
+      clearPendingReviewSubmission(taskId, "spec");
       toast(`Critique failed: ${err.message}`, "error");
     }
   });
@@ -1191,7 +1152,13 @@ document.getElementById("form-new-task").addEventListener("submit", async (e) =>
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(await res.text());
-    refreshTasks();
+    const createdTask = await res.json();
+    await refreshTasks();
+    if (createdTask?.id) {
+      currentTaskId = createdTask.id;
+      await refreshTaskDetail(createdTask.id);
+      showView("task-detail");
+    }
   } catch (err) {
     toast(`Submit failed: ${err.message}`, "error");
   } finally {
