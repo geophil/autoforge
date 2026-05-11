@@ -1,6 +1,6 @@
 # Agent Execution
 
-The Agent Execution domain abstracts over different AI runtimes (Claude Code CLI, Anthropic API, mock) behind a single `AgentExecutor` interface. `createExecutors()` builds an `ExecutorSet`, and `OrchestratorService.routeExecutor()` chooses the runtime per tier and agent type. The domain also manages the skill system — markdown files injected into prompts — so the orchestrator can read structured results without coupling to a specific runtime.
+The Agent Execution domain abstracts over different AI runtimes (Claude Code CLI, Anthropic API, mock, and the new harness) behind a single `AgentExecutor` interface. `createExecutors()` builds an `ExecutorSet`, and `OrchestratorService.routeExecutor()` chooses the runtime per tier and agent type. The domain now separates where tools run (`Workspace`), which model API is called (`ModelProvider`), and which persona/skills define the agent.
 
 ## Business Rules and Invariants
 
@@ -31,7 +31,7 @@ if (!statusFile) {
 }
 ```
 
-**Implemented in**: `ClaudeCodeExecutor.execute()` and `AnthropicSdkExecutor.execute()`.
+**Implemented in**: `ClaudeCodeExecutor.execute()`, `AnthropicSdkExecutor.execute()`, and `HarnessExecutor.execute()`.
 
 ### Budget Is Enforced by the Executor
 
@@ -48,9 +48,87 @@ const budgetTimer = setTimeout(() => {
 }, timeoutSeconds * 1000);
 ```
 
-For `AnthropicSdkExecutor`, a deadline timestamp is checked at the start of each tool iteration loop.
+For `AnthropicSdkExecutor`, a deadline timestamp is checked at the start of each tool iteration loop. `HarnessExecutor` checks the deadline before each provider call and before starting each tool call, and it passes remaining timeout context into tools. Long-running non-`exec` tools are still expected to return promptly; `exec` receives a concrete timeout.
 
-**Implemented in**: `ClaudeCodeExecutor.execute()` and `AnthropicSdkExecutor.execute()`.
+**Implemented in**: `ClaudeCodeExecutor.execute()`, `AnthropicSdkExecutor.execute()`, and `HarnessExecutor.execute()`.
+
+### `Workspace` Is the File and Exec Boundary
+
+`AgentTask` no longer exposes `workingDirectory` directly. Executors receive a `Workspace`, so local and future cloud sandboxes share the same read/write/exec contract.
+
+```typescript
+// src/runtime/workspace.ts
+export interface Workspace {
+  readonly id: string;
+  readonly provider: "local" | "mock" | "e2b" | "aws" | string;
+  readFile(path: string): Promise<string>;
+  writeFile(path: string, content: string): Promise<void>;
+  exec(cmd: string, args: string[], opts?: ExecOptions): AsyncIterable<ExecEvent>;
+  destroy(): Promise<void>;
+}
+```
+
+`LocalWorkspace` constrains paths to its root, rejects symlink escapes, streams stdout/stderr/exit events from `child_process.spawn`, and sanitizes child process environment inheritance.
+
+```typescript
+// src/runtime/local-workspace.ts
+async *exec(cmd: string, args: string[], opts: ExecOptions = {}): AsyncIterable<ExecEvent> {
+  const cwd = opts.cwd ? this.resolveInsideRoot(opts.cwd) : this.rootPath;
+  await this.assertRealPathInsideRoot(cwd, opts.cwd ?? ".");
+  yield* spawnStreaming(cmd, args, {
+    cwd,
+    env: childProcessEnv(opts.env),
+    timeoutSeconds: opts.timeoutSeconds
+  });
+}
+```
+
+`ClaudeCodeExecutor` and the current `AnthropicSdkExecutor` are transitional local-only shims: they call `requireLocalWorkspaceRoot(task.workspace)` to get a subprocess `cwd`. A non-local workspace will fail fast for these executors instead of silently running in the wrong place.
+
+### `ModelProvider` Is the Message API Boundary
+
+`ModelProvider` normalizes model calls so Anthropic, OpenAI, and Gemini can be swapped without rewriting workspace or persona logic.
+
+```typescript
+// src/runtime/model-provider.ts
+export interface ModelProvider {
+  readonly name: string;
+  readonly supportedModels: string[];
+  message(args: {
+    model: string;
+    systemPrompt: string;
+    history: ModelMessage[];
+    tools: ToolDefinition[];
+    maxTokens?: number;
+    timeoutSeconds?: number;
+  }): Promise<ModelResponse>;
+}
+```
+
+`AnthropicProvider` currently implements this interface. It owns the Anthropic client and API key in the orchestrator process, maps tool definitions to Anthropic tool schemas, preserves stop reasons such as `tool_use`, `pause_turn`, and `refusal`, and returns normalized token usage.
+
+### `HarnessExecutor` Composes Provider, Workspace, and Tools
+
+`HarnessExecutor` is the new model-agnostic loop. It receives a `ModelProvider`, a `ToolRegistry`, and an `AgentTask.workspace`; then it loops over model responses, executes tool calls against the workspace, and finalizes through the existing status-file convention.
+
+```typescript
+// src/runtime/harness-executor.ts
+const response = await this.options.provider.message({
+  model: task.model ?? this.options.defaultModel,
+  systemPrompt,
+  history: snapshotHistory(history),
+  tools: this.options.tools.definitions(),
+  maxTokens: DEFAULT_MAX_TOKENS,
+  timeoutSeconds: remainingMs / 1000
+});
+```
+
+Important harness rules:
+- Provider history is deep-cloned before calls so providers cannot mutate transcript state.
+- Tool exceptions become recoverable `tool_result` errors unless they are timeout-style errors.
+- Tool stats increment only after a tool actually starts.
+- `pause_turn`, `refusal`, `stop_sequence`, `max_tokens`, and `end_turn` are terminal provider stops.
+- `load_skill` records loaded skill attribution only after the markdown content is successfully read.
 
 ### ExecutorSet Routes Runtime Per Tier and Agent Type
 
@@ -78,8 +156,9 @@ export function createExecutors(env: AppEnv): ExecutorSet {
 private routeExecutor(tier: Tier, agentType: AgentType): AgentExecutor {
   const set = this.deps.executors;
   if (!set) return this.deps.executor;
-  if (agentType === "planner") return set.sdk ?? set.claudeCode;
-  if (agentType === "reflector") return set.sdk ?? set.claudeCode;
+if (agentType === "planner") return set.sdk ?? set.claudeCode;
+if (agentType === "reflector") return set.sdk ?? set.claudeCode;
+if (agentType === "diagnostician") return set.sdk ?? set.claudeCode;
   if (agentType === "meta") return set.claudeCode;
   if (tier === "EXPRESS" && set.sdk) return set.sdk;
   return set.claudeCode;
@@ -120,6 +199,7 @@ export interface AgentTask {
   type: AgentType;
   systemPrompt: string;   // persona content resolved by PersonaRegistry
   prompt: string;         // task-specific user message
+  workspace: Workspace;   // read/write/exec boundary
   skillFiles: string[];   // paths resolved by SkillRegistry
   // ...
 }
@@ -144,11 +224,13 @@ private agentEnvironment(): Record<string, string> {
 
 **Implemented in**: `OrchestratorService.agentEnvironment()`.
 
+`LocalWorkspace.exec()` enforces the same invariant for shell commands: it builds a child process env from a small allowlist (`PATH`, `HOME`, `TMPDIR`, `SHELL`) plus explicit task environment. It does not spread `process.env`, so model-facing tools cannot print orchestrator API keys.
+
 ## Core Flows
 
 ### ClaudeCodeExecutor.execute Flow
 
-The Claude Code CLI is the default runtime. It runs in non-interactive mode.
+The Claude Code CLI is the legacy local runtime. It still runs in non-interactive mode and remains available for filesystem-heavy work while the harness reaches feature parity.
 
 1. **Prompt assembly**: Persona (`systemPrompt`) + skills content + task prompt + status-reporting instructions are concatenated into a single stdin string.
 2. **MCP config** (optional): If `QMD_MCP_URL` is set in `task.environment`, a temporary `--mcp-config` JSON is written pointing at the QMD server so the agent can call `query`/`get`/`multi_get` tools.
@@ -183,6 +265,19 @@ Used when `EXECUTOR_DEFAULT=anthropic-sdk`. Runs a tool-use agentic loop against
 
 Both executors now use **client-side MCP**: `ClaudeCodeExecutor` writes a `--mcp-config` file the Claude CLI consumes; `AnthropicSdkExecutor` runs the MCP client in-process via `@modelcontextprotocol/sdk`. Anthropic's remote MCP connector (`mcp_servers` API param) is intentionally not used — it would require the QMD server to be publicly reachable, which it isn't (QMD lives on the docker / k8s service network).
 
+### ClaudeCodeExecutor Deprecation Timeline
+
+`ClaudeCodeExecutor` is marked `@deprecated`, but it is not removed in this plan. The deprecation is a direction-of-travel marker: new execution features should target `HarnessExecutor`, `Workspace`, `ModelProvider`, and `ToolRegistry`.
+
+| Phase | Routing behavior | Action |
+|---|---|---|
+| Now | Claude Code remains available and is still returned for meta plus STANDARD/THOROUGH filesystem-heavy work. | Keep behavior unchanged. Use the `LocalWorkspace` adapter shim. |
+| Next plan | Harness reaches feature parity for planner/coder/reviewer/doc flows that currently need Claude Code. | Run a bake-off period with both runtimes available. |
+| Following plan | `routeExecutor()` stops returning Claude Code by default. | Keep module as an emergency fallback. |
+| Later | Harness is stable for all supported agent types. | Delete `src/executors/claude-code.ts` and related tests. |
+
+The main compatibility rule is that Claude Code only accepts `LocalWorkspace`. If a future cloud workspace is routed to this executor, `requireLocalWorkspaceRoot()` fails fast instead of silently running tools in the orchestrator working directory.
+
 Available local tools for `AnthropicSdkExecutor` (same set regardless of MCP):
 - `read_file` — read a file relative to working directory
 - `write_file` — write a file, creating parent directories
@@ -201,6 +296,33 @@ Compaction telemetry is stored in transcript turns (`kind: "compaction"`) with:
 - `usedFallback`
 
 When `QMD_MCP_URL` is set in `AgentTask.environment`, that agent sees QMD's MCP tools (`query`, `get`, `multi_get`, `status`) — names that don't collide with the local set.
+
+### Harness Runtime Tools and Skill Loading
+
+`createRuntimeToolRegistry()` creates workspace-backed tools for the harness:
+
+| Tool | Purpose |
+|---|---|
+| `read_file` | Read UTF-8 content from `Workspace.readFile()` |
+| `write_file` | Write UTF-8 content through `Workspace.writeFile()` |
+| `exec` | Collect streamed `Workspace.exec()` stdout/stderr/exit status |
+| `done` | Write `.autoforge-status.json` with runtime status validation |
+| `lookup_skill` | Return `{ name, description }[]` from markdown skill files |
+| `load_skill` | Return full skill markdown and record `loadedSkills` attribution |
+
+```typescript
+// src/runtime/tools.ts
+execute: async (input, _workspace, context) => {
+  const name = requireString(input.name, "name");
+  const skill = (await listSkillSummaries(options.skillRegistry!)).find((candidate) => candidate.name === name);
+  if (!skill) throw new Error(`Skill not found: ${name}`);
+  const content = await readFile(skill.path, "utf8");
+  context.recordLoadedSkill?.(name);
+  return { name, content };
+}
+```
+
+Loaded skills are recorded two ways: `AgentTranscript.loadedSkills` for structured metadata and a `loaded_skills` transcript turn. Today, normal transcript persistence is planner-focused, so the JSONL turn is persisted when a harness-backed planner transcript is inserted; for other harness-backed agents the attribution is available on `AgentResult.transcript` until broader transcript persistence is added.
 
 ### Utility Agent Flow (`reflector` and `diagnostician`)
 
@@ -226,7 +348,7 @@ export interface AgentTask {
   type: AgentType;
   systemPrompt: string;              // persona resolved by PersonaRegistry
   prompt: string;
-  workingDirectory: string;
+  workspace: Workspace;
   budgetSeconds: number;
   environment: Record<string, string>;
   skillFiles: string[];
@@ -279,6 +401,13 @@ export interface AgentExecutor {
 | `src/executors/claude-code.ts` | `ClaudeCodeExecutor` — spawns Claude CLI subprocess; supports MCP |
 | `src/executors/anthropic-sdk.ts` | `AnthropicSdkExecutor` — Anthropic Messages API tool-use loop |
 | `src/executors/mock.ts` | `MockExecutor` — deterministic responses for tests |
+| `src/runtime/workspace.ts` | `Workspace` interface shared by local and future cloud sandboxes |
+| `src/runtime/local-workspace.ts` | `LocalWorkspace` — root-constrained files and streaming subprocess execution |
+| `src/runtime/model-provider.ts` | `ModelProvider` interface and normalized message types |
+| `src/runtime/anthropic-provider.ts` | `AnthropicProvider` — Anthropic SDK adapter |
+| `src/runtime/harness-executor.ts` | `HarnessExecutor` — provider/workspace/tool loop |
+| `src/runtime/tool-registry.ts` | `ToolRegistry` and tool execution context |
+| `src/runtime/tools.ts` | Runtime tools: read/write/exec/done/lookup_skill/load_skill |
 | `src/personas/registry.ts` | `PersonaRegistry` — resolves persona per agent type (DB-first, then file) |
 | `src/personas/*.md` | Persona seed files (planner, coder, reviewer, doc, meta, reflector, diagnostician) |
 | `src/skills/registry.ts` | `SkillRegistry` — maps agent types to skill file paths; snapshots to `skill_versions` |

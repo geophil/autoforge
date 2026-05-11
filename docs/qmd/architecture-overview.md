@@ -41,9 +41,11 @@ Human → HTTP POST /api/meta
 
 **Composition**: Every agent — planner, coder, reviewer, doc, meta, plus utility `reflector` and `diagnostician` personas — uses the same composition primitives: `persona(type) + skills(type) + task_context + AgentExecutor`. Runtime selection and environment exposure are policy-driven per agent and tier through `OrchestratorService.routeExecutor()` and `agentEnvironment()`.
 
+**Harness / workspace / provider separation**: New execution work is organized around three independent axes. `Workspace` controls where files and commands live, `ModelProvider` controls which message API is used, and persona + skills control what the agent is. `HarnessExecutor` composes these axes in the orchestrator process. The invariant is: **the harness runs in the orchestrator process; the sandbox runs nothing the harness depends on**. Model API credentials stay with the provider in the orchestrator. Workspace implementations hold no model credentials and expose only file and exec operations.
+
 **Storage**:
 - `SQLite` — append-only event log + materialized projections (source of truth); includes `skill_versions` as a population of persona/skill variants, `experiments` for improvement history, `lessons` for lineage memory, and `fork_proposals` for diagnostician-discovered niches
-- `NATS JetStream` — event streaming, optional (system runs without it)
+- `NATS JetStream` — optional event streaming; `TASKS`, `META`, `SYSTEM`, and `WORKSPACE` streams are provisioned when NATS is available
 - `Git worktrees` — per-task isolated working directories under `.runtime-worktrees/`
 - `QMD index` — vector + BM25 index of `docs/qmd/` served via HTTP MCP on port 8181
 
@@ -54,6 +56,7 @@ Human → HTTP POST /api/meta
 | Task Orchestration | Pipeline coordination, state machine, agent dispatch | `OrchestratorService.submitTask`, `approveTask`, `rejectTask`, `submitMetaTask` |
 | Complexity & Tier Routing | Classify task description, select tier | `assessComplexity()`, `routeTier()` |
 | Agent Execution | Dispatch work to AI runtimes, enforce budgets, inject personas + skills | `AgentExecutor.execute()`, `PersonaRegistry.resolve()`, `SkillRegistry.skillsForAgent()` |
+| Runtime Workspaces | Abstract file, write, exec, and cleanup operations for local and future cloud sandboxes | `Workspace`, `LocalWorkspace`, `MockWorkspace`, `workspace_created`, `workspace_destroyed` |
 | Persona & Skill Versioning | Version and activate prompt assets; track experiments | `PersonaRegistry.snapshotId()`, `DbClient.upsertPromptAsset()`, `experiments` table |
 | PR Gate & Version Control | Quality gate, GitHub operations, git isolation | `evaluatePrGate()`, `createPullRequest()`, `WorktreeManager` |
 | Event Sourcing & Recovery | Durable event log, projections, crash recovery | `DbClient.appendEvent()`, `RecoveryService.recover()` |
@@ -73,6 +76,7 @@ Human → HTTP POST /api/meta
         model: plannerModel(tier),                  ← tier-aware planner model
         systemPrompt: personas.resolve("planner"),  ← persona injected
         skillFiles: skills.skillsForAgent("planner"),
+        workspace: LocalWorkspace(worktreePath),     ← file/exec boundary
         environment: agentEnvironment()             ← QMD_MCP_URL if configured
       }) → PlanSubtask[] + AgentTranscript (captured turn-by-turn)
         db.insertTranscript({ taskId, stage: "planner", attempt, turns, ... })
@@ -130,7 +134,11 @@ Human → HTTP POST /api/meta
 
 **Agents never hold credentials**: `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY` live only in the orchestrator process. Git push, PR operations, Anthropic SDK construction, and embedding calls happen in orchestrator-owned code. The exception is non-secret `QMD_MCP_URL`, which `agentEnvironment()` forwards to task-facing planner/coder/reviewer/doc/doc-review runs so they can query the knowledge base.
 
-**Executor routing is per dispatch**: Startup builds an `ExecutorSet` containing the primary executor, optional Anthropic SDK executor, and Claude Code executor. `OrchestratorService.routeExecutor()` then routes planner and reflector to SDK when available, meta to Claude Code, EXPRESS work to SDK when available, and STANDARD/THOROUGH filesystem-heavy work to Claude Code.
+**Workspace implementations hold no model credentials**: `LocalWorkspace.exec()` receives only an allowlisted child environment plus explicit task environment. It does not inherit all of `process.env`, preventing orchestrator secrets from leaking through `exec`. Future `E2BWorkspace`, `AwsWorkspace`, or `ModalWorkspace` implementations should keep this same property: the workspace can run tools, but it cannot call model APIs with orchestrator credentials.
+
+**Executor routing is per dispatch**: Startup builds an `ExecutorSet` containing the primary executor, optional Anthropic SDK executor, and Claude Code executor. `OrchestratorService.routeExecutor()` then routes planner, reflector, and diagnostician to SDK when available, meta to Claude Code, EXPRESS work to SDK when available, and STANDARD/THOROUGH filesystem-heavy work to Claude Code.
+
+**Cloud readiness is a workspace swap**: Local operation uses `LocalWorkspace` with direct `fs` and `spawn`. Remote sandbox operation should implement the same `Workspace` interface and can later carry tool traffic over the `WORKSPACE` JetStream stream. The orchestrator, event sourcing, lessons, population routing, and PR gate do not need a cloud-provider-specific branch.
 
 **Population-shaped prompt asset versioning**: Personas and skills are both stored in `skill_versions` under a naming convention (`persona:coder`, `skill:tdd`). The table now represents a population per persona or skill type: one `baseline`, zero or more `active` traffic variants, and `candidate` variants evaluated by shadow runs before graduation. Legacy `is_active` is compatibility state derived from `status`; it no longer means "the only active row." Each agent execution records the selected `persona_version_id` and `skill_version_ids` in the event payload for outcome attribution.
 

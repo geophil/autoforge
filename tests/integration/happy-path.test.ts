@@ -9,6 +9,9 @@ describe("happy path pipeline", () => {
 
     const approved = await service.approveTask(task.id);
     expect(approved.state).toBe("completed");
+    const lifecycleEvents = db.listEvents(task.id);
+    expect(lifecycleEvents.some((event) => event.type === "workspace_created")).toBe(true);
+    expect(lifecycleEvents.some((event) => event.type === "workspace_destroyed")).toBe(true);
 
     const variantEvents = db.sqlite
       .query(

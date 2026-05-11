@@ -132,20 +132,30 @@ NATS replay checks stream message count before fetching to avoid hanging on an e
 
 ### NATS JetStream Streams
 
-Three streams are provisioned at startup:
+Four streams are provisioned at startup:
 
 ```typescript
 // src/nats/streams.ts
 await ensureStream(jsm, "TASKS",  ["autoforge.task.>"],   RetentionPolicy.Limits, StorageType.File,   1_000);
 await ensureStream(jsm, "META",   ["autoforge.meta.>"],   RetentionPolicy.Limits, StorageType.File);
 await ensureStream(jsm, "SYSTEM", ["autoforge.system.>"], RetentionPolicy.Limits, StorageType.Memory, 100);
+await ensureStream(jsm, "WORKSPACE", ["autoforge.workspace.>"], RetentionPolicy.Limits, StorageType.File, 1_000);
 ```
 
 - **TASKS**: File-backed, persists task events (primary stream for replay).
 - **META**: File-backed, reserved for meta-loop experiment events.
 - **SYSTEM**: Memory-backed, limited to 100 messages — for ephemeral system signals.
+- **WORKSPACE**: File-backed short-retention stream for future harness-to-sandbox tool traffic. Local workspaces still use direct `fs` and `spawn`.
 
 Subject format: `autoforge.task.{projectId}.{taskId}.{event.type}`
+
+Workspace tool traffic subjects are reserved for remote workspace implementations:
+
+```typescript
+workspaceSubject("workspace-1", "request")        // autoforge.workspace.workspace-1.tool.request
+workspaceSubject("workspace-1", "response", "c1") // autoforge.workspace.workspace-1.tool.response.c1
+workspaceSubject("workspace-1", "stream", "c1")   // autoforge.workspace.workspace-1.tool.stream.c1
+```
 
 ### Event Projection Logic (`applyEventProjection`)
 
@@ -191,6 +201,17 @@ export function taskSubject(projectId, taskId, event): string {
 }
 ```
 
+Workspace tool payloads are schema-first even though local tool traffic does not use NATS yet:
+
+```typescript
+export const WorkspaceToolRequestSchema = z.object({
+  correlationId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  toolName: z.string().min(1),
+  input: z.record(z.string(), z.unknown()).default({})
+});
+```
+
 ### Spec D Population Events
 
 Population operations are still ordinary append-only `events` rows. The important event types are:
@@ -218,8 +239,22 @@ The following control events use the existing type-agnostic `events` table and d
 | `steering_consumed` | `OrchestratorService.recordSteeringConsumed()` | Marks queued steering as consumed by a specific dispatch. |
 | `lifecycle_hook_completed` | `OrchestratorService.runLifecyclePhase()` | Records lifecycle hook execution details (or skip reason) per phase/script. |
 | `lifecycle_hook_failed` | `OrchestratorService.runLifecyclePhase()` | Records hook failure forensics before pausing task in `awaiting_intervention`. |
+| `workspace_created` | `OrchestratorService.localWorkspace()` | Records workspace ID, provider, task ID, dispatch ID, and root path for each dispatch workspace. |
+| `workspace_destroyed` | `OrchestratorService.cleanupWorktree()` | Records idempotent workspace cleanup after terminal task cleanup or stale-task sweep. |
 
 NATS impact: `recordEvent()` publishes all six event types on the same `autoforge.task.{projectId}.{taskId}.{event.type}` contract, so downstream consumers should decide whether to render, aggregate, or filter these control-plane events.
+
+Workspace lifecycle state is derived from the event log. There is no `runtime_sessions` or `workspaces` table. Active workspaces are `workspace_created` IDs minus `workspace_destroyed` IDs.
+
+```typescript
+// src/runtime/workspace-cleanup.ts
+export function pendingWorkspaceDestroyPayloads(events, reason): WorkspaceDestroyedPayload[] {
+  // Parse workspace_created and workspace_destroyed payloads, then return
+  // destroy payloads only for created workspace IDs not already destroyed.
+}
+```
+
+`sweepStaleTasks()` reuses the same cleanup path after terminalizing stale work. Running the sweeper repeatedly does not duplicate `workspace_destroyed`.
 
 ### SDK Compaction Transcript Fields
 
@@ -284,6 +319,8 @@ ALTER TABLE skill_versions ADD COLUMN specialty_embedding BLOB;
 | `src/db/migrations/009_fork_proposals.sql` | `fork_proposals` table for diagnostician-generated fork niches |
 | `src/db/migrations/010_specialty_embedding.sql` | `skill_versions.specialty_embedding` BLOB for specialty classifier eligibility |
 | `src/nats/client.ts` | `NatsClient` — connect, `publishTaskEvent`, `replayTaskEvents` |
-| `src/nats/streams.ts` | `ensureJetStreamStreams` — TASKS, META, SYSTEM stream provisioning |
-| `src/nats/messages.ts` | `AutoforgeMessage` schema (Zod), `taskSubject` helper |
+| `src/nats/streams.ts` | `ensureJetStreamStreams` — TASKS, META, SYSTEM, WORKSPACE stream provisioning |
+| `src/nats/messages.ts` | `AutoforgeMessage` schema, task/workspace subject helpers, workspace tool schemas |
+| `src/runtime/workspace-events.ts` | Zod payload schemas for workspace lifecycle events |
+| `src/runtime/workspace-cleanup.ts` | Idempotent workspace cleanup helper over event history |
 | `src/orchestrator/recovery.ts` | `RecoveryService` — NATS replay with SQLite fallback |

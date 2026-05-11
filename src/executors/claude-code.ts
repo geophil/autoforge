@@ -7,6 +7,14 @@ import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
 import { buildStatusReportingPrompt, loadSkillFiles, readStatusFileFromWorkspace } from "./status-convention";
 import { requireLocalWorkspaceRoot } from "../runtime/local-workspace";
 
+/**
+ * @deprecated Transitional local-only executor.
+ *
+ * Claude Code remains functional while `HarnessExecutor` reaches feature
+ * parity for filesystem-heavy planner/coder/reviewer/doc work. New execution
+ * features should target `HarnessExecutor`, `Workspace`, `ModelProvider`, and
+ * `ToolRegistry` instead of adding new behavior here.
+ */
 export class ClaudeCodeExecutor implements AgentExecutor {
   readonly name = "claude-code";
 

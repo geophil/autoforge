@@ -32,6 +32,7 @@ import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayloa
 import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
 import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
 import { LocalWorkspace } from "../runtime/local-workspace";
+import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
 
 interface ServiceDeps {
   env: AppEnv;
@@ -94,8 +95,31 @@ export class OrchestratorService {
     });
   }
 
-  private localWorkspace(rootPath: string, taskId: string, dispatchId: string): LocalWorkspace {
-    return new LocalWorkspace({ rootPath, taskId, dispatchId });
+  private localWorkspace(rootPath: string, taskId: string, dispatchId: string, projectId?: string): LocalWorkspace {
+    const workspace = new LocalWorkspace({ rootPath, taskId, dispatchId });
+    if (projectId) {
+      const alreadyCreated = this.deps.db.listEvents(taskId).some((event) => {
+        return event.type === "workspace_created" && event.payload.workspace_id === workspace.id;
+      });
+      if (!alreadyCreated) {
+        this.recordEvent({
+          taskId,
+          projectId,
+          agent: "orchestrator",
+          type: "workspace_created",
+          status: "done",
+          payload: workspaceCreatedPayload({
+            workspaceId: workspace.id,
+            provider: workspace.provider,
+            taskId,
+            dispatchId,
+            rootPath: workspace.rootPath
+          }),
+          budgetSeconds: 0
+        });
+      }
+    }
+    return workspace;
   }
 
   async backfillSpecialtyEmbeddings(): Promise<number> {
@@ -379,7 +403,7 @@ export class OrchestratorService {
       type: "planner",
       systemPrompt: plannerDispatch.content,
       prompt: plannerPrompt,
-      workspace: this.localWorkspace(worktreePath, taskId, "planner"),
+      workspace: this.localWorkspace(worktreePath, taskId, "planner", projectId),
       budgetSeconds: this.budgetForTier(tier, "planner"),
       environment: this.agentEnvironment(),
       skillFiles: this.skills.skillsForAgent("planner"),
@@ -663,7 +687,7 @@ export class OrchestratorService {
         type: "doc",
         systemPrompt: docDispatch.content,
         prompt: docPrompt,
-        workspace: this.localWorkspace(worktreePath, taskId, "doc"),
+        workspace: this.localWorkspace(worktreePath, taskId, "doc", task.projectId),
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("doc"),
@@ -1215,7 +1239,7 @@ export class OrchestratorService {
         type: "meta",
         systemPrompt: metaDispatch.content,
         prompt,
-        workspace: this.localWorkspace(worktree.path, metaTaskId, "meta"),
+        workspace: this.localWorkspace(worktree.path, metaTaskId, "meta", projectId),
         budgetSeconds: 600,
         environment: {},
         skillFiles: this.skills.skillsForAgent("meta"),
@@ -1581,7 +1605,7 @@ export class OrchestratorService {
           type: subtaskAgentType,
           systemPrompt: subtaskDispatch.content,
           prompt: coderPrompt,
-          workspace: this.localWorkspace(worktreePath, taskId, subtask.id),
+          workspace: this.localWorkspace(worktreePath, taskId, subtask.id, projectId),
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
@@ -1714,7 +1738,7 @@ export class OrchestratorService {
         type: "reviewer",
         systemPrompt: reviewerDispatch.content,
         prompt: reviewerPrompt,
-        workspace: this.localWorkspace(worktreePath, taskId, `reviewer-${iteration}`),
+        workspace: this.localWorkspace(worktreePath, taskId, `reviewer-${iteration}`, projectId),
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("reviewer"),
@@ -2404,12 +2428,31 @@ export class OrchestratorService {
   }
 
   private cleanupWorktree(taskId: string): void {
+    const task = this.deps.db.getTask(taskId);
+    if (task) {
+      this.emitPendingWorkspaceDestroyed(task.id, task.projectId, "terminal_task");
+    }
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (worktreePath) {
       const branch = `autoforge/${taskId}`;
       this.deps.worktrees.remove({ branch, path: worktreePath });
     }
     this.cleanupIterationTags(taskId);
+  }
+
+  private emitPendingWorkspaceDestroyed(taskId: string, projectId: string, reason: string): void {
+    const events = this.deps.db.listEvents(taskId);
+    for (const payload of pendingWorkspaceDestroyPayloads(events, reason)) {
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "workspace_destroyed",
+        status: "done",
+        payload,
+        budgetSeconds: 0
+      });
+    }
   }
 
   private captureTaskDiffStats(taskId: string): void {

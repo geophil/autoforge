@@ -186,6 +186,21 @@ export type TaskStatus = "pending" | "in_progress" | "done" | "done_with_concern
 
 Spec D event types stored in `events.event_type` include `variant_selected`, `shadow_run_completed`, `traffic_allocated`, `diagnostic_run_completed`, `diagnostic_cluster_detected`, `fork_approved`, `fork_rejected`, and `variants_merged`. See `domain-event-sourcing.md` > Spec D Population Events.
 
+Workspace lifecycle events are ordinary `AutoforgeMessage` rows too:
+
+```typescript
+// src/runtime/workspace-events.ts
+export const WorkspaceCreatedPayloadSchema = WorkspaceLifecyclePayloadSchema.extend({
+  root_path: z.string().optional()
+});
+
+export const WorkspaceDestroyedPayloadSchema = WorkspaceLifecyclePayloadSchema.extend({
+  reason: z.string().optional()
+});
+```
+
+`workspace_created` and `workspace_destroyed` do not project into a dedicated SQL table. Cleanup derives active workspace state by scanning event history.
+
 ## ProjectConfig
 
 **Owned by**: `domain-task-orchestration.md`
@@ -299,6 +314,55 @@ CREATE TABLE IF NOT EXISTS agent_transcripts (
 ```
 
 `persona_version_id` links planner attempts and other captured transcripts back to the selected population variant. `GET /api/transcripts/by-task/:taskId` lists rows, and `GET /api/transcripts/:id` fetches a single transcript.
+
+Harness transcripts can also include dynamic skill loading attribution:
+
+```typescript
+// src/executors/interface.ts
+export type AgentTranscriptTurn =
+  | { kind: "assistant"; content: unknown[] }
+  | { kind: "tool_result"; toolUseId: string; content: string }
+  | { kind: "loaded_skills"; skills: string[] }
+  | { kind: "compaction"; droppedTurns: number; /* ... */ }
+  | { kind: "error"; name: string; message: string; stack?: string };
+```
+
+The `loaded_skills` turn is part of the existing transcript JSONL shape, so no schema migration is needed when a harness-backed transcript is persisted. Current orchestrator persistence is planner-focused; non-planner harness runs expose this attribution on `AgentResult.transcript` until broader transcript capture is added.
+
+## Workspace and Runtime Provider Types
+
+**Owned by**: `domain-agent-execution.md`
+**Storage**: event payloads and transcript metadata; no dedicated table
+
+```typescript
+// src/runtime/workspace.ts
+export interface Workspace {
+  readonly id: string;
+  readonly provider: "local" | "mock" | "e2b" | "aws" | string;
+  readFile(path: string): Promise<string>;
+  writeFile(path: string, content: string): Promise<void>;
+  exec(cmd: string, args: string[], opts?: ExecOptions): AsyncIterable<ExecEvent>;
+  destroy(): Promise<void>;
+}
+```
+
+```typescript
+// src/runtime/model-provider.ts
+export interface ModelProvider {
+  readonly name: string;
+  readonly supportedModels: string[];
+  message(args: {
+    model: string;
+    systemPrompt: string;
+    history: ModelMessage[];
+    tools: ToolDefinition[];
+    maxTokens?: number;
+    timeoutSeconds?: number;
+  }): Promise<ModelResponse>;
+}
+```
+
+These two interfaces are the cloud-runtime hinge: adding a new sandbox means implementing `Workspace`; adding a new model API means implementing `ModelProvider`.
 
 ## SkillVersion Population Variant
 
