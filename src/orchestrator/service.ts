@@ -2428,6 +2428,15 @@ export class OrchestratorService {
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
         };
+        this.recordEvent({
+          taskId,
+          projectId,
+          agent: subtaskAgentType,
+          type: "subtask_started",
+          status: "running",
+          payload: { subtaskId: subtask.id, iteration, sequence: subtask.sequence, agentType: subtaskAgentType },
+          budgetSeconds: this.budgetForTier(tier, "coder")
+        });
         const coderResult = await coderExecutor.execute(liveTask);
         this.recordSteeringConsumed({
           taskId,
@@ -2449,7 +2458,9 @@ export class OrchestratorService {
           baselineLessonIds: coderLessons.ids,
           baselineVariantId: subtaskDispatch.baselineVariantId,
           loadCandidateLessons: (candidateVariantId) =>
-            this.loadLessonsForDispatch(candidateVariantId, subtaskAgentType, description)
+            this.loadLessonsForDispatch(candidateVariantId, subtaskAgentType, description),
+          subtaskId: subtask.id,
+          iteration
         });
 
         if (!isSuccess(coderResult.status)) {
@@ -2931,6 +2942,8 @@ export class OrchestratorService {
     baselineLessonIds: string[];
     baselineVariantId: string | null;
     loadCandidateLessons: (candidateVariantId: string) => Promise<{ ids: string[]; block: string }>;
+    subtaskId?: string;
+    iteration?: number;
   }): Promise<void> {
     try {
       await runShadowDispatches({

@@ -35,6 +35,8 @@ interface ShadowDispatchInput {
   baselineLessonIds: string[];
   loadCandidateLessons: (candidateVariantId: string) => Promise<{ ids: string[]; block: string }>;
   runner?: ShadowRunner;
+  subtaskId?: string;
+  iteration?: number;
   recordEvent: (event: {
     taskId: string;
     projectId: string;
@@ -144,17 +146,20 @@ export async function runShadowDispatches(input: ShadowDispatchInput): Promise<v
 }
 
 export function recordShadowRunCompleted(
-  input: Pick<ShadowDispatchInput, "taskId" | "projectId" | "recordEvent" | "liveTask">,
+  input: Pick<ShadowDispatchInput, "taskId" | "projectId" | "recordEvent" | "liveTask" | "subtaskId" | "iteration">,
   payload: Record<string, unknown>,
   status: "done" | "done_with_concerns" = "done"
 ): void {
+  const extraFields: Record<string, unknown> = {};
+  if (input.subtaskId !== undefined) extraFields.subtask_id = input.subtaskId;
+  if (input.iteration !== undefined) extraFields.iteration = input.iteration;
   input.recordEvent({
     taskId: input.taskId,
     projectId: input.projectId,
     agent: "orchestrator",
     type: "shadow_run_completed",
     status,
-    payload,
+    payload: { ...payload, ...extraFields },
     budgetSeconds: input.liveTask.budgetSeconds
   });
 }
