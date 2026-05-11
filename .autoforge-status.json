@@ -1,9 +1,4 @@
 {
-  "status": "DONE_WITH_CONCERNS",
-  "artifacts": [
-    "src/orchestrator/service.ts",
-    "src/orchestrator/shadow.ts",
-    "src/types/core.ts"
-  ],
-  "concerns": "src/types/core.ts was not listed in filesInScope but required a purely additive one-line change: adding 'running' to the TaskStatus union. Without it, status: 'running' on the subtask_started event would fail TypeScript compilation (AutoforgeMessage['status'] resolves to the concrete TaskStatus union). No existing values were removed or renamed."
+  "status": "DONE",
+  "artifacts": ["tests/unit/subtask-started.test.ts"]
 }
