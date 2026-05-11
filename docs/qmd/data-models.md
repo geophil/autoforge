@@ -22,19 +22,62 @@ export interface PipelineTask {
   createdAt: string;   // ISO 8601
   updatedAt: string;
   archivedAt?: string;
+  /** Submit-time review preference; null on legacy pre-V2 rows. */
+  reviewPlan?: boolean | null;
+  /** Approved discovery+spec artifacts (populated after spec gate). */
+  specArtifacts?: PlannerSpecArtifacts | null;
+  /** Revision counters + approval-mode metadata for the two-stage planning loop. */
+  planningContext?: PlanningContext | null;
+  /** The spec-phase planner's most recent unanswered question, surfaced in the dashboard. */
+  currentBlockingQuestion?: string | null;
 }
 
 export type TaskStage =
-  | "received" | "assessing" | "planning" | "awaiting_plan_approval"
+  | "received" | "assessing" | "planning"
+  | "awaiting_spec_approval" | "awaiting_plan_approval"
   | "replanning" | "executing" | "reviewing" | "reworking"
   | "pr_created" | "awaiting_approval" | "documenting"
   | "awaiting_intervention" | "completed" | "failed";
 
 export type Tier = "EXPRESS" | "STANDARD" | "THOROUGH";
+
+export interface PlanningContext {
+  /** Number of planner attempts that ran in spec phase (counts critique iterations). */
+  specRevision: number;
+  /** Number of planner attempts that ran in execution-plan phase. */
+  planRevision: number;
+  /** "manual" when an operator approved via the dashboard; "auto" for reviewPlan: false; null until approval. */
+  approvalMode: "manual" | "auto" | null;
+  /** ISO timestamp set at the same transition that flips approvalMode away from null. */
+  reviewedAt: string | null;
+}
+
+export interface PlannerSpecArtifacts {
+  discovery: {
+    intent: string;
+    constraints: string[];
+    assumptions: string[];
+    decisions: Array<{
+      decision: string;
+      reason: string;
+      alternativesRejected: string[];
+      consequence: string;
+    }>;
+    nonGoals: string[];
+    openQuestions: string[];
+  };
+  spec: {
+    problem: string;
+    desiredBehavior: string[];
+    acceptanceCriteria: string[];
+    verification: string[];
+    risks: string[];
+  };
+}
 ```
 
 ```sql
--- src/db/schema.sql
+-- src/db/schema.sql + src/db/migrations/011_spec_artifacts.sql
 CREATE TABLE IF NOT EXISTS tasks (
   id          TEXT PRIMARY KEY,
   project_id  TEXT NOT NULL,
@@ -49,6 +92,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at  TEXT NOT NULL,
   archived_at TEXT
 );
+-- Added by migration 011 (interactive planning V2):
+--   spec_artifacts            TEXT     JSON PlannerSpecArtifacts, nullable
+--   planning_context          TEXT     JSON PlanningContext, nullable
+--   current_blocking_question TEXT     latest unanswered spec-phase question
+--   review_plan               INTEGER  1/0/NULL submit-time preference
 ```
 
 ## PlanSubtask
@@ -292,28 +340,36 @@ ALTER TABLE experiments ADD COLUMN proposed_content TEXT;
 **Storage**: `agent_transcripts` table
 
 ```sql
--- src/db/schema.sql plus src/db/migrations/003_transcripts_variant.sql
+-- src/db/schema.sql plus migrations 003 (persona_version_id) and 011 (rollback_event_id)
 CREATE TABLE IF NOT EXISTS agent_transcripts (
-  id              TEXT PRIMARY KEY,
-  task_id         TEXT NOT NULL,
-  stage           TEXT NOT NULL,
-  attempt         INTEGER NOT NULL,
-  created_at      TEXT NOT NULL,
-  executor_used   TEXT NOT NULL,
-  model           TEXT,
-  system_prompt   TEXT NOT NULL,
-  user_prompt     TEXT NOT NULL,
-  transcript      TEXT NOT NULL,
-  output          TEXT,
-  critique        TEXT,
-  token_input     INTEGER,
-  token_output    INTEGER,
-  elapsed_seconds REAL,
-  persona_version_id TEXT
+  id                TEXT PRIMARY KEY,
+  task_id           TEXT NOT NULL,
+  stage             TEXT NOT NULL,    -- planner:spec | planner:execution_plan | coder | ...
+  attempt           INTEGER NOT NULL,
+  created_at        TEXT NOT NULL,
+  executor_used     TEXT NOT NULL,
+  model             TEXT,
+  system_prompt     TEXT NOT NULL,
+  user_prompt       TEXT NOT NULL,
+  transcript        TEXT NOT NULL,
+  output            TEXT,
+  critique          TEXT,
+  token_input       INTEGER,
+  token_output      INTEGER,
+  elapsed_seconds   REAL,
+  persona_version_id TEXT,
+  rollback_event_id TEXT,             -- migration 011, scopes post-rollback retries
+  UNIQUE(task_id, stage, attempt)
 );
 ```
 
-`persona_version_id` links planner attempts and other captured transcripts back to the selected population variant. `GET /api/transcripts/by-task/:taskId` lists rows, and `GET /api/transcripts/:id` fetches a single transcript.
+`stage` is namespaced after migration 011: planner attempts split into `planner:spec` (discovery + spec) and `planner:execution_plan` (subtasks). Legacy rows with `stage = 'planner'` are rewritten to `planner:execution_plan` at migration time because the legacy planner only ever emitted subtasks.
+
+`persona_version_id` links planner attempts and other captured transcripts back to the selected population variant.
+
+`rollback_event_id` (migration 011) scopes a transcript to a post-rollback retry era. The orchestrator's `scopeFilteredPlannerTranscripts` helper filters transcripts by the current rollback scope so the spec/plan critique budget effectively resets while attempt numbers remain monotonic across the task's lifetime (preserving the `(task_id, stage, attempt)` UNIQUE invariant).
+
+`GET /api/transcripts/by-task/:taskId` lists rows, and `GET /api/transcripts/:id` fetches a single transcript.
 
 Harness transcripts can also include dynamic skill loading attribution:
 

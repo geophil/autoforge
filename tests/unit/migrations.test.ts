@@ -137,7 +137,115 @@ describe("DbClient migrations", () => {
       "007_lessons.sql",
       "008_experiments_proposed_content.sql",
       "009_fork_proposals.sql",
-      "010_specialty_embedding.sql"
+      "010_specialty_embedding.sql",
+      "011_spec_artifacts.sql"
     ]);
+  });
+});
+
+// Plan §Task 3 — dedicated coverage for migration 011.
+//
+// Migration 011 rewrites legacy `stage = 'planner'` rows to
+// `'planner:execution_plan'` so the two-phase planner namespacing is
+// retroactive. We verify the rewrite happens, the (task_id, stage, attempt)
+// UNIQUE invariant is preserved, and that legacy per-task attempt counters
+// remain monotonic after the rewrite (so `critiquePlan` on a legacy task can
+// still walk the right attempt history under PLANNER_MAX_ITERATIONS).
+describe("migration 011 — legacy planner stage rewrite", () => {
+  let tempDir: string;
+  let db: DbClient;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "migration-011-test-"));
+    db = new DbClient(join(tempDir, `${randomUUID()}.sqlite`));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test("rewrites stage='planner' to 'planner:execution_plan' and preserves UNIQUE", () => {
+    // Apply migrations up through 010 only, by copying selected SQL files
+    // into a scratch dir.
+    const earlyMigrationsDir = join(tempDir, "early-migrations");
+    mkdirSync(earlyMigrationsDir, { recursive: true });
+    const allMigrations = readdirSync(resolve(process.cwd(), "src/db/migrations"))
+      .filter((name) => name.endsWith(".sql") && !name.startsWith("011_"))
+      .sort();
+    for (const file of allMigrations) {
+      const src = resolve(process.cwd(), "src/db/migrations", file);
+      const dest = join(earlyMigrationsDir, file);
+      writeFileSync(dest, require("node:fs").readFileSync(src, "utf8"));
+    }
+    db.initSchema(resolve(process.cwd(), "src/db/schema.sql"), earlyMigrationsDir);
+
+    // Insert pre-migration planner rows. Two tasks, attempts 0 and 1 each, all
+    // stage='planner' (the legacy namespace).
+    const insert = db.sqlite.query(`
+      INSERT INTO agent_transcripts (
+        id, task_id, stage, attempt, persona_version_id, created_at, executor_used,
+        model, system_prompt, user_prompt, transcript, output, critique,
+        token_input, token_output, elapsed_seconds
+      ) VALUES (?, ?, 'planner', ?, NULL, datetime('now'), 'mock', NULL, '', '', '', NULL, NULL, NULL, NULL, NULL)
+    `);
+    insert.run("transcript-a-0", "task-a", 0);
+    insert.run("transcript-a-1", "task-a", 1);
+    insert.run("transcript-b-0", "task-b", 0);
+
+    const preStages = db.sqlite
+      .query("SELECT stage FROM agent_transcripts ORDER BY task_id, attempt")
+      .all() as Array<{ stage: string }>;
+    expect(preStages.map((r) => r.stage)).toEqual(["planner", "planner", "planner"]);
+
+    // Now apply migration 011 against the same DB by re-running initSchema
+    // pointed at the canonical migrations directory.
+    db.initSchema(
+      resolve(process.cwd(), "src/db/schema.sql"),
+      resolve(process.cwd(), "src/db/migrations")
+    );
+
+    const postStages = db.sqlite
+      .query("SELECT task_id, stage, attempt FROM agent_transcripts ORDER BY task_id, attempt")
+      .all() as Array<{ task_id: string; stage: string; attempt: number }>;
+    expect(postStages).toEqual([
+      { task_id: "task-a", stage: "planner:execution_plan", attempt: 0 },
+      { task_id: "task-a", stage: "planner:execution_plan", attempt: 1 },
+      { task_id: "task-b", stage: "planner:execution_plan", attempt: 0 }
+    ]);
+
+    // Re-inserting at attempt 0 with the new (post-rewrite) stage should still
+    // trip the (task_id, stage, attempt) UNIQUE constraint — the rewrite did
+    // not weaken the invariant.
+    const collide = db.sqlite.query(`
+      INSERT INTO agent_transcripts (
+        id, task_id, stage, attempt, persona_version_id, created_at, executor_used,
+        model, system_prompt, user_prompt, transcript, output, critique,
+        token_input, token_output, elapsed_seconds
+      ) VALUES (?, ?, 'planner:execution_plan', ?, NULL, datetime('now'), 'mock', NULL, '', '', '', NULL, NULL, NULL, NULL, NULL)
+    `);
+    expect(() =>
+      collide.run("transcript-a-collide", "task-a", 0)
+    ).toThrow();
+  });
+
+  test("migration 011 records itself in schema_migrations exactly once", () => {
+    db.initSchema(
+      resolve(process.cwd(), "src/db/schema.sql"),
+      resolve(process.cwd(), "src/db/migrations")
+    );
+    const count = db.sqlite
+      .query("SELECT COUNT(*) AS n FROM schema_migrations WHERE migration_file = ?")
+      .get("011_spec_artifacts.sql") as { n: number };
+    expect(count.n).toBe(1);
+
+    // Calling initSchema again must be a no-op for migration 011.
+    db.initSchema(
+      resolve(process.cwd(), "src/db/schema.sql"),
+      resolve(process.cwd(), "src/db/migrations")
+    );
+    const count2 = db.sqlite
+      .query("SELECT COUNT(*) AS n FROM schema_migrations WHERE migration_file = ?")
+      .get("011_spec_artifacts.sql") as { n: number };
+    expect(count2.n).toBe(1);
   });
 });

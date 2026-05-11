@@ -1,14 +1,26 @@
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve, join as pathJoin } from "node:path";
+import { resolve } from "node:path";
 import type { AppEnv } from "../config/env";
 import { assessComplexity, routeTier } from "../assessment/tier";
 import { type AutoforgeMessage } from "../nats/messages";
 import type { AgentExecutor, AgentResult, AgentTask, ToolStats } from "../executors/interface";
 import type { DbClient } from "../db/client";
 import type { NatsClient } from "../nats/client";
-import type { AgentType, PipelineTask, PlanSubtask, RejectionFeedback, ReviewFinding, SubtaskReportStatus, TaskStage, Tier } from "../types/core";
+import type {
+  AgentType,
+  PipelineTask,
+  PlanSubtask,
+  PlannerRequestedPhase,
+  PlannerSpecArtifacts,
+  ParsedPlannerOutput,
+  RejectionFeedback,
+  ReviewFinding,
+  SubtaskReportStatus,
+  TaskStage,
+  Tier
+} from "../types/core";
+import { emptyPlanningContext } from "../types/core";
 import { assertTransition } from "./state-machine";
 import { computeDiffStats, computeIterationDiff } from "./diff-stats";
 import { reflectOnTask, type ReflectionResult } from "./reflection";
@@ -32,7 +44,11 @@ import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayloa
 import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
 import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
 import { LocalWorkspace } from "../runtime/local-workspace";
+import { isPlannerFallbackOutput, parsePlannerStructuredOutput } from "./planner-output";
+import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
+
+const QMD_TOOL_NAMES = new Set(["query", "get", "multi_get", "status"]);
 
 interface ServiceDeps {
   env: AppEnv;
@@ -270,6 +286,18 @@ export class OrchestratorService {
     this.deps.db.deleteTaskPermanently(taskId);
   }
 
+  private recordPlannerPhaseMismatch(taskId: string, projectId: string, detail: string): void {
+    this.recordEvent({
+      taskId,
+      projectId,
+      agent: "orchestrator",
+      type: "planner_phase_mismatch",
+      status: "done_with_concerns",
+      payload: { detail },
+      budgetSeconds: 60
+    });
+  }
+
   async submitTask(
     projectId: string,
     description: string,
@@ -279,6 +307,7 @@ export class OrchestratorService {
     const assessment = assessComplexity(description);
     const tier = opts.forceTier ?? routeTier(assessment);
     const worktree = this.deps.worktrees.create(taskId);
+    const pauseReview = this.pausePolicySubmit(tier, opts.reviewPlan);
 
     this.recordEvent({
       taskId,
@@ -292,7 +321,8 @@ export class OrchestratorService {
         tier,
         assessment,
         planSubtasks: [],
-        iteration: 0
+        iteration: 0,
+        reviewPlan: opts.reviewPlan ?? null
       },
       budgetSeconds: 60
     });
@@ -302,23 +332,180 @@ export class OrchestratorService {
       iteration: 0,
       stage: "planning",
       worktreePath: worktree.path,
-      label: "task-start"
+      label: "task-start",
+      planningPhase: "spec"
     });
 
     this.transition(taskId, projectId, "received", "assessing", { assessment, tier });
     this.transition(taskId, projectId, "assessing", "planning", {});
 
-    let planSubtasks: PlanSubtask[];
+    let planSubtasks: PlanSubtask[] = [];
+
     try {
-      planSubtasks = await this.runPlannerAttempt(
-        taskId,
-        projectId,
-        description,
-        tier,
-        worktree.path,
-        0,
-        null
-      );
+      if (tier === "EXPRESS") {
+        const parsed = await this.runPlannerAttempt({
+          taskId,
+          projectId,
+          description,
+          tier,
+          worktreePath: worktree.path,
+          transcriptStage: "planner:execution_plan",
+          requestedPhase: "execution_plan",
+          critique: null
+        });
+        const extra: Record<string, unknown> = {};
+        const planningContext = {
+          ...emptyPlanningContext(),
+          planRevision: parsed.planSubtasks.length > 0 ? 1 : 0,
+          qmdContext: parsed.planningContext.qmdContext ?? null
+        };
+        if (parsed.phase === "combined") {
+          extra.specArtifacts = parsed.specArtifacts;
+          planningContext.specRevision = Math.max(parsed.planningContext.specRevision, 1);
+        }
+        extra.planningContext = planningContext;
+        this.transition(taskId, projectId, "planning", "executing", {
+          planSubtasks: parsed.planSubtasks,
+          ...extra
+        });
+        planSubtasks = parsed.planSubtasks;
+      } else if (!pauseReview) {
+        let preservedSpec: PlannerSpecArtifacts | null = null;
+        let preservedQmdContext = null;
+        let parsed = await this.runPlannerAttempt({
+          taskId,
+          projectId,
+          description,
+          tier,
+          worktreePath: worktree.path,
+          transcriptStage: "planner:execution_plan",
+          requestedPhase: "combined",
+          critique: null
+        });
+
+        if (parsed.phase === "spec") {
+          preservedSpec = parsed.specArtifacts;
+          preservedQmdContext = parsed.planningContext.qmdContext ?? null;
+          this.recordEvent({
+            taskId,
+            projectId,
+            agent: "orchestrator",
+            type: "planner_phase_fallback_to_two_call",
+            status: "done",
+            payload: { reason: "combined_output_spec_only" },
+            budgetSeconds: 60
+          });
+          parsed = await this.runPlannerAttempt({
+            taskId,
+            projectId,
+            description,
+            tier,
+            worktreePath: worktree.path,
+            transcriptStage: "planner:execution_plan",
+            requestedPhase: "execution_plan",
+            critique: null,
+            approvedSpec: preservedSpec
+          });
+          if (parsed.planSubtasks.length === 0) {
+            this.pauseForIntervention({
+              taskId,
+              projectId,
+              fromStage: "planning",
+              failureCategory: "planner_failed",
+              failureReason: "execution plan missing after combined-phase fallback",
+              forensics: { agent: "planner", transcript_stage: "planner:execution_plan" }
+            });
+          }
+        } else if (parsed.phase === "combined") {
+          preservedSpec = parsed.specArtifacts;
+          preservedQmdContext = parsed.planningContext.qmdContext ?? null;
+        } else if (parsed.phase === "execution_plan" || parsed.phase === "legacy_subtasks") {
+          preservedQmdContext = parsed.planningContext.qmdContext ?? null;
+          this.recordPlannerPhaseMismatch(taskId, projectId, "combined_requested_execution_shaped_only");
+        }
+
+        const reviewedAt = new Date().toISOString();
+        const planningContext = {
+          ...emptyPlanningContext(),
+          approvalMode: "auto" as const,
+          reviewedAt,
+          specRevision: preservedSpec ? 1 : 0,
+          planRevision: parsed.planSubtasks.length > 0 ? 1 : 0,
+          qmdContext: parsed.planningContext.qmdContext ?? preservedQmdContext ?? null
+        };
+
+        this.transition(taskId, projectId, "planning", "executing", {
+          planSubtasks: parsed.planSubtasks,
+          specArtifacts: preservedSpec,
+          planningContext,
+          currentBlockingQuestion: null
+        });
+        planSubtasks = parsed.planSubtasks;
+      } else {
+        let parsed = await this.runPlannerAttempt({
+          taskId,
+          projectId,
+          description,
+          tier,
+          worktreePath: worktree.path,
+          transcriptStage: "planner:spec",
+          requestedPhase: "spec",
+          critique: null
+        });
+
+        if (parsed.phase === "execution_plan" || parsed.phase === "legacy_subtasks") {
+          if (parsed.planSubtasks.length > 0 && !isPlannerFallbackOutput(parsed.planSubtasks)) {
+            this.recordPlannerPhaseMismatch(taskId, projectId, "spec_requested_got_execution_plan");
+            this.transition(taskId, projectId, "planning", "awaiting_spec_approval", {
+              specArtifacts: null,
+              planningContext: emptyPlanningContext(),
+              currentBlockingQuestion:
+                "planner returned execution plan when spec was requested — please clarify",
+              planSubtasks: []
+            });
+            return this.requireTask(taskId);
+          }
+        }
+
+        if (parsed.phase === "combined") {
+          this.recordPlannerPhaseMismatch(taskId, projectId, "spec_phase_received_combined_execution_discarded");
+          parsed = {
+            phase: "spec",
+            specArtifacts: parsed.specArtifacts,
+            planningContext: parsed.planningContext,
+            blockingQuestion: parsed.blockingQuestion,
+            planSubtasks: []
+          };
+        }
+
+        if (parsed.phase !== "spec") {
+          this.pauseForIntervention({
+            taskId,
+            projectId,
+            fromStage: "planning",
+            failureCategory: "planner_failed",
+            failureReason: `spec planner produced ${parsed.phase} without usable spec artifacts`,
+            forensics: { agent: "planner", parsed_phase: parsed.phase }
+          });
+        }
+
+        const specScoped = this.scopeFilteredPlannerTranscripts(taskId, "planner:spec");
+        const planningContext = {
+          ...parsed.planningContext,
+          specRevision: specScoped.length,
+          planRevision: 0
+        };
+
+        this.transition(taskId, projectId, "planning", "awaiting_spec_approval", {
+          specArtifacts: parsed.specArtifacts,
+          planningContext,
+          currentBlockingQuestion: parsed.blockingQuestion,
+          planSubtasks: []
+        });
+        return this.requireTask(taskId);
+      }
+
+      await this.executeAndReview(taskId, projectId, description, tier, planSubtasks, 0, worktree.path, worktree.branch);
     } catch (err) {
       // Planner failure has already been surfaced (failure_analysis event +
       // awaiting_intervention transition inside runPlannerAttempt). Return
@@ -326,24 +513,9 @@ export class OrchestratorService {
       if (err instanceof StageFailedError) {
         return this.requireTask(taskId);
       }
-      throw err;
-    }
-
-    if (this.pausePolicy(tier, opts.reviewPlan)) {
-      this.transition(taskId, projectId, "planning", "awaiting_plan_approval", { planSubtasks });
-      return this.requireTask(taskId);
-    }
-
-    this.transition(taskId, projectId, "planning", "executing", { planSubtasks });
-
-    try {
-      await this.executeAndReview(taskId, projectId, description, tier, planSubtasks, 0, worktree.path, worktree.branch);
-    } catch (err) {
-      if (err instanceof StageFailedError) {
-        // Leave worktree intact so the operator can inspect or retry.
-        return this.requireTask(taskId);
-      }
-      await this.finalizeTerminalTask(taskId);
+      // Unexpected errors (e.g. PR creation failure while already in `reviewing`)
+      // do not run finalizeTerminalTask; avoid leaking the task worktree.
+      this.cleanupWorktree(taskId);
       throw err;
     }
     const task = this.deps.db.getTask(taskId);
@@ -356,9 +528,34 @@ export class OrchestratorService {
     throw new Error(`Task ${taskId} did not reach approval state; current state: ${task.state}`);
   }
 
-  private pausePolicy(tier: Tier, reviewPlanOverride?: boolean): boolean {
-    if (reviewPlanOverride !== undefined) return reviewPlanOverride;
+  private effectivePauseReview(task: PipelineTask): boolean {
+    if (task.reviewPlan === true) return true;
+    if (task.reviewPlan === false) return false;
+    return task.tier === "STANDARD" || task.tier === "THOROUGH";
+  }
+
+  /** Submit-time review preference before `PipelineTask` projection exists. */
+  private pausePolicySubmit(tier: Tier, reviewPlan?: boolean): boolean {
+    if (reviewPlan !== undefined) return reviewPlan;
     return tier === "STANDARD" || tier === "THOROUGH";
+  }
+
+  private latestRollbackEventId(taskId: string): string | null {
+    const events = this.deps.db.listEvents(taskId);
+    const rev = [...events].reverse().find((e) => e.type === "rollback_applied");
+    return rev?.id ?? null;
+  }
+
+  private scopeFilteredPlannerTranscripts(taskId: string, stage: string): AgentTranscriptMeta[] {
+    const scope = this.latestRollbackEventId(taskId);
+    const rows = this.deps.db.listTranscriptsByTask(taskId).filter((t) => t.stage === stage);
+    return rows.filter((t) => (scope === null ? !t.rollbackEventId : t.rollbackEventId === scope));
+  }
+
+  private nextTranscriptAttempt(taskId: string, stage: string): number {
+    const rows = this.deps.db.listTranscriptsByTask(taskId).filter((t) => t.stage === stage);
+    if (rows.length === 0) return 0;
+    return Math.max(...rows.map((r) => r.attempt)) + 1;
   }
 
   private plannerModel(tier: Tier): string {
@@ -366,22 +563,117 @@ export class OrchestratorService {
     return this.deps.env.PLANNER_MODEL_COMPLEX;
   }
 
-  private async runPlannerAttempt(
-    taskId: string,
-    projectId: string,
-    description: string,
-    tier: Tier,
-    worktreePath: string,
-    attempt: number,
-    critique: string | null,
-    priorPlan?: PlanSubtask[]
-  ): Promise<PlanSubtask[]> {
+  private observedQmdTools(result: AgentResult): string[] {
+    const seen = new Set<string>();
+    const turns = result.transcript?.turns ?? [];
+    for (const turn of turns) {
+      if (turn.kind !== "assistant" || !Array.isArray(turn.content)) continue;
+      for (const block of turn.content) {
+        if (!block || typeof block !== "object") continue;
+        const row = block as { type?: unknown; name?: unknown };
+        if (row.type !== "tool_use" || typeof row.name !== "string") continue;
+        if (QMD_TOOL_NAMES.has(row.name)) {
+          seen.add(row.name);
+        }
+      }
+    }
+    return Array.from(seen).sort();
+  }
+
+  private requireQmdEvidenceForPlanner(args: {
+    taskId: string;
+    projectId: string;
+    transcriptStage: "planner:spec" | "planner:execution_plan";
+    requestedPhase: PlannerRequestedPhase;
+    parsed: ParsedPlannerOutput;
+    transcriptId: string;
+    attempt: number;
+    plannerExecutorName: string;
+    plannerPersonaId: string;
+    plannerSkillIds: string[];
+    plannerResult: AgentResult;
+    observedQmdTools: string[];
+  }): void {
+    if (!this.deps.env.QMD_MCP_URL) return;
+    const qmdContext = args.parsed.planningContext.qmdContext ?? null;
+    const qmdEvidenceStatus = qmdContext?.status ?? "missing";
+    const hasEvidence =
+      qmdContext?.status === "used" &&
+      ((qmdContext.queries?.length ?? 0) > 0 || (qmdContext.documents?.length ?? 0) > 0);
+    if (hasEvidence) return;
+
+    const currentTask = this.requireTask(args.taskId);
+    this.pauseForIntervention({
+      taskId: args.taskId,
+      projectId: args.projectId,
+      fromStage: currentTask.state,
+      failureCategory: "planner_missing_qmd_context",
+      failureReason: "planner output missing required QMD knowledgebase evidence",
+      forensics: {
+        agent: "planner",
+        executor_used: args.plannerExecutorName,
+        model: this.plannerModel(currentTask.tier),
+        persona_version_id: args.plannerPersonaId,
+        skill_version_ids: args.plannerSkillIds,
+        tool_stats: args.plannerResult.metrics.toolStats ?? null,
+        transcript_id: args.transcriptId,
+        transcript_stage: args.transcriptStage,
+        attempt: args.attempt,
+        iteration: currentTask.iteration,
+        requested_phase: args.requestedPhase,
+        parsed_phase: args.parsed.phase,
+        qmd_required: true,
+        qmd_evidence_status: qmdEvidenceStatus,
+        qmd_context: qmdContext,
+        qmd_tools_observed: args.observedQmdTools
+      }
+    });
+  }
+
+  private async runPlannerAttempt(args: {
+    taskId: string;
+    projectId: string;
+    description: string;
+    tier: Tier;
+    worktreePath: string;
+    transcriptStage: "planner:spec" | "planner:execution_plan";
+    requestedPhase: PlannerRequestedPhase;
+    critique: string | null;
+    priorPlan?: PlanSubtask[];
+    approvedSpec?: PlannerSpecArtifacts | null;
+    priorSpecArtifacts?: PlannerSpecArtifacts | null;
+    currentBlockingQuestion?: string | null;
+  }): Promise<ParsedPlannerOutput> {
+    const {
+      taskId,
+      projectId,
+      description,
+      tier,
+      worktreePath,
+      transcriptStage,
+      requestedPhase,
+      critique,
+      priorPlan,
+      approvedSpec,
+      priorSpecArtifacts,
+      currentBlockingQuestion
+    } = args;
+
+    const attempt = this.nextTranscriptAttempt(taskId, transcriptStage);
     const plannerExecutor = this.routeExecutor(tier, "planner");
-    const userPrompt = this.buildPlannerPrompt(description, tier, attempt, priorPlan, critique);
+    const userPrompt = this.buildPlannerPrompt({
+      description,
+      tier,
+      phase: requestedPhase,
+      transcriptAttemptIndex: attempt,
+      priorPlan,
+      approvedSpec,
+      priorSpecArtifacts,
+      critique,
+      currentBlockingQuestion
+    });
     const plannerSteering = this.steeringForDispatch(taskId);
-    const plannerPrompt = plannerSteering.prompt
-      ? `${plannerSteering.prompt}\n\n${userPrompt}`
-      : userPrompt;
+    const plannerPrompt = plannerSteering.prompt ? `${plannerSteering.prompt}\n\n${userPrompt}` : userPrompt;
     const plannerDispatch = await this.selectPersonaForDispatch("planner", { description, tier, projectId });
     const plannerPersonaId = plannerDispatch.selection.variantId;
     const plannerSkillIds = this.skills.snapshotIds("planner");
@@ -435,17 +727,12 @@ export class OrchestratorService {
         this.loadLessonsForDispatch(candidateVariantId, "planner", description)
     });
 
-    // Persist transcript before we do anything else — even on failure we want
-    // the full I/O (including the `error` turn captured by the SDK executor)
-    // so the operator can see WHY planning failed.
     const transcript = plannerResult.transcript;
-    const turnsJsonl = transcript
-      ? transcript.turns.map((t) => JSON.stringify(t)).join("\n")
-      : "";
+    const turnsJsonl = transcript ? transcript.turns.map((t) => JSON.stringify(t)).join("\n") : "";
 
     const transcriptId = this.deps.db.insertTranscript({
       taskId,
-      stage: "planner",
+      stage: transcriptStage,
       attempt,
       personaVersionId: plannerPersonaId,
       executorUsed: plannerExecutor.name,
@@ -457,17 +744,11 @@ export class OrchestratorService {
       critique,
       tokenInput: plannerResult.metrics.tokenInput ?? null,
       tokenOutput: plannerResult.metrics.tokenOutput ?? null,
-      elapsedSeconds: plannerResult.metrics.elapsedSeconds
+      elapsedSeconds: plannerResult.metrics.elapsedSeconds,
+      rollbackEventId: this.latestRollbackEventId(taskId)
     });
 
-    // Surface executor failures instead of silently falling back. Previously
-    // a FAILED/TIMEOUT planner result was parsed into the generic fallback
-    // subtask and the pipeline marched on — hiding a real API error under a
-    // downstream coder TIMEOUT 12 minutes later.
     if (plannerResult.status === "FAILED" || plannerResult.status === "TIMEOUT") {
-      // Use live task state so the pause emits a valid transition whether
-      // the caller is submitTask (planning), critiquePlan (replanning), or
-      // retryFromIntervention (planning, but with attempt > 0).
       const currentTask = this.requireTask(taskId);
       const currentStage = currentTask.state;
       this.pauseForIntervention({
@@ -490,15 +771,48 @@ export class OrchestratorService {
           budget_seconds: this.budgetForTier(tier, "planner"),
           elapsed_seconds: plannerResult.metrics.elapsedSeconds,
           token_input: plannerResult.metrics.tokenInput ?? 0,
-          token_output: plannerResult.metrics.tokenOutput ?? 0
+          token_output: plannerResult.metrics.tokenOutput ?? 0,
+          transcript_stage: transcriptStage
         }
       });
     }
 
-    const planSubtasks = parsePlanSubtasks(taskId, plannerResult.output, worktreePath);
+    const observedQmdTools = this.observedQmdTools(plannerResult);
+    const parsed = parsePlannerStructuredOutput(taskId, plannerResult.output, requestedPhase, worktreePath);
+    this.requireQmdEvidenceForPlanner({
+      taskId,
+      projectId,
+      transcriptStage,
+      requestedPhase,
+      parsed,
+      transcriptId,
+      attempt,
+      plannerExecutorName: plannerExecutor.name,
+      plannerPersonaId,
+      plannerSkillIds,
+      plannerResult,
+      observedQmdTools
+    });
     const plannerFallback =
-      planSubtasks.length === 1 &&
-      planSubtasks[0].description === "Implement requested behavior with tests-first workflow.";
+      (parsed.phase === "execution_plan" || parsed.phase === "legacy_subtasks") &&
+      parsed.planSubtasks.length > 0 &&
+      isPlannerFallbackOutput(parsed.planSubtasks);
+
+    const plannedPayload: Record<string, unknown> = {
+      parsed_phase: parsed.phase,
+      requested_phase: requestedPhase,
+      planSubtasks: parsed.planSubtasks,
+      planner_fallback: plannerFallback,
+      attempt,
+      transcript_id: transcriptId,
+      transcript_stage: transcriptStage,
+      planningContext: parsed.planningContext,
+      qmd_tools_observed: observedQmdTools
+    };
+    if (parsed.phase === "spec" || parsed.phase === "combined") {
+      plannedPayload.specArtifacts = parsed.specArtifacts;
+      plannedPayload.blockingQuestion = parsed.blockingQuestion;
+    }
 
     this.recordEvent({
       taskId,
@@ -506,47 +820,279 @@ export class OrchestratorService {
       agent: "planner",
       type: "planned",
       status: plannerFallback ? "done_with_concerns" : "done",
-      payload: {
-        planSubtasks,
-        planner_fallback: plannerFallback,
-        attempt,
-        transcript_id: transcriptId
-      },
+      payload: plannedPayload,
       budgetSeconds: this.budgetForTier(tier, "planner"),
       elapsedSeconds: plannerResult.metrics.elapsedSeconds,
-      tokenUsage: plannerResult.metrics.tokenInput !== undefined ? {
-        input: plannerResult.metrics.tokenInput,
-        output: plannerResult.metrics.tokenOutput ?? 0,
-        estimatedCost: plannerResult.metrics.estimatedCost
-      } : undefined,
+      tokenUsage:
+        plannerResult.metrics.tokenInput !== undefined
+          ? {
+              input: plannerResult.metrics.tokenInput,
+              output: plannerResult.metrics.tokenOutput ?? 0,
+              estimatedCost: plannerResult.metrics.estimatedCost
+            }
+          : undefined,
       executorUsed: plannerExecutor.name,
       personaVersionId: plannerPersonaId,
       skillVersionIds: plannerSkillIds
     });
 
-    return planSubtasks;
+    return parsed;
   }
 
-  private buildPlannerPrompt(
-    description: string,
-    tier: Tier,
-    attempt: number,
-    priorPlan: PlanSubtask[] | undefined,
-    critique: string | null
-  ): string {
-    const assessment = assessComplexity(description);
-    const base = `## Task\n${description}\n\n## Complexity signals\nTier: ${tier} | Scope: ${assessment.scope} | Risk: ${assessment.risk} | Coupling: ${assessment.coupling}`;
-    if (attempt === 0 || !priorPlan || !critique) return base;
+  private buildPlannerPrompt(params: {
+    description: string;
+    tier: Tier;
+    phase: PlannerRequestedPhase;
+    transcriptAttemptIndex: number;
+    priorPlan?: PlanSubtask[];
+    approvedSpec?: PlannerSpecArtifacts | null;
+    priorSpecArtifacts?: PlannerSpecArtifacts | null;
+    critique: string | null;
+    currentBlockingQuestion?: string | null;
+  }): string {
+    const assessment = assessComplexity(params.description);
+    const lines: string[] = [];
+    lines.push("## Phase");
+    lines.push(params.phase);
+    lines.push("");
+    lines.push(`## Task`);
+    lines.push(params.description);
+    lines.push("");
+    lines.push(`## Complexity signals`);
+    lines.push(
+      `Tier: ${params.tier} | Scope: ${assessment.scope} | Risk: ${assessment.risk} | Coupling: ${assessment.coupling}`
+    );
+    lines.push("");
+    lines.push("## Knowledgebase requirement");
+    lines.push(
+      "If QMD is configured (QMD_MCP_URL present), you MUST build context from QMD first and emit planningContext.qmdContext evidence in .autoforge-status.json."
+    );
+    lines.push(
+      "Outputs missing required QMD evidence are rejected and the task is paused for intervention."
+    );
 
-    return [
-      base,
-      `## Prior plan (attempt ${attempt - 1})`,
-      JSON.stringify(priorPlan, null, 2),
-      `## Human feedback on prior plan`,
-      critique,
-      `## Instructions`,
-      "Revise the plan to address the feedback. Prefer minimal changes — keep subtasks that were not critiqued, unless the feedback implies they should change."
-    ].join("\n\n");
+    if (params.phase === "execution_plan" && params.approvedSpec) {
+      lines.push("");
+      lines.push("## Approved Spec");
+      lines.push(JSON.stringify(params.approvedSpec, null, 2));
+    }
+
+    const attempt = params.transcriptAttemptIndex;
+    const crit = params.critique?.trim() ?? "";
+
+    if (params.phase === "execution_plan" && attempt > 0 && params.priorPlan && crit.length > 0) {
+      lines.push("");
+      lines.push(`## Prior plan (attempt ${attempt - 1})`);
+      lines.push(JSON.stringify(params.priorPlan, null, 2));
+      if (params.approvedSpec) {
+        lines.push("");
+        lines.push("## Approved Spec (reference)");
+        lines.push(JSON.stringify(params.approvedSpec, null, 2));
+      }
+      lines.push("");
+      lines.push("## Human feedback on prior plan");
+      lines.push(crit);
+      lines.push("");
+      lines.push("## Instructions");
+      lines.push(
+        "Revise the plan to address the feedback. Prefer minimal changes — keep subtasks that were not critiqued, unless the feedback implies they should change."
+      );
+      return lines.join("\n");
+    }
+
+    if (params.phase === "spec" && attempt > 0 && params.priorSpecArtifacts && crit.length > 0) {
+      lines.push("");
+      lines.push(`## Prior discovery/spec (attempt ${attempt - 1})`);
+      lines.push(JSON.stringify(params.priorSpecArtifacts, null, 2));
+      lines.push("");
+      if (params.currentBlockingQuestion && params.currentBlockingQuestion.trim()) {
+        lines.push("## Operator Answer To Question");
+        lines.push(`> Q: ${params.currentBlockingQuestion}`);
+        lines.push("");
+        lines.push("A:");
+        lines.push(crit);
+      } else {
+        lines.push("## Operator Critique");
+        lines.push(crit);
+      }
+      lines.push("");
+      lines.push("## Instructions");
+      lines.push(
+        "Revise discovery/spec to address the feedback. Prefer minimal edits — retain validated intent unless the critique explicitly challenges it."
+      );
+      return lines.join("\n");
+    }
+
+    return lines.join("\n");
+  }
+
+  async approveSpec(taskId: string): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    if (task.state !== "awaiting_spec_approval") {
+      throw new Error(`Cannot approve spec: task is in state '${task.state}'`);
+    }
+
+    const reviewedAt = new Date().toISOString();
+    const prev = task.planningContext ?? emptyPlanningContext();
+    const specAttempts = this.scopeFilteredPlannerTranscripts(taskId, "planner:spec").length;
+    const planningContext = {
+      ...prev,
+      approvalMode: "manual" as const,
+      reviewedAt,
+      specRevision: Math.max(prev.specRevision, specAttempts),
+      planRevision: prev.planRevision
+    };
+
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "spec_approved",
+      status: "done",
+      payload: { reviewedAt },
+      budgetSeconds: 60
+    });
+
+    this.transition(taskId, task.projectId, "awaiting_spec_approval", "planning", {
+      planningContext,
+      currentBlockingQuestion: null,
+      specArtifacts: task.specArtifacts
+    });
+
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (!worktreePath) throw new Error(`Worktree missing for task ${taskId}`);
+
+    let parsed: ParsedPlannerOutput;
+    try {
+      parsed = await this.runPlannerAttempt({
+        taskId,
+        projectId: task.projectId,
+        description: task.description,
+        tier: task.tier,
+        worktreePath,
+        transcriptStage: "planner:execution_plan",
+        requestedPhase: "execution_plan",
+        critique: null,
+        approvedSpec: task.specArtifacts ?? undefined
+      });
+    } catch (err) {
+      if (err instanceof StageFailedError) return this.requireTask(taskId);
+      throw err;
+    }
+
+    if (parsed.phase === "spec") {
+      this.recordPlannerPhaseMismatch(taskId, task.projectId, "execution_requested_got_spec");
+      this.pauseForIntervention({
+        taskId,
+        projectId: task.projectId,
+        fromStage: "planning",
+        failureCategory: "planner_phase_mismatch",
+        failureReason: "planner returned spec-shaped output during execution-plan phase",
+        forensics: { agent: "planner", parsed_phase: parsed.phase }
+      });
+    }
+
+    const execAttempts = this.scopeFilteredPlannerTranscripts(taskId, "planner:execution_plan").length;
+    const pcNext = {
+      ...planningContext,
+      planRevision: execAttempts,
+      qmdContext: parsed.planningContext.qmdContext ?? planningContext.qmdContext ?? null
+    };
+
+    this.transition(taskId, task.projectId, "planning", "awaiting_plan_approval", {
+      planSubtasks: parsed.planSubtasks,
+      planningContext: pcNext,
+      currentBlockingQuestion: null,
+      specArtifacts: task.specArtifacts
+    });
+    return this.requireTask(taskId);
+  }
+
+  async critiqueSpec(taskId: string, critique: string): Promise<PipelineTask> {
+    const task = this.requireTask(taskId);
+    if (task.state !== "awaiting_spec_approval") {
+      throw new Error(`Cannot critique spec: task is in state '${task.state}'`);
+    }
+
+    const scoped = this.scopeFilteredPlannerTranscripts(taskId, "planner:spec");
+    const lastAttempt = scoped.length === 0 ? -1 : Math.max(...scoped.map((t) => t.attempt));
+    if (lastAttempt >= this.deps.env.PLANNER_SPEC_MAX_ITERATIONS) {
+      throw new Error(
+        `Spec re-plan iteration limit (${this.deps.env.PLANNER_SPEC_MAX_ITERATIONS}) reached for task ${taskId}`
+      );
+    }
+
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "spec_critiqued",
+      status: "in_progress",
+      payload: {
+        critique_text: critique,
+        critiqued_attempt: lastAttempt,
+        next_attempt: lastAttempt + 1
+      },
+      budgetSeconds: 60
+    });
+
+    this.transition(taskId, task.projectId, "awaiting_spec_approval", "replanning", {});
+
+    const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
+    if (!worktreePath) {
+      this.transition(taskId, task.projectId, "replanning", "failed", { reason: "worktree missing" });
+      await this.finalizeTerminalTask(taskId);
+      throw new Error(`Worktree missing for task ${taskId}`);
+    }
+
+    let parsed: ParsedPlannerOutput;
+    try {
+      parsed = await this.runPlannerAttempt({
+        taskId,
+        projectId: task.projectId,
+        description: task.description,
+        tier: task.tier,
+        worktreePath,
+        transcriptStage: "planner:spec",
+        requestedPhase: "spec",
+        critique,
+        priorSpecArtifacts: task.specArtifacts ?? undefined,
+        currentBlockingQuestion: task.currentBlockingQuestion ?? undefined
+      });
+    } catch (err) {
+      if (err instanceof StageFailedError) return this.requireTask(taskId);
+      this.transition(taskId, task.projectId, "replanning", "failed", {
+        reason: err instanceof Error ? err.message : String(err)
+      });
+      await this.finalizeTerminalTask(taskId);
+      throw err;
+    }
+
+    if (parsed.phase !== "spec") {
+      this.pauseForIntervention({
+        taskId,
+        projectId: task.projectId,
+        fromStage: "replanning",
+        failureCategory: "planner_phase_mismatch",
+        failureReason: `spec critique produced ${parsed.phase} output`,
+        forensics: { agent: "planner", parsed_phase: parsed.phase }
+      });
+    }
+
+    const specScoped = this.scopeFilteredPlannerTranscripts(taskId, "planner:spec");
+    const planningContext = {
+      ...(task.planningContext ?? emptyPlanningContext()),
+      specRevision: specScoped.length,
+      qmdContext: parsed.planningContext.qmdContext ?? task.planningContext?.qmdContext ?? null
+    };
+
+    this.transition(taskId, task.projectId, "replanning", "awaiting_spec_approval", {
+      specArtifacts: parsed.specArtifacts,
+      planningContext,
+      currentBlockingQuestion: parsed.blockingQuestion,
+      planSubtasks: []
+    });
+    return this.requireTask(taskId);
   }
 
   async approvePlan(taskId: string): Promise<PipelineTask> {
@@ -593,13 +1139,12 @@ export class OrchestratorService {
       throw new Error(`Cannot critique plan: task is in state '${task.state}'`);
     }
 
-    const transcripts = this.deps.db.listTranscriptsByTask(taskId);
-    const lastAttempt = transcripts.length === 0 ? 0 : Math.max(...transcripts.map((t) => t.attempt));
+    const scoped = this.scopeFilteredPlannerTranscripts(taskId, "planner:execution_plan");
+    const lastAttempt = scoped.length === 0 ? -1 : Math.max(...scoped.map((t) => t.attempt));
     if (lastAttempt >= this.deps.env.PLANNER_MAX_ITERATIONS) {
       throw new Error(`Re-plan iteration limit (${this.deps.env.PLANNER_MAX_ITERATIONS}) reached for task ${taskId}`);
     }
 
-    const nextAttempt = lastAttempt + 1;
     const priorPlan = task.planSubtasks;
 
     this.recordEvent({
@@ -611,7 +1156,7 @@ export class OrchestratorService {
       payload: {
         critique_text: critique,
         critiqued_attempt: lastAttempt,
-        next_attempt: nextAttempt
+        next_attempt: lastAttempt + 1
       },
       budgetSeconds: 60
     });
@@ -625,16 +1170,22 @@ export class OrchestratorService {
       throw new Error(`Worktree missing for task ${taskId}`);
     }
 
-    let newPlan: PlanSubtask[];
+    let parsed: ParsedPlannerOutput;
     try {
-      newPlan = await this.runPlannerAttempt(
-        taskId, task.projectId, task.description, task.tier,
-        worktreePath, nextAttempt, critique, priorPlan
-      );
+      parsed = await this.runPlannerAttempt({
+        taskId,
+        projectId: task.projectId,
+        description: task.description,
+        tier: task.tier,
+        worktreePath,
+        transcriptStage: "planner:execution_plan",
+        requestedPhase: "execution_plan",
+        critique,
+        priorPlan,
+        approvedSpec: task.specArtifacts ?? undefined
+      });
     } catch (err) {
       if (err instanceof StageFailedError) {
-        // runPlannerAttempt already paused the task in awaiting_intervention
-        // with full forensics. Return the paused task so the API surfaces it.
         return this.requireTask(taskId);
       }
       this.transition(taskId, task.projectId, "replanning", "failed", {
@@ -644,7 +1195,17 @@ export class OrchestratorService {
       throw err;
     }
 
-    this.transition(taskId, task.projectId, "replanning", "awaiting_plan_approval", { planSubtasks: newPlan });
+    const newPlan = parsed.planSubtasks;
+    const execAttempts = this.scopeFilteredPlannerTranscripts(taskId, "planner:execution_plan").length;
+    const prevPc = task.planningContext ?? emptyPlanningContext();
+    this.transition(taskId, task.projectId, "replanning", "awaiting_plan_approval", {
+      planSubtasks: newPlan,
+      planningContext: {
+        ...prevPc,
+        planRevision: execAttempts,
+        qmdContext: parsed.planningContext.qmdContext ?? prevPc.qmdContext ?? null
+      }
+    });
     return this.requireTask(taskId);
   }
 
@@ -976,6 +1537,17 @@ export class OrchestratorService {
     });
   }
 
+  private inferLastPlannerTranscriptStage(taskId: string): "planner:spec" | "planner:execution_plan" | null {
+    // `listTranscriptsByTask` returns rows in (created_at, rowid) order, so the
+    // last planner row is the chronologically-most-recent attempt regardless of
+    // millisecond collisions on created_at.
+    const rows = this.deps.db
+      .listTranscriptsByTask(taskId)
+      .filter((t) => t.stage === "planner:spec" || t.stage === "planner:execution_plan");
+    if (rows.length === 0) return null;
+    return rows[rows.length - 1].stage as "planner:spec" | "planner:execution_plan";
+  }
+
   /**
    * Retry a paused task from a prior stage. Only valid when the task is
    * currently in `awaiting_intervention`. Without `fromStage`, retries the
@@ -988,7 +1560,21 @@ export class OrchestratorService {
    */
   async retryFromIntervention(
     taskId: string,
-    opts: { fromStage?: "planning" | "executing"; checkpointId?: string; operatorNote?: string } = {}
+    opts: {
+      fromStage?: "planning" | "executing";
+      checkpointId?: string;
+      operatorNote?: string;
+      planningPhase?: "spec" | "execution_plan";
+      /**
+       * Bypass the `cannot_rollback_to_approved_spec` guard.
+       *
+       * The guard exists so an operator cannot silently overwrite an already-approved
+       * spec by requesting `planningPhase: "spec"` without explicitly rolling back to
+       * a spec-phase checkpoint (which inherently invalidates the prior approval).
+       * `force: true` says "yes, throw away my approved spec without a rollback".
+       */
+      force?: boolean;
+    } = {}
   ): Promise<PipelineTask> {
     const task = this.requireTask(taskId);
     if (task.state !== "awaiting_intervention") {
@@ -1015,19 +1601,62 @@ export class OrchestratorService {
       .map((event) => ({ eventId: event.id, payload: parseCheckpointPayload(event.payload) }))
       .filter((event): event is { eventId: string; payload: TaskCheckpointPayload } => event.payload !== null);
 
-    let retryIteration = task.iteration;
+    const inferredPhase: "spec" | "execution_plan" = (() => {
+      if (opts.planningPhase) return opts.planningPhase;
+      const last = this.inferLastPlannerTranscriptStage(taskId);
+      return last === "planner:execution_plan" ? "execution_plan" : "spec";
+    })();
+
+    // Resolve the requested checkpoint up front so we can apply the
+    // rollback-to-spec policy before any side effects (worktree reset / events).
+    let checkpoint: TaskCheckpointPayload | null = null;
     if (opts.checkpointId) {
-      const checkpoint = checkpoints.find((candidate) => candidate.payload.checkpoint_id === opts.checkpointId)?.payload;
+      checkpoint = checkpoints.find((c) => c.payload.checkpoint_id === opts.checkpointId)?.payload ?? null;
       if (!checkpoint || checkpoint.task_id !== taskId) {
         throw new Error("checkpoint_not_found");
       }
       if (checkpointStageOrder(checkpoint.stage) > checkpointStageOrder(targetStage)) {
         throw new Error("checkpoint_stage_after_retry_stage");
       }
+    }
 
+    // Rollback-to-approved-spec guard (plan §Task 7).
+    //
+    // When the task has an already-approved spec (planningContext.reviewedAt set),
+    // requesting `planningPhase: "spec"` without a corresponding spec-checkpoint
+    // rollback would silently throw away validated intent with no audit trail.
+    // Reject with 409 unless `force: true` is supplied. Rolling back to a
+    // spec-phase checkpoint is the audit-trailed path: the rollback_applied
+    // event names the checkpoint and invalidates planningContext below.
+    const hasApprovedSpec =
+      targetStage === "planning" &&
+      task.planningContext?.reviewedAt !== null &&
+      task.planningContext?.reviewedAt !== undefined;
+    const rollingBackToSpecCheckpoint =
+      checkpoint?.planning_phase === "spec";
+    if (
+      targetStage === "planning" &&
+      inferredPhase === "spec" &&
+      hasApprovedSpec &&
+      !rollingBackToSpecCheckpoint &&
+      !opts.force
+    ) {
+      throw new Error("cannot_rollback_to_approved_spec");
+    }
+
+    let retryIteration = task.iteration;
+    let invalidateApprovedSpec = false;
+    if (checkpoint) {
       const priorHeadSha = this.deps.worktrees.currentHead(worktreePath);
       this.deps.worktrees.resetToCommit(worktreePath, checkpoint.git_sha);
       retryIteration = checkpoint.iteration;
+      // If the rollback target is a spec-phase checkpoint and the task had an
+      // approved spec, invalidate the approval. The transcript rows are
+      // preserved for forensics; subsequent planner attempts are scoped by
+      // `rollback_event_id` (see `scopeFilteredPlannerTranscripts`) so the
+      // critique budget effectively resets while the monotonic attempt counter
+      // does not.
+      invalidateApprovedSpec = rollingBackToSpecCheckpoint && hasApprovedSpec;
       this.recordEvent({
         taskId,
         projectId: task.projectId,
@@ -1040,7 +1669,9 @@ export class OrchestratorService {
           target_iteration: checkpoint.iteration,
           operator_note: opts.operatorNote ?? null,
           prior_head_sha: priorHeadSha,
-          checkpoint_git_sha: checkpoint.git_sha
+          checkpoint_git_sha: checkpoint.git_sha,
+          checkpoint_planning_phase: checkpoint.planning_phase ?? null,
+          invalidated_planning_context: invalidateApprovedSpec
         },
         budgetSeconds: 60
       });
@@ -1065,33 +1696,218 @@ export class OrchestratorService {
         from_stage: targetStage,
         previously_failed_stage: failedStage,
         checkpoint_id: opts.checkpointId ?? null,
+        planning_phase: opts.planningPhase ?? null,
         operator_note: opts.operatorNote ?? null,
-        iteration: retryIteration
+        iteration: retryIteration,
+        force: opts.force === true
       },
       budgetSeconds: 60
     });
 
     if (targetStage === "planning") {
-      this.transition(taskId, task.projectId, "awaiting_intervention", "planning", { retry: true, iteration: retryIteration });
-      // Use the next attempt number so the failed transcript is preserved
-      // for forensics and we don't collide with the UNIQUE(task_id, stage,
-      // attempt) constraint.
-      const existingTranscripts = this.deps.db.listTranscriptsByTask(taskId);
-      const nextAttempt = existingTranscripts.filter((t) => t.stage === "planner").length;
+      const transitionPayload: Record<string, unknown> = {
+        retry: true,
+        iteration: retryIteration
+      };
+      if (invalidateApprovedSpec) {
+        // Reset the approval-mode metadata; preserve specRevision/planRevision
+        // counters so downstream analytics keep historical context.
+        const prev = task.planningContext ?? emptyPlanningContext();
+        transitionPayload.planningContext = {
+          ...prev,
+          approvalMode: null,
+          reviewedAt: null
+        };
+      }
+      this.transition(taskId, task.projectId, "awaiting_intervention", "planning", transitionPayload);
+
+      // Phase selection precedence:
+      //   1. Explicit `opts.planningPhase` wins.
+      //   2. A spec-checkpoint rollback that invalidated the approved spec
+      //      always retries as `spec` (plan §Task 7 step 4) — the operator
+      //      asked for a fresh spec gate.
+      //   3. Otherwise infer from the most recent planner transcript stage.
+      const lastPlannerStage = this.inferLastPlannerTranscriptStage(taskId);
+      const phase: "spec" | "execution_plan" =
+        opts.planningPhase
+          ?? (invalidateApprovedSpec ? "spec" : null)
+          ?? (lastPlannerStage === "planner:execution_plan" ? "execution_plan" : "spec");
+
       try {
-        const planSubtasks = await this.runPlannerAttempt(
-          taskId, task.projectId, task.description, task.tier,
-          worktreePath, nextAttempt, null
-        );
-        // Same pause policy as submitTask so the operator reviews the new plan.
-        if (this.pausePolicy(task.tier, undefined)) {
-          this.transition(taskId, task.projectId, "planning", "awaiting_plan_approval", { planSubtasks });
+        if (!this.effectivePauseReview(task)) {
+          let preservedSpec: PlannerSpecArtifacts | null = task.specArtifacts ?? null;
+          let parsed = await this.runPlannerAttempt({
+            taskId,
+            projectId: task.projectId,
+            description: task.description,
+            tier: task.tier,
+            worktreePath,
+            transcriptStage: "planner:execution_plan",
+            requestedPhase: "combined",
+            critique: null
+          });
+          if (parsed.phase === "spec") {
+            preservedSpec = parsed.specArtifacts;
+            this.recordEvent({
+              taskId,
+              projectId: task.projectId,
+              agent: "orchestrator",
+              type: "planner_phase_fallback_to_two_call",
+              status: "done",
+              payload: { reason: "retry_combined_spec_only" },
+              budgetSeconds: 60
+            });
+            parsed = await this.runPlannerAttempt({
+              taskId,
+              projectId: task.projectId,
+              description: task.description,
+              tier: task.tier,
+              worktreePath,
+              transcriptStage: "planner:execution_plan",
+              requestedPhase: "execution_plan",
+              critique: null,
+              approvedSpec: preservedSpec
+            });
+            if (parsed.planSubtasks.length === 0) {
+              this.pauseForIntervention({
+                taskId,
+                projectId: task.projectId,
+                fromStage: "planning",
+                failureCategory: "planner_failed",
+                failureReason: "execution plan missing after retry combined-phase fallback",
+                forensics: { agent: "planner", transcript_stage: "planner:execution_plan" }
+              });
+            }
+          } else if (parsed.phase === "combined") {
+            preservedSpec = parsed.specArtifacts;
+          }
+
+          const reviewedAt = new Date().toISOString();
+          const planningContext = {
+            ...emptyPlanningContext(),
+            approvalMode: "auto" as const,
+            reviewedAt,
+            specRevision: preservedSpec ? 1 : 0,
+            planRevision: parsed.planSubtasks.length > 0 ? 1 : 0
+          };
+          this.transition(taskId, task.projectId, "planning", "executing", {
+            planSubtasks: parsed.planSubtasks,
+            specArtifacts: preservedSpec,
+            planningContext,
+            currentBlockingQuestion: null
+          });
+          await this.executeAndReview(
+            taskId,
+            task.projectId,
+            task.description,
+            task.tier,
+            parsed.planSubtasks,
+            0,
+            worktreePath,
+            branch
+          );
           return this.requireTask(taskId);
         }
-        this.transition(taskId, task.projectId, "planning", "executing", { planSubtasks });
+
+        if (phase === "spec") {
+          let parsed = await this.runPlannerAttempt({
+            taskId,
+            projectId: task.projectId,
+            description: task.description,
+            tier: task.tier,
+            worktreePath,
+            transcriptStage: "planner:spec",
+            requestedPhase: "spec",
+            critique: null
+          });
+
+          if (parsed.phase === "execution_plan" || parsed.phase === "legacy_subtasks") {
+            if (parsed.planSubtasks.length > 0 && !isPlannerFallbackOutput(parsed.planSubtasks)) {
+              this.recordPlannerPhaseMismatch(taskId, task.projectId, "retry_spec_requested_got_execution_plan");
+              this.transition(taskId, task.projectId, "planning", "awaiting_spec_approval", {
+                specArtifacts: null,
+                planningContext: emptyPlanningContext(),
+                currentBlockingQuestion:
+                  "planner returned execution plan when spec was requested — please clarify",
+                planSubtasks: []
+              });
+              return this.requireTask(taskId);
+            }
+          }
+
+          if (parsed.phase === "combined") {
+            this.recordPlannerPhaseMismatch(taskId, task.projectId, "retry_spec_phase_received_combined");
+            parsed = {
+              phase: "spec",
+              specArtifacts: parsed.specArtifacts,
+              planningContext: parsed.planningContext,
+              blockingQuestion: null,
+              planSubtasks: []
+            };
+          }
+
+          if (parsed.phase !== "spec") {
+            this.pauseForIntervention({
+              taskId,
+              projectId: task.projectId,
+              fromStage: "planning",
+              failureCategory: "planner_failed",
+              failureReason: `retry spec planner produced ${parsed.phase}`,
+              forensics: { agent: "planner", parsed_phase: parsed.phase }
+            });
+          }
+
+          const specScoped = this.scopeFilteredPlannerTranscripts(taskId, "planner:spec");
+          this.transition(taskId, task.projectId, "planning", "awaiting_spec_approval", {
+            specArtifacts: parsed.specArtifacts,
+            planningContext: {
+              ...(parsed.planningContext ?? emptyPlanningContext()),
+              specRevision: specScoped.length,
+              planRevision: 0
+            },
+            currentBlockingQuestion: parsed.blockingQuestion,
+            planSubtasks: []
+          });
+          return this.requireTask(taskId);
+        }
+
+        const parsedExec = await this.runPlannerAttempt({
+          taskId,
+          projectId: task.projectId,
+          description: task.description,
+          tier: task.tier,
+          worktreePath,
+          transcriptStage: "planner:execution_plan",
+          requestedPhase: "execution_plan",
+          critique: null,
+          approvedSpec: task.specArtifacts ?? undefined
+        });
+
+        if (this.effectivePauseReview(task)) {
+          const execAttempts = this.scopeFilteredPlannerTranscripts(taskId, "planner:execution_plan").length;
+          const prevPc = task.planningContext ?? emptyPlanningContext();
+          this.transition(taskId, task.projectId, "planning", "awaiting_plan_approval", {
+            planSubtasks: parsedExec.planSubtasks,
+            planningContext: { ...prevPc, planRevision: execAttempts },
+            specArtifacts: task.specArtifacts
+          });
+          return this.requireTask(taskId);
+        }
+
+        this.transition(taskId, task.projectId, "planning", "executing", {
+          planSubtasks: parsedExec.planSubtasks,
+          specArtifacts: task.specArtifacts ?? undefined,
+          planningContext: task.planningContext ?? undefined
+        });
         await this.executeAndReview(
-          taskId, task.projectId, task.description, task.tier,
-          planSubtasks, 0, worktreePath, branch
+          taskId,
+          task.projectId,
+          task.description,
+          task.tier,
+          parsedExec.planSubtasks,
+          0,
+          worktreePath,
+          branch
         );
       } catch (err) {
         if (err instanceof StageFailedError) {
@@ -1129,7 +1945,7 @@ export class OrchestratorService {
     const nonTerminalStates = [
       "received", "assessing", "planning", "replanning",
       "executing", "reviewing", "reworking", "pr_created", "documenting"
-      // 'awaiting_plan_approval', 'awaiting_approval', and 'awaiting_intervention'
+      // 'awaiting_spec_approval', 'awaiting_plan_approval', 'awaiting_approval', and 'awaiting_intervention'
       // are intentionally excluded — all three are human gates with no in-flight
       // work and no staleness deadline.
     ];
@@ -2279,23 +3095,28 @@ export class OrchestratorService {
     stage: TaskCheckpointStage;
     worktreePath: string;
     label: string;
+    planningPhase?: "spec" | "execution_plan" | "combined" | null;
   }): void {
     const gitSha = this.deps.worktrees.currentHead(input.worktreePath);
     if (!gitSha) return;
+    const payload: Record<string, unknown> = {
+      checkpoint_id: randomUUID(),
+      task_id: input.taskId,
+      iteration: input.iteration,
+      stage: input.stage,
+      git_sha: gitSha,
+      label: input.label
+    };
+    if (input.planningPhase !== undefined) {
+      payload.planning_phase = input.planningPhase;
+    }
     this.recordEvent({
       taskId: input.taskId,
       projectId: input.projectId,
       agent: "orchestrator",
       type: "checkpoint_created",
       status: "done",
-      payload: {
-        checkpoint_id: randomUUID(),
-        task_id: input.taskId,
-        iteration: input.iteration,
-        stage: input.stage,
-        git_sha: gitSha,
-        label: input.label
-      },
+      payload,
       budgetSeconds: 60
     });
   }
@@ -2590,64 +3411,6 @@ function buildReviewerPrompt(description: string, subtasks: PlanSubtask[]): stri
     `## Test criteria to verify\n${criteria}`,
     "## Instructions\nReview the code in this working directory. Conduct spec compliance review first, then code quality review. Output findings to .autoforge-status.json."
   ].join("\n\n");
-}
-
-function parsePlanSubtasks(taskId: string, output: unknown, worktreePath?: string): PlanSubtask[] {
-  // Primary: planner writes subtasks directly into the status file output.
-  if (
-    output &&
-    typeof output === "object" &&
-    "subtasks" in output &&
-    Array.isArray((output as { subtasks: unknown[] }).subtasks) &&
-    (output as { subtasks: unknown[] }).subtasks.length > 0
-  ) {
-    const subtasks = (output as { subtasks: Array<Partial<PlanSubtask>> }).subtasks;
-    return subtasks.map((subtask, index) => ({
-      id: subtask.id ?? `${taskId}-subtask-${index + 1}`,
-      sequence: subtask.sequence ?? index + 1,
-      description: subtask.description ?? `Subtask ${index + 1}`,
-      filesInScope: subtask.filesInScope ?? ["src/"],
-      dependencies: subtask.dependencies ?? [],
-      testCriteria: subtask.testCriteria ?? ["Tests pass."],
-      agentType: subtask.agentType
-    }));
-  }
-
-  // Fallback: look for a subtasks.json file the planner may have written separately.
-  if (worktreePath) {
-    try {
-      const subtasksPath = pathJoin(worktreePath, "subtasks.json");
-      if (existsSync(subtasksPath)) {
-        const parsed = JSON.parse(readFileSync(subtasksPath, "utf8"));
-        const list = Array.isArray(parsed) ? parsed : parsed?.subtasks;
-        if (Array.isArray(list) && list.length > 0) {
-          return (list as Array<Partial<PlanSubtask>>).map((subtask, index) => ({
-            id: subtask.id ?? `${taskId}-subtask-${index + 1}`,
-            sequence: subtask.sequence ?? index + 1,
-            description: subtask.description ?? `Subtask ${index + 1}`,
-            filesInScope: subtask.filesInScope ?? ["src/"],
-            dependencies: subtask.dependencies ?? [],
-            testCriteria: subtask.testCriteria ?? ["Tests pass."],
-            agentType: subtask.agentType
-          }));
-        }
-      }
-    } catch {
-      // subtasks.json unreadable or malformed — fall through to default
-    }
-  }
-
-  // Last resort: generic single subtask. Signals planner output was unparseable.
-  return [
-    {
-      id: `${taskId}-subtask-1`,
-      sequence: 1,
-      description: "Implement requested behavior with tests-first workflow.",
-      filesInScope: ["src/"],
-      dependencies: [],
-      testCriteria: ["All tests pass."]
-    }
-  ];
 }
 
 function parseFindings(taskId: string, output: unknown): ReviewFinding[] {

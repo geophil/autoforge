@@ -27,7 +27,14 @@ const CritiqueSchema = z.object({
 const RetrySchema = z.object({
   fromStage: z.enum(["planning", "executing"]).optional(),
   checkpointId: z.string().min(1).optional(),
-  operatorNote: z.string().min(1).max(4000).optional()
+  operatorNote: z.string().min(1).max(4000).optional(),
+  planningPhase: z.enum(["spec", "execution_plan"]).optional(),
+  /**
+   * Acknowledged-override for the `cannot_rollback_to_approved_spec` guard.
+   * Required when the operator wants to redo a spec phase that was already
+   * approved, but is NOT rolling back to a spec-phase checkpoint.
+   */
+  force: z.boolean().optional()
 });
 
 const SteerSchema = z.object({
@@ -84,17 +91,27 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
   app.post("/:id/retry", async (ctx) => {
     let fromStage: "planning" | "executing" | undefined;
     let checkpointId: string | undefined;
+    let planningPhase: "spec" | "execution_plan" | undefined;
     let operatorNote: string | undefined;
+    let force: boolean | undefined;
     try {
       const body = RetrySchema.parse(await ctx.req.json().catch(() => ({})));
       fromStage = body.fromStage;
       checkpointId = body.checkpointId;
       operatorNote = body.operatorNote;
+      planningPhase = body.planningPhase;
+      force = body.force;
     } catch (err) {
       return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
     }
     try {
-      const task = await service.retryFromIntervention(ctx.req.param("id"), { fromStage, checkpointId, operatorNote });
+      const task = await service.retryFromIntervention(ctx.req.param("id"), {
+        fromStage,
+        checkpointId,
+        operatorNote,
+        planningPhase,
+        force
+      });
       events.publish({ type: "task.updated", data: task });
       return ctx.json(task);
     } catch (err) {
@@ -109,7 +126,8 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
       const rollbackConflictErrors = new Set([
         "checkpoint_unreachable",
         "checkpoint_not_found",
-        "invalid_worktree_path"
+        "invalid_worktree_path",
+        "cannot_rollback_to_approved_spec"
       ]);
       if (rollbackConflictErrors.has(msg)) {
         return ctx.json({ error: msg, message: msg }, 409);
@@ -144,6 +162,43 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
         return ctx.json({ error: "unsupported_scope", message: msg }, 400);
       }
       return ctx.json({ error: "steer_failed", message: msg }, 400);
+    }
+  });
+
+  app.post("/:id/approve-spec", async (ctx) => {
+    try {
+      const task = await service.approveSpec(ctx.req.param("id"));
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot approve spec:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      throw err;
+    }
+  });
+
+  app.post("/:id/critique-spec", async (ctx) => {
+    let body: { critique: string };
+    try {
+      body = CritiqueSchema.parse(await ctx.req.json());
+    } catch (err) {
+      return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
+    }
+    try {
+      const task = await service.critiqueSpec(ctx.req.param("id"), body.critique);
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("iteration limit")) {
+        return ctx.json({ error: "iteration_limit_reached", message: msg }, 409);
+      }
+      if (msg.startsWith("Cannot critique spec:")) {
+        return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      return ctx.json({ error: "critique_failed", message: msg }, 400);
     }
   });
 

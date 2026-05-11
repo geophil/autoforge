@@ -1,5 +1,11 @@
 import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
-import type { PlanSubtask, ReviewFinding } from "../types/core";
+import type { PlanSubtask, PlannerRequestedPhase, ReviewFinding } from "../types/core";
+
+function plannerPhaseFromPrompt(prompt: string): PlannerRequestedPhase | null {
+  const m = /\n## Phase\n(spec|execution_plan|combined)\n/.exec(`\n${prompt}`);
+  if (!m) return null;
+  return m[1] as PlannerRequestedPhase;
+}
 
 type Handler = (task: AgentTask) => Promise<AgentResult> | AgentResult;
 
@@ -54,6 +60,29 @@ export class MockExecutor implements AgentExecutor {
     }
 
     if (task.type === "planner") {
+      const phase = plannerPhaseFromPrompt(task.prompt);
+      const desc =
+        typeof task.metadata?.description === "string" ? task.metadata.description : "Implement change.";
+      const discovery = {
+        intent: desc,
+        constraints: [] as string[],
+        assumptions: [] as string[],
+        decisions: [] as {
+          decision: string;
+          reason: string;
+          alternativesRejected: string[];
+          consequence: string;
+        }[],
+        nonGoals: [] as string[],
+        openQuestions: [] as string[]
+      };
+      const spec = {
+        problem: `Address: ${desc}`,
+        desiredBehavior: ["Meet acceptance criteria", "Keep tests passing"],
+        acceptanceCriteria: ["Behavior matches the task description", "Automated tests pass"],
+        verification: ["Run project test suite"],
+        risks: [] as string[]
+      };
       const subtasks: PlanSubtask[] = [
         {
           id: `${task.id}-sub-1`,
@@ -64,6 +93,21 @@ export class MockExecutor implements AgentExecutor {
           testCriteria: ["All related tests pass."]
         }
       ];
+
+      if (phase === "spec") {
+        return this.result("DONE", {
+          discovery,
+          spec,
+          blockingQuestion: null
+        });
+      }
+      if (phase === "combined") {
+        return this.result("DONE", {
+          discovery,
+          spec,
+          subtasks
+        });
+      }
 
       return this.result("DONE", { subtasks });
     }

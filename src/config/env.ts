@@ -27,6 +27,7 @@ const EnvSchema = z.object({
   PLANNER_MODEL_COMPLEX: z.string().default("claude-opus-4-7"),
   PLANNER_MODEL_EXPRESS: z.string().default("claude-sonnet-4-6"),
   PLANNER_MAX_ITERATIONS: z.coerce.number().int().min(0).max(10).default(3),
+  PLANNER_SPEC_MAX_ITERATIONS: z.coerce.number().int().min(0).max(10).default(3),
   AUTOFORGE_HOOK_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
   AUTOFORGE_ENABLE_TEST_HOOKS: z.enum(["0", "1"]).default("0")
 });

@@ -3,9 +3,54 @@ import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import type { AutoforgeMessage } from "../nats/messages";
-import type { AgentType, PipelineTask, PlanSubtask, ReviewFinding, TaskStage, Tier } from "../types/core";
+import type { AgentType, PipelineTask, PlanSubtask, PlannerSpecArtifacts, PlanningContext, ReviewFinding, TaskStage, Tier } from "../types/core";
+import { emptyPlanningContext } from "../types/core";
 import type { AgentTranscriptInput, AgentTranscriptMeta, AgentTranscriptRow } from "../types/transcripts";
 import { applyEventProjection } from "./projections";
+
+function parseTaskJsonColumn<T>(row: Record<string, unknown>, column: string): T | null {
+  const raw = row[column];
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== "string") return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function rowToPipelineTask(row: Record<string, unknown>): PipelineTask {
+  const specArtifacts = parseTaskJsonColumn<PlannerSpecArtifacts>(row, "spec_artifacts");
+  const planningContextRaw = parseTaskJsonColumn<PlanningContext>(row, "planning_context");
+  const reviewRaw = row.review_plan;
+  let reviewPlan: boolean | null | undefined;
+  if (reviewRaw === null || reviewRaw === undefined) {
+    reviewPlan = undefined;
+  } else {
+    reviewPlan = Number(reviewRaw) === 1;
+  }
+  return {
+    id: String(row.id),
+    projectId: String(row.project_id),
+    description: String(row.description),
+    state: row.state as TaskStage,
+    tier: row.tier as Tier,
+    assessment: JSON.parse(String(row.assessment)),
+    planSubtasks: JSON.parse(String(row.plan)) as PlanSubtask[],
+    iteration: Number(row.iteration),
+    prUrl: row.pr_url ? String(row.pr_url) : undefined,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    archivedAt: row.archived_at ? String(row.archived_at) : undefined,
+    reviewPlan,
+    specArtifacts: specArtifacts ?? null,
+    planningContext: planningContextRaw ?? emptyPlanningContext(),
+    currentBlockingQuestion:
+      row.current_blocking_question === null || row.current_blocking_question === undefined
+        ? null
+        : String(row.current_blocking_question)
+  };
+}
 
 export interface LessonInsert {
   agentType: string;
@@ -884,11 +929,11 @@ export class DbClient {
       INSERT INTO agent_transcripts (
         id, task_id, stage, attempt, persona_version_id, created_at, executor_used, model,
         system_prompt, user_prompt, transcript, output, critique,
-        token_input, token_output, elapsed_seconds
+        token_input, token_output, elapsed_seconds, rollback_event_id
       ) VALUES (
         $id, $task_id, $stage, $attempt, $persona_version_id, $created_at, $executor_used, $model,
         $system_prompt, $user_prompt, $transcript, $output, $critique,
-        $token_input, $token_output, $elapsed_seconds
+        $token_input, $token_output, $elapsed_seconds, $rollback_event_id
       )
     `).run({
       $id: id,
@@ -906,18 +951,23 @@ export class DbClient {
       $critique: input.critique,
       $token_input: input.tokenInput,
       $token_output: input.tokenOutput,
-      $elapsed_seconds: input.elapsedSeconds
+      $elapsed_seconds: input.elapsedSeconds,
+      $rollback_event_id: input.rollbackEventId ?? null
     });
     return id;
   }
 
   listTranscriptsByTask(taskId: string): AgentTranscriptMeta[] {
+    // ORDER BY created_at, rowid — created_at has only millisecond resolution
+    // so two transcripts inserted in the same millisecond can compare equal;
+    // rowid is SQLite's monotonic insertion order and provides a deterministic
+    // tie-break that matches the order the orchestrator actually persisted them.
     const rows = this.sqlite.query(`
       SELECT id, task_id, stage, attempt, persona_version_id, created_at, executor_used, model,
-             token_input, token_output, elapsed_seconds
+             token_input, token_output, elapsed_seconds, rollback_event_id
       FROM agent_transcripts
       WHERE task_id = ?
-      ORDER BY attempt ASC
+      ORDER BY created_at ASC, rowid ASC
     `).all(taskId) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       id: String(r.id),
@@ -930,7 +980,8 @@ export class DbClient {
       model: r.model === null ? null : String(r.model),
       tokenInput: r.token_input === null ? null : Number(r.token_input),
       tokenOutput: r.token_output === null ? null : Number(r.token_output),
-      elapsedSeconds: r.elapsed_seconds === null ? null : Number(r.elapsed_seconds)
+      elapsedSeconds: r.elapsed_seconds === null ? null : Number(r.elapsed_seconds),
+      rollbackEventId: r.rollback_event_id === null || r.rollback_event_id === undefined ? null : String(r.rollback_event_id)
     }));
   }
 
@@ -955,7 +1006,11 @@ export class DbClient {
       critique: row.critique === null ? null : String(row.critique),
       tokenInput: row.token_input === null ? null : Number(row.token_input),
       tokenOutput: row.token_output === null ? null : Number(row.token_output),
-      elapsedSeconds: row.elapsed_seconds === null ? null : Number(row.elapsed_seconds)
+      elapsedSeconds: row.elapsed_seconds === null ? null : Number(row.elapsed_seconds),
+      rollbackEventId:
+        row.rollback_event_id === null || row.rollback_event_id === undefined
+          ? null
+          : String(row.rollback_event_id)
     };
   }
 
@@ -967,20 +1022,7 @@ export class DbClient {
       whereClause = "";
     }
     const rows = this.sqlite.query(`SELECT * FROM tasks${whereClause} ORDER BY created_at DESC`).all() as Array<Record<string, unknown>>;
-    return rows.map((row) => ({
-      id: String(row.id),
-      projectId: String(row.project_id),
-      description: String(row.description),
-      state: row.state as TaskStage,
-      tier: row.tier as Tier,
-      assessment: JSON.parse(String(row.assessment)),
-      planSubtasks: JSON.parse(String(row.plan)),
-      iteration: Number(row.iteration),
-      prUrl: row.pr_url ? String(row.pr_url) : undefined,
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at),
-      archivedAt: row.archived_at ? String(row.archived_at) : undefined
-    }));
+    return rows.map((row) => rowToPipelineTask(row as Record<string, unknown>));
   }
 
   getTask(taskId: string): PipelineTask | null {
@@ -988,20 +1030,7 @@ export class DbClient {
     if (row === null) {
       return null;
     }
-    return {
-      id: String(row.id),
-      projectId: String(row.project_id),
-      description: String(row.description),
-      state: row.state as TaskStage,
-      tier: row.tier as Tier,
-      assessment: JSON.parse(String(row.assessment)),
-      planSubtasks: JSON.parse(String(row.plan)) as PlanSubtask[],
-      iteration: Number(row.iteration),
-      prUrl: row.pr_url ? String(row.pr_url) : undefined,
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at),
-      archivedAt: row.archived_at ? String(row.archived_at) : undefined
-    };
+    return rowToPipelineTask(row as Record<string, unknown>);
   }
 
   listEvents(taskId: string): Array<{

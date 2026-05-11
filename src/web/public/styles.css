@@ -903,6 +903,7 @@ dialog select:focus {
   font-weight: 500;
 }
 .card-pill-plan { background: var(--yellow); color: var(--bg); }
+.card-pill-spec { background: var(--accent-dim); color: var(--accent); }
 .card-pill-pr { background: var(--cyan); color: var(--bg); }
 /* Legacy alias — older commits referenced this class name */
 .card-plan-badge { background: var(--yellow); color: var(--bg); font-size: 0.7rem; padding: 0.05rem 0.4rem; border-radius: 3px; font-weight: 500; }

@@ -37,7 +37,8 @@ export function createWebServer(
 
   app.get("/api/config", (ctx) => {
     return ctx.json({
-      plannerMaxIterations: env.PLANNER_MAX_ITERATIONS
+      plannerMaxIterations: env.PLANNER_MAX_ITERATIONS,
+      plannerSpecMaxIterations: env.PLANNER_SPEC_MAX_ITERATIONS
     });
   });
 

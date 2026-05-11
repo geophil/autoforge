@@ -4,6 +4,7 @@ const API = "";
 let tasks = [];
 let currentTaskId = null;
 let plannerMaxIterations = 3;
+let plannerSpecMaxIterations = 3;
 let taskListTab = 'active'; // 'active' | 'archived'
 
 // --- DOM refs ---
@@ -131,6 +132,7 @@ function renderTaskList() {
           <code>${t.id.slice(0, 8)}</code>
           <span>${timeAgo(t.createdAt)}</span>
           ${t.iteration > 0 ? `<span>iteration ${t.iteration}</span>` : ""}
+          ${t.state === "awaiting_spec_approval" ? `<span class="card-pill card-pill-spec">spec review</span>` : ""}
           ${t.state === "awaiting_plan_approval" || t.state === "replanning" ? `<span class="card-pill card-pill-plan">plan review</span>` : ""}
           ${t.state === "awaiting_approval" ? `<span class="card-pill card-pill-pr">awaiting merge</span>` : ""}
         </div>
@@ -168,8 +170,15 @@ async function refreshTaskDetail(taskId) {
     }
     const task = await taskRes.json();
     const transcripts = transcriptsRes.ok ? await transcriptsRes.json() : [];
-    task.planAttempt = transcripts.length === 0 ? 0 : Math.max(...transcripts.map((t) => t.attempt));
+    const specTranscripts = transcripts.filter((row) => row.stage === "planner:spec");
+    const planTranscripts = transcripts.filter((row) => row.stage === "planner:execution_plan");
+    task.specTranscripts = specTranscripts;
+    task.planTranscripts = planTranscripts;
     task.transcripts = transcripts;
+    task.specAttempt =
+      specTranscripts.length === 0 ? 0 : Math.max(...specTranscripts.map((row) => row.attempt));
+    task.planAttempt =
+      planTranscripts.length === 0 ? 0 : Math.max(...planTranscripts.map((row) => row.attempt));
     // Surface the most recent failure_analysis so the intervention card can
     // render forensics without a second round trip.
     if (eventsRes.ok) {
@@ -225,7 +234,21 @@ function renderTaskDetail(task) {
   const subtasks = task.planSubtasks || [];
 
   const terminalStates = ["completed", "failed"];
-  const nonTerminalStates = ["received", "assessing", "planning", "awaiting_plan_approval", "replanning", "executing", "reviewing", "reworking", "pr_created", "awaiting_approval", "documenting", "awaiting_intervention"];
+  const nonTerminalStates = [
+    "received",
+    "assessing",
+    "planning",
+    "awaiting_spec_approval",
+    "awaiting_plan_approval",
+    "replanning",
+    "executing",
+    "reviewing",
+    "reworking",
+    "pr_created",
+    "awaiting_approval",
+    "documenting",
+    "awaiting_intervention"
+  ];
   let actionsHtml = "";
   const pendingSteering = Array.isArray(task.pendingSteering) ? task.pendingSteering : [];
   const pendingSteeringHtml = pendingSteering.length > 0
@@ -320,12 +343,77 @@ function renderTaskDetail(task) {
           <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel task</button>
         </div>
       </div>`;
+  } else if (task.state === "awaiting_spec_approval") {
+    const attemptCount = task.specAttempt ?? 0;
+    const maxAttempts = plannerSpecMaxIterations + 1;
+    const specNum = attemptCount + 1;
+    const reviseDisabled = attemptCount >= maxAttempts - 1;
+    const transcripts = task.specTranscripts ?? [];
+    const latestTranscript = transcripts.slice(-1)[0];
+    const viewLink = latestTranscript
+      ? `<a href="#" onclick="openTranscript('${latestTranscript.id}'); return false;" class="view-transcript-link">View transcript →</a>`
+      : "";
+
+    const stepper = transcripts.map((t, idx) => `
+      <button class="step-dot ${idx === transcripts.length - 1 ? "current" : ""}"
+        onclick="openTranscript('${t.id}')"
+        title="View transcript for spec #${idx + 1}">
+        ${idx + 1}
+      </button>
+    `).join("");
+    const futureDots = Array.from({ length: maxAttempts - transcripts.length }, (_, i) => `
+      <span class="step-dot future" title="Spec #${transcripts.length + i + 1} (not attempted)">${transcripts.length + i + 1}</span>
+    `).join("");
+
+    const priorCritique = latestTranscript?.critique;
+    const critiqueCallout = priorCritique
+      ? `<div class="prior-critique">
+          <div class="prior-critique-label">Your critique from spec #${specNum - 1}:</div>
+          <div class="prior-critique-body">${esc(priorCritique)}</div>
+        </div>`
+      : "";
+
+    const specMarkdown =
+      typeof window.renderSpecMarkdown === "function" ? window.renderSpecMarkdown(task) : "";
+    const specHtml =
+      typeof window.markdownToHtml === "function" && specMarkdown
+        ? window.markdownToHtml(specMarkdown)
+        : "";
+    const specDocBlock = specHtml
+      ? `<section class="plan-review-markdown" aria-label="Proposed spec">${specHtml}</section>`
+      : "";
+
+    actionsHtml = `
+      <div class="task-detail-actions plan-review">
+        <div class="plan-review-header">
+          <h3 class="plan-review-title">Spec Review — spec #${specNum} of ${maxAttempts}</h3>
+          ${viewLink}
+        </div>
+        <div class="plan-review-stepper">${stepper}${futureDots}</div>
+        ${specDocBlock}
+        ${critiqueCallout}
+        <div class="critique-wrapper">
+          <textarea id="critique-spec-input" class="critique-input" rows="4"
+            placeholder="Optional: critique the discovery/spec before approving. Cmd/Ctrl+Enter to submit."
+            maxlength="4000"></textarea>
+          <div class="critique-counter" id="critique-spec-counter">0 / 4000</div>
+        </div>
+        ${steeringComposer}
+        <div class="plan-review-buttons">
+          <button class="btn btn-approve" onclick="approveSpec('${task.id}', this)">Approve Spec &amp; Plan Next</button>
+          <button class="btn btn-secondary" id="btn-critique-spec"
+            onclick="critiqueSpec('${task.id}', this)" ${reviseDisabled ? "disabled" : ""}>
+            Revise Spec${reviseDisabled ? " (limit reached)" : ""}
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick="cancelTask('${task.id}')" style="margin-left:auto">Cancel</button>
+        </div>
+      </div>`;
   } else if (task.state === "awaiting_plan_approval") {
     const attemptCount = task.planAttempt ?? 0;
     const maxAttempts = plannerMaxIterations + 1;
     const planNum = attemptCount + 1;
     const reviseDisabled = attemptCount >= (maxAttempts - 1);
-    const transcripts = task.transcripts ?? [];
+    const transcripts = task.planTranscripts ?? [];
     const latestTranscript = transcripts.slice(-1)[0];
     const viewLink = latestTranscript
       ? `<a href="#" onclick="openTranscript('${latestTranscript.id}'); return false;" class="view-transcript-link">View transcript →</a>`
@@ -496,6 +584,7 @@ function renderTaskDetail(task) {
   `;
 
   wireCritiqueInput(task);
+  wireSpecCritiqueInput(task);
   loadEvents(task.id);
 }
 
@@ -518,6 +607,28 @@ function wireCritiqueInput(task) {
       e.preventDefault();
       const btn = document.getElementById("btn-critique");
       if (btn && !btn.disabled) critiquePlan(task.id, btn);
+    }
+  });
+}
+
+function wireSpecCritiqueInput(task) {
+  const input = document.getElementById("critique-spec-input");
+  const counter = document.getElementById("critique-spec-counter");
+  if (!input || !counter) return;
+
+  const update = () => {
+    const len = input.value.length;
+    counter.textContent = `${len} / 4000`;
+    counter.classList.toggle("at-limit", len >= 4000);
+  };
+  input.addEventListener("input", update);
+  update();
+
+  input.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      const btn = document.getElementById("btn-critique-spec");
+      if (btn && !btn.disabled) critiqueSpec(task.id, btn);
     }
   });
 }
@@ -829,6 +940,20 @@ async function approvePlan(taskId, btnEl) {
   });
 }
 
+async function approveSpec(taskId, btnEl) {
+  await runAction(btnEl, "Approving…", btnEl?.closest(".plan-review-buttons"), async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/approve-spec`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      toast("Spec approved — generating execution plan…", "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Approve spec failed: ${err.message}`, "error");
+    }
+  });
+}
+
 async function critiquePlan(taskId, btnEl) {
   const input = document.getElementById("critique-input");
   const critique = (input?.value ?? "").trim();
@@ -850,6 +975,35 @@ async function critiquePlan(taskId, btnEl) {
       }
       if (!res.ok) throw new Error(await res.text());
       toast("Critique submitted — re-planning…", "success");
+      refreshTasks();
+      refreshTaskDetail(taskId);
+    } catch (err) {
+      toast(`Critique failed: ${err.message}`, "error");
+    }
+  });
+}
+
+async function critiqueSpec(taskId, btnEl) {
+  const input = document.getElementById("critique-spec-input");
+  const critique = (input?.value ?? "").trim();
+  if (!critique) {
+    toast("Please enter a critique to revise the spec.", "error");
+    return;
+  }
+  const button = btnEl ?? document.getElementById("btn-critique-spec");
+  await runAction(button, "Re-planning spec…", button.closest(".plan-review-buttons"), async () => {
+    try {
+      const res = await fetch(`${API}/api/tasks/${taskId}/critique-spec`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ critique })
+      });
+      if (res.status === 409) {
+        toast("Spec revision limit reached — approve or cancel.", "error");
+        return;
+      }
+      if (!res.ok) throw new Error(await res.text());
+      toast("Critique submitted — revising spec…", "success");
       refreshTasks();
       refreshTaskDetail(taskId);
     } catch (err) {
@@ -888,6 +1042,13 @@ async function retryTask(taskId, fromStage, btnEl) {
         }
         if (body?.error === "invalid_worktree_path") {
           toast("Rollback failed: worktree path no longer matches this task.", "error");
+          return;
+        }
+        if (body?.error === "cannot_rollback_to_approved_spec") {
+          toast(
+            "Retrying spec phase would overwrite an approved spec. Roll back to a spec checkpoint or resubmit with force.",
+            "error"
+          );
           return;
         }
         toast("Task is no longer paused for intervention.", "error");
@@ -977,7 +1138,9 @@ window.approveTask = approveTask;
 window.rejectTask = rejectTask;
 window.cancelTask = cancelTask;
 window.approvePlan = approvePlan;
+window.approveSpec = approveSpec;
 window.critiquePlan = critiquePlan;
+window.critiqueSpec = critiqueSpec;
 window.retryTask = retryTask;
 window.submitSteering = submitSteering;
 window.archiveTask = archiveTask;
@@ -1386,6 +1549,9 @@ async function loadConfig() {
       const cfg = await res.json();
       if (typeof cfg.plannerMaxIterations === "number") {
         plannerMaxIterations = cfg.plannerMaxIterations;
+      }
+      if (typeof cfg.plannerSpecMaxIterations === "number") {
+        plannerSpecMaxIterations = cfg.plannerSpecMaxIterations;
       }
     }
   } catch {

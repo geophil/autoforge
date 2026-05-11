@@ -12,6 +12,8 @@ export interface TaskCheckpointPayload {
   stage: TaskCheckpointStage;
   git_sha: string;
   label: string;
+  /** Present on planner checkpoints — distinguishes spec vs execution-plan attempts. */
+  planning_phase?: "spec" | "execution_plan" | "combined" | null;
 }
 
 const STAGE_ORDER: Record<TaskCheckpointStage, number> = {
@@ -46,7 +48,15 @@ export function parseCheckpointPayload(payload: unknown): TaskCheckpointPayload 
     iteration: record.iteration,
     stage: record.stage,
     git_sha: record.git_sha,
-    label: record.label
+    label: record.label,
+    planning_phase:
+      record.planning_phase === "spec" ||
+      record.planning_phase === "execution_plan" ||
+      record.planning_phase === "combined"
+        ? record.planning_phase
+        : record.planning_phase === null
+          ? null
+          : undefined
   };
 }
 

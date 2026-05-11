@@ -253,7 +253,11 @@ describe("reflection flow", () => {
     const { service, db, cleanup } = createTestService();
     try {
       const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
-      expect(task.state).toBe("awaiting_plan_approval");
+      expect(task.state).toBe("awaiting_spec_approval");
+
+      await service.approveSpec(task.id);
+      const atPlan = service.getTask(task.id)!;
+      expect(atPlan.state).toBe("awaiting_plan_approval");
 
       (service as unknown as { cleanupWorktree: (taskId: string) => void }).cleanupWorktree(task.id);
 

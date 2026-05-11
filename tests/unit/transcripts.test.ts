@@ -89,7 +89,7 @@ describe("DbClient transcripts methods", () => {
     expect(row!.tokenInput).toBe(1234);
   });
 
-  test("listTranscriptsByTask returns metadata only, ordered by attempt asc", () => {
+  test("listTranscriptsByTask returns metadata only, ordered by insertion (created_at, rowid)", () => {
     const db = freshDb();
     db.sqlite
       .query(
@@ -97,18 +97,22 @@ describe("DbClient transcripts methods", () => {
       )
       .run("task-2", "proj", "desc", "planning", "STANDARD", "{}", "[]", 0, "2026-04-16T00:00:00Z", "2026-04-16T00:00:00Z");
 
-    db.insertTranscript({
-      taskId: "task-2", stage: "planner", attempt: 1,
-      personaVersionId: "persona-planner-v2",
-      executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
-      transcript: "", output: null, critique: "fix it",
-      tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
-    });
+    // Insertion order matches attempt order in production (planner runs attempt
+    // 0 before attempt 1). The ordering contract is "chronological by insertion"
+    // — created_at is the primary key with rowid as the millisecond-collision
+    // tie-break — so this list reflects the same order the orchestrator wrote.
     db.insertTranscript({
       taskId: "task-2", stage: "planner", attempt: 0,
       personaVersionId: "persona-planner-v1",
       executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
       transcript: "", output: null, critique: null,
+      tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
+    });
+    db.insertTranscript({
+      taskId: "task-2", stage: "planner", attempt: 1,
+      personaVersionId: "persona-planner-v2",
+      executorUsed: "anthropic-sdk", model: "opus", systemPrompt: "s", userPrompt: "u",
+      transcript: "", output: null, critique: "fix it",
       tokenInput: 1, tokenOutput: 1, elapsedSeconds: 1
     });
 

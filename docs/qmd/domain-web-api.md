@@ -74,7 +74,7 @@ publish(event: { type: string; data: unknown }): void {
 |--------|------|---------|-------------|
 | `GET`  | `/` | `server.ts` | Static HTML dashboard (`src/web/public/index.html`) |
 | `GET`  | `/api/health` | `server.ts` | Health check — returns `{ status, uptime }` |
-| `GET`  | `/api/config` | `server.ts` | Dashboard config such as `{ plannerMaxIterations }` |
+| `GET`  | `/api/config` | `server.ts` | Dashboard config: `{ plannerMaxIterations, plannerSpecMaxIterations }` |
 | `POST` | `/api/tasks` | `tasks.ts` | Submit a new task; returns the task object directly |
 | `GET`  | `/api/tasks` | `tasks.ts` | List tasks; supports `archived=true` and `includeArchived=true` |
 | `GET`  | `/api/tasks/:id` | `tasks.ts` | Get single task |
@@ -85,9 +85,11 @@ publish(event: { type: string; data: unknown }): void {
 | `POST` | `/api/tasks/:id/approve` | `approvals.ts` | Approve awaiting task; returns the task object directly |
 | `POST` | `/api/tasks/:id/reject` | `approvals.ts` | Reject awaiting task with reason; returns the **new restart task** directly |
 | `POST` | `/api/tasks/:id/cancel` | `approvals.ts` | Cancel a task; returns the task object directly |
+| `POST` | `/api/tasks/:id/approve-spec` | `approvals.ts` | Approve discovery/spec for a task paused in `awaiting_spec_approval`; resumes planner in `execution_plan` phase |
+| `POST` | `/api/tasks/:id/critique-spec` | `approvals.ts` | Submit critique (or answer to a blocking question) and rerun the spec-phase planner. Capped by `PLANNER_SPEC_MAX_ITERATIONS` |
 | `POST` | `/api/tasks/:id/approve-plan` | `approvals.ts` | Approve a task paused in `awaiting_plan_approval` |
-| `POST` | `/api/tasks/:id/critique-plan` | `approvals.ts` | Submit plan critique and rerun planner |
-| `POST` | `/api/tasks/:id/retry` | `approvals.ts` | Retry from `awaiting_intervention` with optional `fromStage`, `checkpointId`, and `operatorNote` |
+| `POST` | `/api/tasks/:id/critique-plan` | `approvals.ts` | Submit plan critique and rerun the execution-plan-phase planner. Capped by `PLANNER_MAX_ITERATIONS` |
+| `POST` | `/api/tasks/:id/retry` | `approvals.ts` | Retry from `awaiting_intervention` with optional `fromStage`, `checkpointId`, `operatorNote`, `planningPhase`, and `force` |
 | `POST` | `/api/tasks/:id/steer` | `approvals.ts` | Queue boundary-safe steering for the next attempt (`scope: next_attempt`) |
 | `POST` | `/api/meta` | `meta.ts` | Trigger meta-loop analysis; returns `experimentId` |
 | `POST` | `/api/meta/:experimentId/conclude` | `meta.ts` | Conclude experiment (keep or revert) |
@@ -119,6 +121,8 @@ POST /api/tasks
 
 `submitTask` runs the full pipeline synchronously — the HTTP response is not returned until the task reaches `awaiting_approval` or fails.
 
+When QMD is configured (`QMD_MCP_URL` present), planner attempts that omit required `planningContext.qmdContext` evidence pause the task in `awaiting_intervention` with `failure_category=planner_missing_qmd_context`. The API returns that paused task so operators can inspect forensics and retry.
+
 ### Approval Flow
 
 ```
@@ -136,7 +140,10 @@ POST /api/tasks/:id/approve
   - `checkpointId`: rewind worktree to a recorded checkpoint before retrying
   - `operatorNote`: attached to `rollback_applied` / `retry_requested` for forensics
   - `fromStage`: `planning` or `executing`
+  - `planningPhase`: `spec` or `execution_plan` — explicit planner phase when retrying from planning. Omitted means inferred from the most recent planner transcript stage, except after a spec-checkpoint rollback (which always targets `spec`).
+  - `force`: bypass the `cannot_rollback_to_approved_spec` guard. Required when the task already has an approved spec (`planningContext.reviewedAt` set) and the operator wants to redo the spec phase without rolling back to a spec-phase checkpoint. Returns HTTP 409 `cannot_rollback_to_approved_spec` otherwise.
 - `POST /api/tasks/:id/steer` queues an operator message as `steering_message`; the next planner/coder/reviewer/doc dispatch injects it and emits `steering_consumed`.
+- QMD-evidence planner failures use the same retry surface: operators fix context/prompting and retry from `planning`.
 
 ### SSE Dashboard Flow
 
@@ -208,7 +215,7 @@ app.post("/run", async (ctx) => {
 
 ## Integration Points
 
-- **Task Orchestration**: Task routes delegate to `OrchestratorService` methods (`submitTask`, `approveTask`, `rejectTask`, `archiveTask`, `unarchiveTask`, `deleteTaskPermanently`, `approvePlan`, `critiquePlan`, `retryFromIntervention`, `listTasks`, `getTask`).
+- **Task Orchestration**: Task routes delegate to `OrchestratorService` methods (`submitTask`, `approveTask`, `rejectTask`, `archiveTask`, `unarchiveTask`, `deleteTaskPermanently`, `approveSpec`, `critiqueSpec`, `approvePlan`, `critiquePlan`, `retryFromIntervention`, `listTasks`, `getTask`).
 - **Meta-Loop**: Meta and experiment routes delegate to `OrchestratorService.submitMetaTask()`, `concludeExperiment()`, `listPendingForkExperiments()`, `approveFork()`, and `rejectFork()`.
 - **Diagnostics**: `POST /api/diagnostic/run` delegates to `OrchestratorService.runPopulationDiagnostic()`.
 - **Event Log**: `GET /api/tasks/:id/events` delegates to `DbClient.listEvents(taskId)`.
@@ -227,7 +234,7 @@ Approval-surface mutating routes (including retry/rollback and steering) current
 | `src/web/public/index.html` | Static dashboard HTML |
 | `src/web/public/dashboard.js` | Dashboard client JS — SSE subscription, task list rendering |
 | `src/web/routes/tasks.ts` | Task creation/list/get/events/archive/unarchive/permanent delete |
-| `src/web/routes/approvals.ts` | Approve/reject/cancel/approve-plan/critique-plan/retry task operations |
+| `src/web/routes/approvals.ts` | Approve/reject/cancel/approve-spec/critique-spec/approve-plan/critique-plan/retry/steer task operations |
 | `src/web/routes/meta.ts` | `POST /api/meta`, `POST /api/meta/:experimentId/conclude` |
 | `src/web/routes/transcripts.ts` | `GET /api/transcripts/by-task/:taskId`, `GET /api/transcripts/:id` |
 | `src/web/routes/experiments.ts` | `GET /api/experiments?status=proposed&operation=fork`, `POST /api/experiments/:id/approve-fork`, `POST /api/experiments/:id/reject-fork` |

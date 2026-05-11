@@ -3,6 +3,162 @@ import { createTestService } from "../helpers/create-service";
 import { StageFailedError } from "../../src/orchestrator/service";
 
 describe("awaiting_intervention: planner failures surface with forensics", () => {
+  test("planner output without QMD evidence pauses in awaiting_intervention when QMD is configured", async () => {
+    const { service, db } = createTestService(
+      {
+        planner: async () => ({
+          status: "DONE",
+          artifacts: [],
+          output: {
+            discovery: {
+              intent: "Plan feature",
+              constraints: [],
+              assumptions: [],
+              decisions: [],
+              nonGoals: [],
+              openQuestions: []
+            },
+            spec: {
+              problem: "Need behavior",
+              desiredBehavior: ["Do the thing"],
+              acceptanceCriteria: ["Works"],
+              verification: ["Tests"],
+              risks: []
+            }
+          },
+          metrics: { elapsedSeconds: 0.3 }
+        })
+      },
+      { QMD_MCP_URL: "http://localhost:8181/mcp" }
+    );
+
+    const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
+    expect(task.state).toBe("awaiting_intervention");
+
+    const events = db.listEvents(task.id);
+    const failure = events.find((e) => e.type === "failure_analysis");
+    expect(failure).toBeDefined();
+    expect(failure!.payload.failure_category).toBe("planner_missing_qmd_context");
+    expect(failure!.payload.qmd_required).toBe(true);
+    expect(failure!.payload.qmd_evidence_status).toBe("missing");
+  });
+
+  test("planner output with QMD evidence proceeds to spec approval when QMD is configured", async () => {
+    const { service } = createTestService(
+      {
+        planner: async () => ({
+          status: "DONE",
+          artifacts: [],
+          output: {
+            discovery: {
+              intent: "Plan feature",
+              constraints: [],
+              assumptions: [],
+              decisions: [],
+              nonGoals: [],
+              openQuestions: []
+            },
+            spec: {
+              problem: "Need behavior",
+              desiredBehavior: ["Do the thing"],
+              acceptanceCriteria: ["Works"],
+              verification: ["Tests"],
+              risks: []
+            },
+            planningContext: {
+              qmdContext: {
+                status: "used",
+                phase: "spec",
+                queries: ["task orchestration planning gate"],
+                documents: ["docs/qmd/domain-task-orchestration.md"],
+                fallbackReason: null
+              }
+            }
+          },
+          metrics: { elapsedSeconds: 0.3 }
+        })
+      },
+      { QMD_MCP_URL: "http://localhost:8181/mcp" }
+    );
+
+    const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
+    expect(task.state).toBe("awaiting_spec_approval");
+  });
+
+  test("execution-plan phase also enforces QMD evidence when configured", async () => {
+    const { service, db } = createTestService(
+      {
+        planner: async (task) => {
+          const phaseMatch = /\n## Phase\n(spec|execution_plan|combined)\n/.exec("\n" + task.prompt);
+          const phase = phaseMatch?.[1];
+          if (phase === "spec") {
+            return {
+              status: "DONE",
+              artifacts: [],
+              output: {
+                discovery: {
+                  intent: "Plan feature",
+                  constraints: [],
+                  assumptions: [],
+                  decisions: [],
+                  nonGoals: [],
+                  openQuestions: []
+                },
+                spec: {
+                  problem: "Need behavior",
+                  desiredBehavior: ["Do the thing"],
+                  acceptanceCriteria: ["Works"],
+                  verification: ["Tests"],
+                  risks: []
+                },
+                planningContext: {
+                  qmdContext: {
+                    status: "used",
+                    phase: "spec",
+                    queries: ["spec phase query"],
+                    documents: ["docs/qmd/domain-task-orchestration.md"],
+                    fallbackReason: null
+                  }
+                }
+              },
+              metrics: { elapsedSeconds: 0.2 }
+            };
+          }
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: {
+              subtasks: [
+                {
+                  id: "t1-subtask-1",
+                  sequence: 1,
+                  description: "Implement",
+                  filesInScope: ["src/"],
+                  dependencies: [],
+                  testCriteria: ["passes"]
+                }
+              ]
+            },
+            metrics: { elapsedSeconds: 0.2 }
+          };
+        }
+      },
+      { QMD_MCP_URL: "http://localhost:8181/mcp" }
+    );
+
+    const created = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
+    expect(created.state).toBe("awaiting_spec_approval");
+
+    const afterApproveSpec = await service.approveSpec(created.id);
+    expect(afterApproveSpec.state).toBe("awaiting_intervention");
+
+    const events = db.listEvents(created.id);
+    const failure = events.find((e) => e.type === "failure_analysis");
+    expect(failure).toBeDefined();
+    expect(failure!.payload.failure_category).toBe("planner_missing_qmd_context");
+    expect(failure!.payload.requested_phase).toBe("execution_plan");
+  });
+
   test("planner FAILED pauses task in awaiting_intervention instead of silently falling back", async () => {
     const { service, db } = createTestService({
       planner: async () => ({
@@ -266,7 +422,7 @@ describe("retryFromIntervention", () => {
   test("retry from planning re-runs the planner (fresh attempt #0)", async () => {
     let plannerCalls = 0;
     const { service, db } = createTestService({
-      planner: async () => {
+      planner: async (task) => {
         plannerCalls += 1;
         if (plannerCalls === 1) {
           return {
@@ -274,6 +430,35 @@ describe("retryFromIntervention", () => {
             artifacts: [],
             blockReason: "first call fails",
             metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+        const phaseMatch = /\n## Phase\n(spec|execution_plan|combined)\n/.exec("\n" + task.prompt);
+        const phase = phaseMatch?.[1];
+        if (phase === "spec") {
+          const desc =
+            typeof task.metadata?.description === "string" ? task.metadata.description : "task";
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: {
+              discovery: {
+                intent: desc,
+                constraints: [],
+                assumptions: [],
+                decisions: [],
+                nonGoals: [],
+                openQuestions: []
+              },
+              spec: {
+                problem: `Solve: ${desc}`,
+                desiredBehavior: ["Meet criteria", "Keep tests green"],
+                acceptanceCriteria: ["Matches description", "Tests pass"],
+                verification: ["Run tests"],
+                risks: []
+              },
+              blockingQuestion: null
+            },
+            metrics: { elapsedSeconds: 0.2, tokenInput: 100, tokenOutput: 50 }
           };
         }
         return {
@@ -295,11 +480,15 @@ describe("retryFromIntervention", () => {
 
     const retried = await service.retryFromIntervention(paused.id, { fromStage: "planning" });
 
-    // Second planner succeeded — STANDARD tier pauses at plan approval.
-    expect(retried.state).toBe("awaiting_plan_approval");
-    expect(retried.planSubtasks).toHaveLength(1);
-    expect(retried.planSubtasks[0].description).toBe("Do the thing");
+    expect(retried.state).toBe("awaiting_spec_approval");
+    expect(retried.specArtifacts?.spec.problem.length).toBeGreaterThan(0);
     expect(plannerCalls).toBe(2);
+
+    const afterExec = await service.approveSpec(retried.id);
+    expect(afterExec.state).toBe("awaiting_plan_approval");
+    expect(afterExec.planSubtasks).toHaveLength(1);
+    expect(afterExec.planSubtasks[0].description).toBe("Do the thing");
+    expect(plannerCalls).toBe(3);
 
     const events = db.listEvents(paused.id);
     expect(events.some((e) => e.type === "retry_requested")).toBe(true);
@@ -308,7 +497,7 @@ describe("retryFromIntervention", () => {
   test("rollback to task-start checkpoint then retry from planning stays replay-consistent", async () => {
     let plannerCalls = 0;
     const { service, db } = createTestService({
-      planner: async () => {
+      planner: async (task) => {
         plannerCalls += 1;
         if (plannerCalls === 1) {
           return {
@@ -316,6 +505,35 @@ describe("retryFromIntervention", () => {
             artifacts: [],
             blockReason: "first call fails",
             metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+        const phaseMatch = /\n## Phase\n(spec|execution_plan|combined)\n/.exec("\n" + task.prompt);
+        const phase = phaseMatch?.[1];
+        if (phase === "spec") {
+          const desc =
+            typeof task.metadata?.description === "string" ? task.metadata.description : "task";
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: {
+              discovery: {
+                intent: desc,
+                constraints: [],
+                assumptions: [],
+                decisions: [],
+                nonGoals: [],
+                openQuestions: []
+              },
+              spec: {
+                problem: `Solve: ${desc}`,
+                desiredBehavior: ["Meet criteria", "Keep tests green"],
+                acceptanceCriteria: ["Matches description", "Tests pass"],
+                verification: ["Run tests"],
+                risks: []
+              },
+              blockingQuestion: null
+            },
+            metrics: { elapsedSeconds: 0.2, tokenInput: 100, tokenOutput: 50 }
           };
         }
         return {
@@ -345,7 +563,7 @@ describe("retryFromIntervention", () => {
       checkpointId: String(taskStartCheckpoint!.payload.checkpoint_id),
       operatorNote: "reset to task start"
     });
-    expect(retried.state).toBe("awaiting_plan_approval");
+    expect(retried.state).toBe("awaiting_spec_approval");
     expect(plannerCalls).toBe(2);
 
     const rollback = db.listEvents(paused.id).find((event) => event.type === "rollback_applied");
@@ -521,5 +739,181 @@ describe("StageFailedError is exported for callers that need to distinguish", ()
     expect(err.taskId).toBe("task-xyz");
     expect(err.stage).toBe("planning");
     expect(err.message).toBe("nope");
+  });
+});
+
+// Plan §Task 7 — rollback-to-approved-spec policy.
+//
+// All four scenarios share the same setup: a STANDARD task whose spec was
+// approved and whose subsequent execution-plan planner call failed, leaving
+// the task in `awaiting_intervention` with `planningContext.reviewedAt` set.
+function specApprovedExecutionFailedPlanner() {
+  let plannerCalls = 0;
+  return {
+    plannerCalls: () => plannerCalls,
+    handler: async (task: { prompt: string; metadata?: { description?: unknown } }) => {
+      plannerCalls += 1;
+      const phaseMatch = /\n## Phase\n(spec|execution_plan|combined)\n/.exec("\n" + task.prompt);
+      const phase = phaseMatch?.[1];
+      if (phase === "execution_plan") {
+        return {
+          status: "FAILED" as const,
+          artifacts: [] as string[],
+          blockReason: "synthetic execution-plan failure",
+          metrics: { elapsedSeconds: 0.1 }
+        };
+      }
+      const desc =
+        typeof task.metadata?.description === "string" ? task.metadata.description : "task";
+      return {
+        status: "DONE" as const,
+        artifacts: [] as string[],
+        output: {
+          discovery: {
+            intent: desc,
+            constraints: [],
+            assumptions: [],
+            decisions: [],
+            nonGoals: [],
+            openQuestions: []
+          },
+          spec: {
+            problem: `Solve: ${desc}`,
+            desiredBehavior: ["Meet criteria", "Keep tests green"],
+            acceptanceCriteria: ["Matches description", "Tests pass"],
+            verification: ["Run tests"],
+            risks: []
+          },
+          blockingQuestion: null
+        },
+        metrics: { elapsedSeconds: 0.2, tokenInput: 100, tokenOutput: 50 }
+      };
+    }
+  };
+}
+
+describe("retryFromIntervention: rollback-to-approved-spec policy", () => {
+  test("rollback to spec-phase checkpoint clears planningContext.reviewedAt and re-pauses at awaiting_spec_approval", async () => {
+    const planner = specApprovedExecutionFailedPlanner();
+    const { service, db } = createTestService({ planner: planner.handler });
+
+    const initial = await service.submitTask("autoforge", "Build a STANDARD widget");
+    expect(initial.state).toBe("awaiting_spec_approval");
+
+    await service.approveSpec(initial.id);
+    const afterFailure = service.getTask(initial.id)!;
+    expect(afterFailure.state).toBe("awaiting_intervention");
+    expect(afterFailure.planningContext?.reviewedAt).toBeTruthy();
+    expect(afterFailure.planningContext?.approvalMode).toBe("manual");
+
+    const taskStart = db.listEvents(initial.id).find(
+      (event) => event.type === "checkpoint_created" && event.payload.label === "task-start"
+    );
+    expect(taskStart).toBeDefined();
+    expect((taskStart!.payload as { planning_phase?: string }).planning_phase).toBe("spec");
+
+    const retried = await service.retryFromIntervention(initial.id, {
+      fromStage: "planning",
+      checkpointId: String(taskStart!.payload.checkpoint_id),
+      operatorNote: "spec was wrong"
+    });
+
+    expect(retried.state).toBe("awaiting_spec_approval");
+    expect(retried.planningContext?.reviewedAt).toBeNull();
+    expect(retried.planningContext?.approvalMode).toBeNull();
+
+    const rollback = db.listEvents(initial.id).find((event) => event.type === "rollback_applied");
+    expect(rollback).toBeDefined();
+    expect(rollback!.payload.invalidated_planning_context).toBe(true);
+    expect(rollback!.payload.checkpoint_planning_phase).toBe("spec");
+  });
+
+  test("retry with planningPhase=spec on an approved-spec task without checkpoint throws cannot_rollback_to_approved_spec", async () => {
+    const planner = specApprovedExecutionFailedPlanner();
+    const { service } = createTestService({ planner: planner.handler });
+
+    const initial = await service.submitTask("autoforge", "Build a STANDARD widget");
+    await service.approveSpec(initial.id);
+    expect(service.getTask(initial.id)!.state).toBe("awaiting_intervention");
+
+    await expect(
+      service.retryFromIntervention(initial.id, {
+        fromStage: "planning",
+        planningPhase: "spec"
+      })
+    ).rejects.toThrow("cannot_rollback_to_approved_spec");
+  });
+
+  test("force: true bypasses the cannot_rollback_to_approved_spec guard", async () => {
+    const planner = specApprovedExecutionFailedPlanner();
+    const { service, db } = createTestService({ planner: planner.handler });
+
+    const initial = await service.submitTask("autoforge", "Build a STANDARD widget");
+    await service.approveSpec(initial.id);
+    expect(service.getTask(initial.id)!.state).toBe("awaiting_intervention");
+
+    const retried = await service.retryFromIntervention(initial.id, {
+      fromStage: "planning",
+      planningPhase: "spec",
+      force: true
+    });
+    expect(retried.state).toBe("awaiting_spec_approval");
+
+    // The retry_requested event records the force flag so audit trail is preserved.
+    const retryRequested = db.listEvents(initial.id).find((e) => e.type === "retry_requested");
+    expect(retryRequested!.payload.force).toBe(true);
+  });
+
+  test("post-rollback spec attempt uses monotonic counter and scoped budget", async () => {
+    const planner = specApprovedExecutionFailedPlanner();
+    const { service, db } = createTestService({ planner: planner.handler });
+
+    const initial = await service.submitTask("autoforge", "Build a STANDARD widget");
+    await service.approveSpec(initial.id);
+
+    const preRollbackTranscripts = db.listTranscriptsByTask(initial.id);
+    const preSpec = preRollbackTranscripts.filter((t) => t.stage === "planner:spec");
+    expect(preSpec).toHaveLength(1);
+    expect(preSpec[0].attempt).toBe(0);
+    expect(preSpec[0].rollbackEventId).toBeNull();
+
+    const taskStart = db.listEvents(initial.id).find(
+      (event) => event.type === "checkpoint_created" && event.payload.label === "task-start"
+    );
+    await service.retryFromIntervention(initial.id, {
+      fromStage: "planning",
+      checkpointId: String(taskStart!.payload.checkpoint_id)
+    });
+
+    const rollbackEvent = db.listEvents(initial.id).find((e) => e.type === "rollback_applied")!;
+    const postSpec = db
+      .listTranscriptsByTask(initial.id)
+      .filter((t) => t.stage === "planner:spec");
+    expect(postSpec).toHaveLength(2);
+
+    // Monotonic counter: new spec transcript uses attempt = max(prior) + 1.
+    const newAttempt = postSpec.find((t) => t.rollbackEventId === rollbackEvent.id);
+    expect(newAttempt).toBeDefined();
+    expect(newAttempt!.attempt).toBe(1);
+
+    // (task_id, stage, attempt) UNIQUE is preserved since the new row used
+    // attempt=1 rather than reusing 0. Sanity check via direct SQL.
+    const dupRows = db.sqlite
+      .query(
+        "SELECT attempt FROM agent_transcripts WHERE task_id = ? AND stage = ? ORDER BY attempt ASC"
+      )
+      .all(initial.id, "planner:spec") as Array<{ attempt: number }>;
+    expect(dupRows.map((r) => r.attempt)).toEqual([0, 1]);
+
+    // Budget scope: the spec critique budget is enforced on transcripts
+    // matching the current rollback scope. Pre-rollback attempts are excluded.
+    // After the rollback there is exactly one scoped spec attempt (attempt=1),
+    // so critiqueSpec must accept three more critiques before tripping the
+    // PLANNER_SPEC_MAX_ITERATIONS=3 ceiling.
+    await service.critiqueSpec(initial.id, "tighten acceptance criteria");
+    await service.critiqueSpec(initial.id, "name a concrete metric");
+    await expect(
+      service.critiqueSpec(initial.id, "one more tweak")
+    ).rejects.toThrow(/limit/i);
   });
 });

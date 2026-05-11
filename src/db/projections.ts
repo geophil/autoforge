@@ -1,6 +1,14 @@
 import type { Database } from "bun:sqlite";
 import type { AutoforgeMessage } from "../nats/messages";
-import type { ComplexityAssessment, PlanSubtask, ReviewFinding, TaskStage, Tier } from "../types/core";
+import type {
+  ComplexityAssessment,
+  PlanSubtask,
+  PlannerSpecArtifacts,
+  PlanningContext,
+  ReviewFinding,
+  TaskStage,
+  Tier
+} from "../types/core";
 
 type TaskPayload = {
   description?: string;
@@ -12,6 +20,10 @@ type TaskPayload = {
   prUrl?: string;
   finding?: ReviewFinding;
   resolveAllFindings?: boolean;
+  specArtifacts?: PlannerSpecArtifacts | null;
+  planningContext?: PlanningContext | null;
+  currentBlockingQuestion?: string | null;
+  reviewPlan?: boolean | null;
 };
 
 export function applyEventProjection(sqlite: Database, message: AutoforgeMessage): void {
@@ -19,11 +31,18 @@ export function applyEventProjection(sqlite: Database, message: AutoforgeMessage
   const now = message.timestamp;
   const existing = sqlite.query("SELECT id FROM tasks WHERE id = ?").get(message.taskId) as { id: string } | null;
 
+  const reviewPlanDb =
+    payload.reviewPlan === undefined || payload.reviewPlan === null ? null : payload.reviewPlan ? 1 : 0;
+
   if (existing === null) {
     sqlite
       .query(
-        `INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO tasks (
+           id, project_id, description, state, tier, assessment, plan, iteration,
+           spec_artifacts, planning_context, current_blocking_question, review_plan,
+           created_at, updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         message.taskId,
@@ -34,6 +53,14 @@ export function applyEventProjection(sqlite: Database, message: AutoforgeMessage
         JSON.stringify(payload.assessment ?? defaultAssessment()),
         JSON.stringify(payload.planSubtasks ?? []),
         payload.iteration ?? 0,
+        payload.specArtifacts === undefined || payload.specArtifacts === null
+          ? null
+          : JSON.stringify(payload.specArtifacts),
+        payload.planningContext === undefined || payload.planningContext === null
+          ? null
+          : JSON.stringify(payload.planningContext),
+        payload.currentBlockingQuestion === undefined ? null : payload.currentBlockingQuestion,
+        reviewPlanDb,
         now,
         now
       );
@@ -60,6 +87,30 @@ export function applyEventProjection(sqlite: Database, message: AutoforgeMessage
         payload.iteration ?? null,
         payload.prUrl ?? null,
         now,
+        message.taskId
+      );
+  }
+
+  if (payload.specArtifacts !== undefined) {
+    sqlite
+      .query("UPDATE tasks SET spec_artifacts = ? WHERE id = ?")
+      .run(payload.specArtifacts === null ? null : JSON.stringify(payload.specArtifacts), message.taskId);
+  }
+  if (payload.planningContext !== undefined) {
+    sqlite
+      .query("UPDATE tasks SET planning_context = ? WHERE id = ?")
+      .run(payload.planningContext === null ? null : JSON.stringify(payload.planningContext), message.taskId);
+  }
+  if (payload.currentBlockingQuestion !== undefined) {
+    sqlite
+      .query("UPDATE tasks SET current_blocking_question = ? WHERE id = ?")
+      .run(payload.currentBlockingQuestion, message.taskId);
+  }
+  if (payload.reviewPlan !== undefined) {
+    sqlite
+      .query("UPDATE tasks SET review_plan = ? WHERE id = ?")
+      .run(
+        payload.reviewPlan === null ? null : payload.reviewPlan ? 1 : 0,
         message.taskId
       );
   }

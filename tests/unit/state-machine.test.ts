@@ -49,3 +49,25 @@ describe("plan-review state transitions", () => {
     expect(canTransition("awaiting_plan_approval", "documenting")).toBe(false);
   });
 });
+
+describe("spec-review state transitions", () => {
+  test("planning -> awaiting_spec_approval", () => {
+    expect(canTransition("planning", "awaiting_spec_approval")).toBe(true);
+  });
+
+  test("awaiting_spec_approval -> planning", () => {
+    expect(canTransition("awaiting_spec_approval", "planning")).toBe(true);
+  });
+
+  test("awaiting_spec_approval -> replanning", () => {
+    expect(canTransition("awaiting_spec_approval", "replanning")).toBe(true);
+  });
+
+  test("replanning -> awaiting_spec_approval", () => {
+    expect(canTransition("replanning", "awaiting_spec_approval")).toBe(true);
+  });
+
+  test("awaiting_spec_approval -> failed", () => {
+    expect(canTransition("awaiting_spec_approval", "failed")).toBe(true);
+  });
+});

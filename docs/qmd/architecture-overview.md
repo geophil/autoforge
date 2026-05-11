@@ -78,15 +78,26 @@ Human → HTTP POST /api/meta
         skillFiles: skills.skillsForAgent("planner"),
         workspace: LocalWorkspace(worktreePath),     ← file/exec boundary
         environment: agentEnvironment()             ← QMD_MCP_URL if configured
-      }) → PlanSubtask[] + AgentTranscript (captured turn-by-turn)
-        db.insertTranscript({ taskId, stage: "planner", attempt, turns, ... })
-   f. if pausePolicy(tier, opts.reviewPlan):
-        transition to "awaiting_plan_approval" → return
-        Human inspects plan + transcript via dashboard Plan Review Panel.
-        On approve  → continue at step g.
-        On critique → re-run planner with original prompt + prior plan + critique
-                      (up to PLANNER_MAX_ITERATIONS revisions, default 3),
-                      append a new agent_transcripts row, stay at (f).
+      }) → ParsedPlannerOutput { phase, specArtifacts?, planSubtasks, ... }
+        db.insertTranscript({ taskId, stage: "planner:spec" | "planner:execution_plan", ... })
+   f. Two-stage planning for STANDARD/THOROUGH with reviewPlan: true:
+        - Phase 1: prompt carries `## Phase\nspec`. Planner emits discovery + spec.
+          Task transitions to "awaiting_spec_approval" → return.
+          Human inspects the spec via dashboard Spec Review card (problem, decisions,
+          acceptance criteria, any `blockingQuestion`).
+          On approveSpec  → proceed to phase 2 (planningContext.approvalMode = "manual").
+          On critiqueSpec → re-run planner in spec phase with prior artifacts plus
+                           operator critique or `## Operator Answer To Question`
+                           (capped by PLANNER_SPEC_MAX_ITERATIONS, default 3).
+        - Phase 2: prompt carries `## Phase\nexecution_plan` plus `## Approved Spec`.
+          Planner emits subtasks aligned to validated intent.
+          Task transitions to "awaiting_plan_approval".
+          On approvePlan  → continue at step g.
+          On critiquePlan → re-run planner in execution_plan phase
+                           (capped by PLANNER_MAX_ITERATIONS, default 3).
+        Combined fast path (reviewPlan: false): a single `## Phase\ncombined`
+        planner call emits both spec and subtasks; no pauses, runs straight to g.
+        EXPRESS tasks skip both pauses entirely.
    g. for each subtask:
         routeExecutor(tier, agentType).execute({
           type: subtask.agentType ?? "coder",
@@ -141,6 +152,8 @@ Human → HTTP POST /api/meta
 **Cloud readiness is a workspace swap**: Local operation uses `LocalWorkspace` with direct `fs` and `spawn`. Remote sandbox operation should implement the same `Workspace` interface and can later carry tool traffic over the `WORKSPACE` JetStream stream. The orchestrator, event sourcing, lessons, population routing, and PR gate do not need a cloud-provider-specific branch.
 
 **Population-shaped prompt asset versioning**: Personas and skills are both stored in `skill_versions` under a naming convention (`persona:coder`, `skill:tdd`). The table now represents a population per persona or skill type: one `baseline`, zero or more `active` traffic variants, and `candidate` variants evaluated by shadow runs before graduation. Legacy `is_active` is compatibility state derived from `status`; it no longer means "the only active row." Each agent execution records the selected `persona_version_id` and `skill_version_ids` in the event payload for outcome attribution.
+
+**Interactive two-stage planning**: Planner output is phase-aware. STANDARD/THOROUGH tasks with `reviewPlan: true` go through `awaiting_spec_approval` (discovery + spec validated by a human) before `awaiting_plan_approval` (subtasks). Two independent iteration budgets — `PLANNER_SPEC_MAX_ITERATIONS` and `PLANNER_MAX_ITERATIONS` — gate critique loops. Transcripts namespace on `planner:spec` vs `planner:execution_plan` so the same task can host both phases without colliding on `(task_id, stage, attempt)`. `reviewPlan: false` uses a single `combined`-phase planner call that emits both artifacts at once and never pauses for review.
 
 **Spec D population operations loop**: Completed and failed task outcomes feed reward views such as `task_quality_score`, `variant_performance`, and `population_health`. The `reflector` extracts lineage-scoped `lessons`; the `diagnostician` analyzes recent histories and writes `fork_proposals`; the meta agent turns proposals into operations; operators approve the first fork through `/api/experiments/:id/approve-fork`; candidates run in shadow via `shadow_run_completed`; auto-tuning and meta operations then graduate, promote, demote, merge, or retire variants.
 

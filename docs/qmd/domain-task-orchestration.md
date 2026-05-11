@@ -117,6 +117,27 @@ private budgetForTier(tier, step): number {
 
 **Implemented in**: `OrchestratorService.budgetForTier()`.
 
+### QMD Evidence Is Required for Planner Runs When Configured
+
+When `QMD_MCP_URL` is configured, planner outputs must include usable knowledgebase evidence in `planningContext.qmdContext` (`status: "used"` plus at least one query or retrieved document). Outputs that omit this are rejected and routed to intervention instead of progressing silently.
+
+```typescript
+// src/orchestrator/service.ts
+if (!this.deps.env.QMD_MCP_URL) return;
+const qmdContext = args.parsed.planningContext.qmdContext ?? null;
+const hasEvidence =
+  qmdContext?.status === "used" &&
+  ((qmdContext.queries?.length ?? 0) > 0 || (qmdContext.documents?.length ?? 0) > 0);
+if (!hasEvidence) {
+  this.pauseForIntervention({
+    failureCategory: "planner_missing_qmd_context",
+    failureReason: "planner output missing required QMD knowledgebase evidence"
+  });
+}
+```
+
+**Implemented in**: `OrchestratorService.requireQmdEvidenceForPlanner()`.
+
 ## Core Flows
 
 ### Submit Task Flow
@@ -128,17 +149,21 @@ A new task progresses from submission through to a PR awaiting human approval.
 3. **Worktree creation**: A git branch `autoforge/{taskId}` and isolated working directory are created. See `domain-pr-gate.md` > Git Worktree Isolation.
 4. **Initial events**: `created` and `state.assessing`/`state.planning` events are recorded atomically.
 5. **Planner dispatch**: `OrchestratorService` asks `createDispatcher().selectVariant("planner", taskContext)` for the selected population variant, resolves that variant's prompt content through `PersonaRegistry.resolveVariant()`, injects active lineage lessons from `loadLessonsForDispatch()`, and emits `variant_selected`.
-6. **Planner agent**: Executor runs a `planner` type agent; output is parsed into `PlanSubtask[]` and the turn-by-turn transcript is persisted to `agent_transcripts` (stage `planner`, attempt 0).
-7. **Plan-review pause** (STANDARD/THOROUGH, or any task submitted with `reviewPlan: true`): task transitions to `awaiting_plan_approval` and awaits human action. On approve, the pipeline resumes at step 8. On critique, the planner re-runs with the prior plan and critique appended (up to `PLANNER_MAX_ITERATIONS` revisions), producing a new `agent_transcripts` row per attempt and returning to `awaiting_plan_approval`. EXPRESS tasks skip this pause and proceed directly to step 8.
-8. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, runs `post_coder_pre_review` lifecycle hooks, then runs the reviewer (unless EXPRESS). Each planner/coder/reviewer/doc dispatch selects a population variant, injects selected variant content and lineage lessons, and runs any candidate shadow variants after the live result. Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
-9. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
-10. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
-11. **State**: Task transitions to `awaiting_approval`.
+6. **Phase 1 — Spec generation** (STANDARD/THOROUGH with `reviewPlan: true`): the prompt carries `## Phase\nspec`. Executor runs the planner; every parsed planner attempt is checked for QMD evidence when `QMD_MCP_URL` is configured. If valid, `PlannerSpecArtifacts` (discovery + spec) are persisted to `agent_transcripts` (stage `planner:spec`, attempt 0) and the task transitions to `awaiting_spec_approval`.
+7. **Spec-review pause**: On approve (`approveSpec`), `planningContext.approvalMode = "manual"` and `reviewedAt` are set, the orchestrator advances to phase 2. On critique (`critiqueSpec`), the planner re-runs in spec phase with the prior spec, the operator's critique (or `## Operator Answer To Question` prefix when a `blockingQuestion` was emitted), up to `PLANNER_SPEC_MAX_ITERATIONS` revisions. EXPRESS tasks skip phases 6–7 entirely.
+8. **Phase 2 — Execution-plan generation**: the prompt carries `## Phase\nexecution_plan` plus the approved spec under `## Approved Spec`. Output is `PlanSubtask[]`, persisted to `agent_transcripts` (stage `planner:execution_plan`). QMD evidence enforcement applies here too when configured. The task transitions to `awaiting_plan_approval`.
+9. **Plan-review pause**: Same critique loop as spec, capped by `PLANNER_MAX_ITERATIONS` and scoped to `planner:execution_plan` transcripts. The two budgets are independent.
+10. **Combined fast path** (`reviewPlan: false`): phases 6–9 collapse to a single planner call with `## Phase\ncombined`; output carries both spec and subtasks. `planningContext.approvalMode = "auto"` is set and the task runs straight to step 11 with no pause. If the combined call returns spec only, the orchestrator transparently issues a second `execution_plan` call (records `planner_phase_fallback_to_two_call`) and never pauses — this is the path `rejectTask` exercises on every restart.
+11. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, runs `post_coder_pre_review` lifecycle hooks, then runs the reviewer (unless EXPRESS). Each planner/coder/reviewer/doc dispatch selects a population variant, injects selected variant content and lineage lessons, and runs any candidate shadow variants after the live result. Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
+12. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
+13. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
+14. **State**: Task transitions to `awaiting_approval`.
 
 **Error paths**:
 - Any coder returning FAILED/TIMEOUT → task transitions to `failed`
 - Rework iteration > 3 → `failed`
 - PR gate rejected → `failed`
+- Planner output missing required QMD evidence (while `QMD_MCP_URL` is configured) → task transitions to `awaiting_intervention` with `failure_category=planner_missing_qmd_context`
 
 ### Population Dispatch Flow (`OrchestratorService.selectPersonaForDispatch`)
 
@@ -200,25 +225,47 @@ Human rejects via `POST /api/tasks/:id/reject` with a reason.
 ## State Transitions
 
 ```
-received → assessing → planning → awaiting_plan_approval ⇄ replanning
-                                        ↓ (approve)
-                                    executing → reviewing → reworking → executing (...)
-                                                          ↓
-                                                     pr_created → awaiting_approval
-                                                                        ↓         ↓
-                                                                   documenting  failed
-                                                                        ↓
-                                                                   completed
+received → assessing → planning → awaiting_spec_approval ⇄ replanning (spec)
+                                          ↓ (approveSpec)
+                                      planning → awaiting_plan_approval ⇄ replanning (plan)
+                                                          ↓ (approvePlan)
+                                                      executing → reviewing → reworking → executing (...)
+                                                                            ↓
+                                                                       pr_created → awaiting_approval
+                                                                                          ↓         ↓
+                                                                                     documenting  failed
+                                                                                          ↓
+                                                                                     completed
 ```
 
-EXPRESS-tier tasks and tasks submitted with `reviewPlan: false` skip `awaiting_plan_approval` and transition directly from `planning` to `executing`. Internal reviewer findings can still trigger `reviewing → reworking → executing` within the same task. Operator rejection at `awaiting_approval` does not requeue the same task; it fails the old task and spawns a fresh restart task linked by `restart_spawned`. Any stage can transition to `failed`. See `domain-event-sourcing.md` for how transitions are persisted.
+EXPRESS-tier tasks and tasks submitted with `reviewPlan: false` skip both `awaiting_spec_approval` and `awaiting_plan_approval` and transition directly from `planning` to `executing`. Internal reviewer findings can still trigger `reviewing → reworking → executing` within the same task. Operator rejection at `awaiting_approval` does not requeue the same task; it fails the old task and spawns a fresh restart task linked by `restart_spawned`. Any stage can transition to `failed`. See `domain-event-sourcing.md` for how transitions are persisted.
 
 ### Plan-review states
 
-- `awaiting_plan_approval` — Set after the planner completes on STANDARD/THOROUGH tasks (or any task submitted with `reviewPlan: true`). Human gate; no in-flight work; exempt from the staleness sweeper.
-- `replanning` — Transient state during a critique-driven planner re-run. Returns to `awaiting_plan_approval` on success, transitions to `failed` on planner error or when `PLANNER_MAX_ITERATIONS` is exceeded.
+- `awaiting_spec_approval` — Set after the spec-phase planner attempt completes on STANDARD/THOROUGH tasks with `reviewPlan: true`. Human gate; no in-flight work; exempt from the staleness sweeper. Dashboard surfaces the spec body, decisions with alternatives rejected, and any `blockingQuestion` posed by the planner.
+- `awaiting_plan_approval` — Set after the execution-plan-phase planner attempt completes. Same staleness exemption; dashboard renders the subtasks plus a collapsed Shared Understanding panel showing the approved spec for context.
+- `planningContext.qmdContext` — Persisted alongside planner artifacts. Records whether QMD knowledgebase context was used (`status: "used"`) or the planner explicitly fell back when QMD was unavailable (`status: "fallback"`).
+- `replanning` — Transient state during a critique-driven planner re-run. Returns to whichever review state it came from on success, transitions to `failed` on planner error or when the respective iteration budget is exceeded.
 
-The plan attempt counter (0-indexed internally, displayed 1-indexed) is the row count of `agent_transcripts` for the task with `stage = 'planner'`. The cap is configurable via `PLANNER_MAX_ITERATIONS` (default 3 revisions, so up to 4 planner runs total).
+The two phases keep independent transcript namespaces and budgets:
+
+| Phase | Transcript stage | Budget env var | Default |
+|-------|-------------------|------------------|---------|
+| Spec | `planner:spec` | `PLANNER_SPEC_MAX_ITERATIONS` | 3 revisions |
+| Execution plan | `planner:execution_plan` | `PLANNER_MAX_ITERATIONS` | 3 revisions |
+
+Worst-case planner runs per `THOROUGH` task: 1 + 3 (spec) + 1 + 3 (plan) = 8. For `combined`-phase tasks (`reviewPlan: false`) the single transcript counts against neither budget and there is no critique loop. Legacy tasks with `stage = 'planner'` rows are rewritten to `planner:execution_plan` by migration `011_spec_artifacts.sql`.
+
+### `blockingQuestion` answer loop
+
+When the spec-phase planner emits a non-empty `blockingQuestion`, the orchestrator persists it on the task projection as `currentBlockingQuestion`, pauses at `awaiting_spec_approval`, and surfaces the question as "Answer this question" in the dashboard. The operator's `critiqueSpec` reply is routed back to the next planner attempt prefixed with `## Operator Answer To Question\n> Q: <question>\n\nA: <operator text>`. `currentBlockingQuestion` clears on every successful planner attempt and re-sets if the new attempt asks a new question. Multi-question batching is out of scope in v1.
+
+### Rollback-to-approved-spec policy
+
+When a task in `awaiting_intervention` has an already-approved spec (`planningContext.reviewedAt` non-null), the retry API guards against silently discarding that approval:
+
+- **Rollback to a spec-phase checkpoint** (`checkpoint.planning_phase = "spec"`): the orchestrator clears `planningContext.reviewedAt` and `approvalMode`, records `rollback_applied` with `invalidated_planning_context: true`, and retries in spec phase so the operator gets a fresh spec gate. Existing transcripts are preserved; new ones carry `rollback_event_id` so the critique budget effectively resets while the monotonic attempt counter does not.
+- **Retry with `planningPhase: "spec"` but no spec-checkpoint rollback**: rejected with HTTP 409 `cannot_rollback_to_approved_spec` unless `force: true` is included in the request body.
 
 ## Decision Points
 
@@ -236,23 +283,25 @@ if (!mustRework) {
 
 **Implemented in**: `OrchestratorService.executeAndReview()`.
 
-### Plan Subtask Fallback
+### Phase-Aware Planner Output Parsing
 
-If the planner agent returns no structured subtasks, a single catch-all subtask is synthesized:
+`parsePlannerStructuredOutput` (in `src/orchestrator/planner-output.ts`) classifies planner output by *shape*, not by the planner's self-reported `planningPhase`. Four phases:
 
-```typescript
-// src/orchestrator/service.ts
-return [{
-  id: `${taskId}-subtask-1`,
-  sequence: 1,
-  description: "Implement requested behavior with tests-first workflow.",
-  filesInScope: ["src/"],
-  dependencies: [],
-  testCriteria: ["All tests pass."]
-}];
-```
+| Parsed phase | Shape | Used by orchestrator |
+|---|---|---|
+| `spec` | `discovery` + `spec` present, `subtasks` empty/missing | Persist spec, pause at `awaiting_spec_approval` |
+| `execution_plan` | `subtasks` non-empty, no spec | Persist subtasks, pause at `awaiting_plan_approval` (or continue when review is bypassed) |
+| `combined` | Both spec and subtasks present | Persist both; only valid when the orchestrator requested `combined` |
+| `legacy_subtasks` | Same as `execution_plan` but no `requestedPhase` was set | Backward-compatibility bucket for pre-V2 tasks |
 
-**Implemented in**: `OrchestratorService.parsePlannerOutput()`.
+When the parsed phase contradicts the orchestrator's `requestedPhase`:
+
+- `spec` requested, got `execution_plan` → records `planner_phase_mismatch`, drops the subtasks, pauses at `awaiting_spec_approval` with a `blockingQuestion` asking for clarification.
+- `execution_plan` requested, got `spec` → records the warning, pauses at `awaiting_intervention` so the operator can decide.
+- `combined` requested, got `spec` only → records `planner_phase_fallback_to_two_call` and immediately invokes the planner again with `execution_plan` (no pause). Combined-phase tasks never land at a human gate by design.
+- `combined` requested, got `execution_plan` only → accepts and proceeds with spec artifacts null and `approvalMode: "auto"`.
+
+The synthetic single-subtask fallback is only used as a last-resort when the planner returns neither subtasks nor a parseable spec.
 
 ## Integration Points
 

@@ -11,6 +11,12 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 
 -- Feature tasks (top-level)
+--
+-- This schema captures the baseline shape. Migrations under
+-- src/db/migrations/ add columns on top of it (e.g. migration 011 adds
+-- spec_artifacts, planning_context, current_blocking_question, review_plan).
+-- A fresh DB ends up with the same columns as a migrated long-lived DB
+-- because initSchema applies all numbered migrations after creating tables.
 CREATE TABLE IF NOT EXISTS tasks (
   id          TEXT PRIMARY KEY,
   project_id  TEXT NOT NULL,
@@ -167,9 +173,18 @@ WHERE e.agent IN ('planner', 'coder', 'reviewer', 'doc')
   AND json_extract(e.payload, '$.persona_version_id') IS NOT NULL
 GROUP BY json_extract(e.payload, '$.persona_version_id'), e.agent;
 
--- Agent transcripts (planner stage in v1; reserves room for other stages).
--- One row per planner attempt. Holds composed system prompt, user prompt,
--- turn-by-turn transcript JSONL, and parsed output.
+-- Agent transcripts. One row per agent attempt.
+--
+-- `stage` is namespaced: migration 011 splits the legacy `planner` namespace
+-- into `planner:spec` and `planner:execution_plan` so a single task can have
+-- both spec and execution-plan planner attempts without colliding on
+-- (task_id, stage, attempt). Migrations 003 and 011 also add the
+-- `persona_version_id` and `rollback_event_id` columns respectively.
+--
+-- The `rollback_event_id` column (migration 011) scopes a transcript to a
+-- post-rollback retry era: critique-budget queries filter by the current
+-- rollback scope so a rollback effectively resets the budget while attempt
+-- numbers remain monotonic across the task lifetime.
 CREATE TABLE IF NOT EXISTS agent_transcripts (
   id              TEXT PRIMARY KEY,
   task_id         TEXT NOT NULL,

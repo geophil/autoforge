@@ -3,9 +3,16 @@ import type { TaskStage } from "../types/core";
 const allowedTransitions: Record<TaskStage, TaskStage[]> = {
   received: ["assessing", "failed", "awaiting_intervention"],
   assessing: ["planning", "failed", "awaiting_intervention"],
-  planning: ["awaiting_plan_approval", "executing", "failed", "awaiting_intervention"],
+  planning: [
+    "awaiting_spec_approval",
+    "awaiting_plan_approval",
+    "executing",
+    "failed",
+    "awaiting_intervention"
+  ],
+  awaiting_spec_approval: ["planning", "replanning", "failed"],
   awaiting_plan_approval: ["executing", "replanning", "failed"],
-  replanning: ["awaiting_plan_approval", "failed", "awaiting_intervention"],
+  replanning: ["awaiting_plan_approval", "awaiting_spec_approval", "failed", "awaiting_intervention"],
   executing: ["reviewing", "reworking", "failed", "awaiting_intervention"],
   reviewing: ["reworking", "pr_created", "failed", "awaiting_intervention"],
   reworking: ["executing", "failed", "awaiting_intervention"],

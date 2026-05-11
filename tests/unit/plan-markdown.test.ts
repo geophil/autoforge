@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 // bottom. Evaluate it in a fresh scope so we can import the functions.
 function loadPlanMarkdownModule(): {
   renderPlanMarkdown: (task: unknown) => string;
+  renderSpecMarkdown: (task: unknown) => string;
   markdownToHtml: (md: string) => string;
 } {
   const code = readFileSync(
@@ -21,11 +22,12 @@ function loadPlanMarkdownModule(): {
   );
   return fakeModule.exports as {
     renderPlanMarkdown: (task: unknown) => string;
+    renderSpecMarkdown: (task: unknown) => string;
     markdownToHtml: (md: string) => string;
   };
 }
 
-const { renderPlanMarkdown, markdownToHtml } = loadPlanMarkdownModule();
+const { renderPlanMarkdown, renderSpecMarkdown, markdownToHtml } = loadPlanMarkdownModule();
 
 describe("renderPlanMarkdown", () => {
   test("empty plan renders a no-subtasks notice", () => {
@@ -168,6 +170,263 @@ describe("renderPlanMarkdown", () => {
       planSubtasks: []
     });
     expect(md.split("\n")[0]).toBe("# Plan for: Line one line two with gaps");
+  });
+});
+
+// Three display modes plus the planning-in-progress empty state. Each test
+// here uses the same renderPlanMarkdown entry point.
+describe("renderPlanMarkdown — phase-aware display modes", () => {
+  const sampleSpec = {
+    discovery: {
+      intent: "Add observability for widgets",
+      constraints: [],
+      assumptions: [],
+      decisions: [
+        {
+          decision: "Use ETag caching",
+          reason: "Reduces backend load",
+          alternativesRejected: ["Always re-fetch"],
+          consequence: "Clients must handle 304 responses"
+        }
+      ],
+      nonGoals: [],
+      openQuestions: ["What retention applies to historical widget counts?"]
+    },
+    spec: {
+      problem: "There is no view of widget totals.",
+      desiredBehavior: ["GET returns totals", "Pagination supported"],
+      acceptanceCriteria: ["p95 latency under 100ms", "Rate-limit applied"],
+      verification: ["Load test"],
+      risks: []
+    }
+  };
+
+  test("spec-only mode: Shared Understanding section is expanded, includes blockingQuestion blockquote", () => {
+    const md = renderPlanMarkdown({
+      description: "Widget totals API",
+      tier: "STANDARD",
+      assessment: { scope: "medium", risk: "low" },
+      planSubtasks: [],
+      specArtifacts: sampleSpec,
+      currentBlockingQuestion: "Should totals include archived widgets?"
+    });
+
+    expect(md).toContain("# Plan for: Widget totals API");
+    expect(md).toContain("## Shared Understanding");
+    expect(md).not.toContain("<details>");
+    expect(md).toContain("> **Awaiting answer:** Should totals include archived widgets?");
+    expect(md).toContain("### Problem");
+    expect(md).toContain("There is no view of widget totals.");
+    expect(md).toContain("### Desired Behavior");
+    expect(md).toContain("- GET returns totals");
+    expect(md).toContain("### Acceptance Criteria");
+    expect(md).toContain("### Decisions");
+    expect(md).toContain("**Use ETag caching**");
+    expect(md).toContain("Alternatives rejected: Always re-fetch.");
+    expect(md).toContain("### Open Questions");
+    expect(md).toContain("- [ ] What retention applies to historical widget counts?");
+    expect(md).not.toContain("## Subtasks");
+    expect(md).not.toContain("_No subtasks produced yet._");
+    expect(md).not.toContain("_Plan in progress…_");
+  });
+
+  test("spec + subtasks mode: Shared Understanding wraps in <details> and Subtasks follows", () => {
+    const md = renderPlanMarkdown({
+      description: "Widget totals API",
+      tier: "STANDARD",
+      assessment: {},
+      planSubtasks: [
+        {
+          id: "t1-subtask-1",
+          sequence: 1,
+          description: "Wire GET /widgets/totals",
+          agentType: "coder",
+          filesInScope: ["src/widgets/totals.ts"],
+          dependencies: [],
+          testCriteria: ["Returns totals"]
+        }
+      ],
+      specArtifacts: sampleSpec
+    });
+
+    expect(md).toContain("<details><summary>Shared Understanding</summary>");
+    expect(md).toContain("</details>");
+    expect(md).toContain("### Problem");
+    // <details> must precede the ## Subtasks heading
+    expect(md.indexOf("<details>")).toBeLessThan(md.indexOf("## Subtasks"));
+    // Subtasks block still renders the legacy fields
+    expect(md).toContain("### 1. Wire GET /widgets/totals");
+    expect(md).toContain("- **Agent:** coder");
+    expect(md).toContain("- **Files in scope:** `src/widgets/totals.ts`");
+  });
+
+  test("planning-in-progress: state=planning + no artifacts renders 'Plan in progress…'", () => {
+    const md = renderPlanMarkdown({
+      description: "Brand-new task",
+      tier: "STANDARD",
+      assessment: {},
+      planSubtasks: [],
+      state: "planning"
+    });
+    expect(md).toContain("_Plan in progress…_");
+    expect(md).not.toContain("_No subtasks produced yet._");
+  });
+
+  test("legacy empty state: no state field falls back to subtasks-not-produced notice", () => {
+    const md = renderPlanMarkdown({
+      description: "Old-style task",
+      tier: "EXPRESS",
+      assessment: {},
+      planSubtasks: []
+    });
+    expect(md).toContain("_No subtasks produced yet._");
+    expect(md).not.toContain("_Plan in progress…_");
+  });
+
+  test("legacy subtasks-only mode is unchanged when specArtifacts is absent", () => {
+    const md = renderPlanMarkdown({
+      description: "Legacy task",
+      tier: "STANDARD",
+      assessment: { scope: "medium" },
+      planSubtasks: [
+        {
+          id: "legacy-subtask-1",
+          sequence: 1,
+          description: "Do the thing",
+          agentType: "coder",
+          filesInScope: ["src/"],
+          dependencies: [],
+          testCriteria: ["Works"]
+        }
+      ]
+    });
+    expect(md).toContain("## Overview");
+    expect(md).toContain("1 subtask, 1 agent type involved: coder.");
+    expect(md).toContain("## Subtasks");
+    expect(md).toContain("### 1. Do the thing");
+    expect(md).not.toContain("Shared Understanding");
+    expect(md).not.toContain("<details>");
+  });
+});
+
+describe("markdownToHtml — <details> and blockquote support", () => {
+  test("<details><summary>…</summary> / </details> passes through with summary content escaped", () => {
+    const md = [
+      "<details><summary>Shared Understanding</summary>",
+      "",
+      "### Problem",
+      "",
+      "The thing.",
+      "",
+      "</details>"
+    ].join("\n");
+    const html = markdownToHtml(md);
+    expect(html).toContain("<details><summary>Shared Understanding</summary>");
+    expect(html).toContain("</details>");
+    expect(html).toContain("<h3>Problem</h3>");
+    expect(html).toContain("<p>The thing.</p>");
+  });
+
+  test("blockquote `> …` becomes <blockquote> with inline bold preserved", () => {
+    const md = "> **Awaiting answer:** What is the rate limit?";
+    const html = markdownToHtml(md);
+    expect(html).toContain("<blockquote><strong>Awaiting answer:</strong> What is the rate limit?</blockquote>");
+  });
+
+  test("non-recognised raw HTML in source is still escaped (defence in depth)", () => {
+    const md = [
+      "# safe",
+      "<script>alert(1)</script>",
+      "<details><summary>Real wrapper</summary>",
+      "</details>"
+    ].join("\n");
+    const html = markdownToHtml(md);
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    // …but our two recognised tags do come through
+    expect(html).toContain("<details>");
+    expect(html).toContain("</details>");
+  });
+});
+
+describe("renderSpecMarkdown", () => {
+  test("without artifacts shows blocking question and fallback body", () => {
+    const md = renderSpecMarkdown({
+      description: "Ship widgets",
+      tier: "STANDARD",
+      assessment: { scope: "multi" },
+      currentBlockingQuestion: "Which datastore?",
+      specArtifacts: null
+    });
+    expect(md).toContain("# Spec review: Ship widgets");
+    expect(md).toContain("**Tier:** STANDARD");
+    expect(md).toContain("## Blocking question");
+    expect(md).toContain("_Which datastore?_");
+    expect(md).toContain("_No structured discovery/spec payload");
+  });
+
+  test("renders discovery, decisions, and spec sections", () => {
+    const md = renderSpecMarkdown({
+      description: "Feature X",
+      tier: "THOROUGH",
+      assessment: {},
+      specArtifacts: {
+        discovery: {
+          intent: "Expose widget counts via API",
+          constraints: ["Rate limiting"],
+          assumptions: ["Redis exists"],
+          decisions: [
+            {
+              decision: "Use pagination",
+              reason: "Large catalogs",
+              alternativesRejected: ["Full scan"],
+              consequence: "More requests"
+            }
+          ],
+          nonGoals: ["Admin UI"],
+          openQuestions: ["Retention policy"]
+        },
+        spec: {
+          problem: "No observability into widgets.",
+          desiredBehavior: ["GET returns totals"],
+          acceptanceCriteria: ["p95 under 100ms"],
+          verification: ["Load test"],
+          risks: ["Cache stampedes"]
+        }
+      }
+    });
+    expect(md).toContain("### Intent");
+    expect(md).toContain("Expose widget counts via API");
+    expect(md).toContain("### Constraints");
+    expect(md).toContain("- Rate limiting");
+    expect(md).toContain("**Use pagination**");
+    expect(md).toContain("Alternatives rejected: Full scan");
+    expect(md).toContain("## Spec");
+    expect(md).toContain("No observability into widgets.");
+    expect(md).toContain("### Desired behavior");
+    expect(md).toContain("- GET returns totals");
+  });
+
+  test("roundtrip to HTML includes headings from renderSpecMarkdown", () => {
+    const md = renderSpecMarkdown({
+      description: "Z",
+      tier: "STANDARD",
+      assessment: {},
+      specArtifacts: {
+        discovery: { intent: "I", constraints: [], assumptions: [], decisions: [], nonGoals: [], openQuestions: [] },
+        spec: {
+          problem: "P",
+          desiredBehavior: [],
+          acceptanceCriteria: [],
+          verification: [],
+          risks: []
+        }
+      }
+    });
+    const html = markdownToHtml(md);
+    expect(html).toContain("<h1>Spec review: Z</h1>");
+    expect(html).toContain("<h2>Discovery</h2>");
+    expect(html).toContain("<h2>Spec</h2>");
   });
 });
 

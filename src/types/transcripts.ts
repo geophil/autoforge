@@ -13,11 +13,14 @@ export interface AgentTranscriptInput {
   tokenInput: number | null;
   tokenOutput: number | null;
   elapsedSeconds: number | null;
+  /** When set, scopes transcript rows to a post-rollback retry era for iteration budgets. */
+  rollbackEventId?: string | null;
 }
 
 export interface AgentTranscriptRow extends AgentTranscriptInput {
   id: string;
   createdAt: string;
+  rollbackEventId?: string | null;
 }
 
 export interface AgentTranscriptMeta {
@@ -32,4 +35,5 @@ export interface AgentTranscriptMeta {
   tokenInput: number | null;
   tokenOutput: number | null;
   elapsedSeconds: number | null;
+  rollbackEventId?: string | null;
 }

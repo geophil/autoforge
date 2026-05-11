@@ -226,6 +226,12 @@ private agentEnvironment(): Record<string, string> {
 
 `LocalWorkspace.exec()` enforces the same invariant for shell commands: it builds a child process env from a small allowlist (`PATH`, `HOME`, `TMPDIR`, `SHELL`) plus explicit task environment. It does not spread `process.env`, so model-facing tools cannot print orchestrator API keys.
 
+### Planner Must Return QMD Evidence When QMD Is Configured
+
+Planner prompts receive `QMD_MCP_URL` through `agentEnvironment()` and the planner skill (`skills/writing-plans.md`) requires QMD-first context gathering. The orchestrator now enforces that planner outputs include `planningContext.qmdContext` evidence when `QMD_MCP_URL` is present.
+
+If the planner output does not include usable QMD evidence (`status: "used"` with at least one query or retrieved document), orchestration pauses in `awaiting_intervention` with `failure_category=planner_missing_qmd_context`.
+
 ## Core Flows
 
 ### ClaudeCodeExecutor.execute Flow

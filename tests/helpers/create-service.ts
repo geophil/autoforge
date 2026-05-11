@@ -11,6 +11,7 @@ import { MockExecutor } from "../../src/executors/mock";
 import type { AgentTask, AgentResult } from "../../src/executors/interface";
 
 type Handlers = Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult | Promise<AgentResult>>>;
+type EnvOverrides = Partial<Record<string, string>>;
 
 export interface TestService {
   service: OrchestratorService;
@@ -21,7 +22,7 @@ export interface TestService {
 
 const pendingCleanups = new Set<() => void>();
 
-export function createTestService(handlers: Handlers = {}): TestService {
+export function createTestService(handlers: Handlers = {}, envOverrides: EnvOverrides = {}): TestService {
   // realpathSync resolves macOS's /var -> /private/var symlink so that
   // prefix comparisons against paths reported by `git worktree list`
   // (which always report the resolved form) succeed.
@@ -38,7 +39,8 @@ export function createTestService(handlers: Handlers = {}): TestService {
     DATABASE_PATH: dbPath,
     EXECUTOR_DEFAULT: "mock",
     REVIEW_SCORE_THRESHOLD: "0.7",
-    TEST_PASS_THRESHOLD: "1"
+    TEST_PASS_THRESHOLD: "1",
+    ...envOverrides
   });
 
   const executor = new MockExecutor(handlers);

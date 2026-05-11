@@ -165,7 +165,7 @@ describe("agent_transcripts schema - persona_version_id migration", () => {
 
     const rows = db.sqlite
       .query("SELECT attempt, persona_version_id FROM agent_transcripts WHERE task_id = ? AND stage = ? ORDER BY attempt ASC")
-      .all("task-variant", "planner") as Array<{ attempt: number; persona_version_id: string | null }>;
+      .all("task-variant", "planner:execution_plan") as Array<{ attempt: number; persona_version_id: string | null }>;
 
     expect(rows).toEqual([
       { attempt: 0, persona_version_id: "persona-v1" },
@@ -279,7 +279,7 @@ describe("agent_transcripts schema - persona_version_id migration", () => {
 
     const rows = db.sqlite
       .query("SELECT attempt, persona_version_id FROM agent_transcripts WHERE task_id = ? AND stage = ? ORDER BY attempt ASC")
-      .all("task-retry-window", "planner") as Array<{ attempt: number; persona_version_id: string | null }>;
+      .all("task-retry-window", "planner:execution_plan") as Array<{ attempt: number; persona_version_id: string | null }>;
 
     expect(rows).toEqual([
       { attempt: 0, persona_version_id: null },

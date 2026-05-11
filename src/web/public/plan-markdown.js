@@ -1,8 +1,9 @@
 // Plan markdown helpers.
 //
-// Two exports:
-//   - renderPlanMarkdown(task)  -> markdown string
-//   - markdownToHtml(md)        -> HTML string (tiny, safe renderer for the subset emitted by renderPlanMarkdown)
+// Exports:
+//   - renderPlanMarkdown(task)  -> markdown string (execution plan / subtasks)
+//   - renderSpecMarkdown(task)   -> markdown string (discovery + spec)
+//   - markdownToHtml(md)        -> HTML string (tiny, safe renderer for the subset emitted by the render* functions)
 //
 // Loaded both in the browser (via <script src>) and in Bun tests
 // (via import or require). See trailing shim.
@@ -34,32 +35,87 @@ function humanizeDep(dep, subtasksById) {
   return dep;
 }
 
-// Pure: shape PlanSubtask[] (+ task context) into a markdown document.
-// Accepts a task-like object with { description, tier, assessment, planSubtasks }.
-function renderPlanMarkdown(task) {
-  const description = oneLine(task?.description) || "(no description)";
-  const tier = task?.tier || "—";
-  const assessment = task?.assessment || {};
-  const subtasks = Array.isArray(task?.planSubtasks) ? task.planSubtasks : [];
+// Append a "Shared Understanding" section (markdown) describing approved
+// discovery + spec artifacts to `lines`. When `collapsed` is true, wraps the
+// section in `<details><summary>…</summary></details>` for the dashboard's
+// awaiting_plan_approval card.
+function appendSharedUnderstanding(lines, specArtifacts, blockingQuestion, collapsed) {
+  const discovery = specArtifacts.discovery && typeof specArtifacts.discovery === "object"
+    ? specArtifacts.discovery
+    : {};
+  const spec = specArtifacts.spec && typeof specArtifacts.spec === "object"
+    ? specArtifacts.spec
+    : {};
 
-  const lines = [];
-  lines.push(`# Plan for: ${description}`);
-  lines.push("");
-
-  const signalBits = [`**Tier:** ${tier}`];
-  if (assessment.scope) signalBits.push(`**Scope:** ${assessment.scope}`);
-  if (assessment.risk) signalBits.push(`**Risk:** ${assessment.risk}`);
-  if (assessment.coupling) signalBits.push(`**Coupling:** ${assessment.coupling}`);
-  if (assessment.novelty) signalBits.push(`**Novelty:** ${assessment.novelty}`);
-  lines.push(signalBits.join("  •  "));
-  lines.push("");
-
-  lines.push("## Overview");
-  if (subtasks.length === 0) {
-    lines.push("_No subtasks produced yet._");
+  if (collapsed) {
+    lines.push("<details><summary>Shared Understanding</summary>");
     lines.push("");
-    return lines.join("\n");
+  } else {
+    lines.push("## Shared Understanding");
+    lines.push("");
   }
+
+  if (blockingQuestion && String(blockingQuestion).trim()) {
+    lines.push(`> **Awaiting answer:** ${oneLine(blockingQuestion)}`);
+    lines.push("");
+  }
+
+  if (spec.problem && String(spec.problem).trim()) {
+    lines.push("### Problem");
+    lines.push("");
+    lines.push(oneLine(spec.problem));
+    lines.push("");
+  }
+
+  const pushBullets = (heading, items) => {
+    const arr = Array.isArray(items) ? items.map((x) => oneLine(String(x))).filter(Boolean) : [];
+    if (arr.length === 0) return;
+    lines.push(`### ${heading}`);
+    lines.push("");
+    for (const x of arr) lines.push(`- ${x}`);
+    lines.push("");
+  };
+
+  pushBullets("Desired Behavior", spec.desiredBehavior);
+  pushBullets("Acceptance Criteria", spec.acceptanceCriteria);
+
+  const decisions = Array.isArray(discovery.decisions) ? discovery.decisions : [];
+  if (decisions.length > 0) {
+    lines.push("### Decisions");
+    lines.push("");
+    for (const dec of decisions) {
+      if (!dec || typeof dec !== "object") continue;
+      const title = oneLine(dec.decision) || "(decision)";
+      const parts = [`**${title}**`];
+      if (dec.reason) parts.push(`— ${oneLine(dec.reason)}.`);
+      const alt = Array.isArray(dec.alternativesRejected)
+        ? dec.alternativesRejected.map((x) => oneLine(String(x))).filter(Boolean)
+        : [];
+      if (alt.length > 0) parts.push(`Alternatives rejected: ${alt.join("; ")}.`);
+      if (dec.consequence) parts.push(`Consequence: ${oneLine(dec.consequence)}.`);
+      lines.push(parts.join(" "));
+      lines.push("");
+    }
+  }
+
+  const openQuestions = Array.isArray(discovery.openQuestions)
+    ? discovery.openQuestions.map((x) => oneLine(String(x))).filter(Boolean)
+    : [];
+  if (openQuestions.length > 0) {
+    lines.push("### Open Questions");
+    lines.push("");
+    for (const q of openQuestions) lines.push(`- [ ] ${q}`);
+    lines.push("");
+  }
+
+  if (collapsed) {
+    lines.push("</details>");
+    lines.push("");
+  }
+}
+
+function appendSubtasks(lines, subtasks) {
+  lines.push("## Overview");
   const agentTypes = [...new Set(subtasks.map((s) => s?.agentType || "coder"))];
   const count = subtasks.length;
   lines.push(
@@ -68,7 +124,6 @@ function renderPlanMarkdown(task) {
   );
   lines.push("");
 
-  // Build id -> sequence map once for dependency humanization.
   const subtasksById = new Map();
   subtasks.forEach((s, idx) => {
     if (s && typeof s.id === "string") {
@@ -113,6 +168,175 @@ function renderPlanMarkdown(task) {
 
     lines.push("");
   });
+}
+
+// True when specArtifacts has a meaningful body (matches normalizeSpecArtifacts on the orchestrator side).
+function hasSpecBody(specArtifacts) {
+  if (!specArtifacts || typeof specArtifacts !== "object") return false;
+  const intent = specArtifacts.discovery?.intent;
+  const problem = specArtifacts.spec?.problem;
+  return (
+    (typeof intent === "string" && intent.trim().length > 0) ||
+    (typeof problem === "string" && problem.trim().length > 0)
+  );
+}
+
+// Pure: shape PlanSubtask[] (+ task context, optional spec artifacts) into a
+// markdown document. Renders one of four modes:
+//
+//   1. Spec-only (`specArtifacts` present, `planSubtasks` empty): Shared Understanding section, expanded.
+//   2. Subtasks-only (no specArtifacts, planSubtasks non-empty): legacy behavior.
+//   3. Spec + subtasks (both present): Shared Understanding in a collapsed <details> block, then Subtasks.
+//   4. Neither: `_Plan in progress…_` when state is planning/replanning, else `_No subtasks produced yet._`.
+//
+// Accepts a task-like object with { description, tier, assessment, planSubtasks,
+// specArtifacts?, currentBlockingQuestion?, state? }.
+function renderPlanMarkdown(task) {
+  const description = oneLine(task?.description) || "(no description)";
+  const tier = task?.tier || "—";
+  const assessment = task?.assessment || {};
+  const subtasks = Array.isArray(task?.planSubtasks) ? task.planSubtasks : [];
+  const specArtifacts = task?.specArtifacts ?? null;
+  const blockingQuestion = task?.currentBlockingQuestion;
+  const state = task?.state;
+
+  const lines = [];
+  lines.push(`# Plan for: ${description}`);
+  lines.push("");
+
+  const signalBits = [`**Tier:** ${tier}`];
+  if (assessment.scope) signalBits.push(`**Scope:** ${assessment.scope}`);
+  if (assessment.risk) signalBits.push(`**Risk:** ${assessment.risk}`);
+  if (assessment.coupling) signalBits.push(`**Coupling:** ${assessment.coupling}`);
+  if (assessment.novelty) signalBits.push(`**Novelty:** ${assessment.novelty}`);
+  lines.push(signalBits.join("  •  "));
+  lines.push("");
+
+  const hasSpec = hasSpecBody(specArtifacts);
+  const hasSubtasks = subtasks.length > 0;
+
+  if (hasSpec && !hasSubtasks) {
+    appendSharedUnderstanding(lines, specArtifacts, blockingQuestion, /* collapsed */ false);
+    return lines.join("\n").replace(/\n+$/, "\n");
+  }
+
+  if (hasSpec && hasSubtasks) {
+    appendSharedUnderstanding(lines, specArtifacts, blockingQuestion, /* collapsed */ true);
+    appendSubtasks(lines, subtasks);
+    return lines.join("\n").replace(/\n+$/, "\n");
+  }
+
+  if (hasSubtasks) {
+    appendSubtasks(lines, subtasks);
+    return lines.join("\n").replace(/\n+$/, "\n");
+  }
+
+  // Neither spec nor subtasks. Surface a state-aware empty notice so operators
+  // distinguish "still planning" from "planner produced nothing".
+  lines.push("## Overview");
+  if (state === "planning" || state === "replanning" || state === "assessing") {
+    lines.push("_Plan in progress…_");
+  } else {
+    lines.push("_No subtasks produced yet._");
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+/**
+ * Markdown document for discovery/spec artifacts shown during awaiting_spec_approval.
+ */
+function renderSpecMarkdown(task) {
+  const description = oneLine(task?.description) || "(no description)";
+  const tier = task?.tier || "—";
+  const assessment = task?.assessment || {};
+
+  const lines = [];
+  lines.push(`# Spec review: ${description}`);
+  lines.push("");
+
+  const signalBits = [`**Tier:** ${tier}`];
+  if (assessment.scope) signalBits.push(`**Scope:** ${assessment.scope}`);
+  if (assessment.risk) signalBits.push(`**Risk:** ${assessment.risk}`);
+  if (assessment.coupling) signalBits.push(`**Coupling:** ${assessment.coupling}`);
+  if (assessment.novelty) signalBits.push(`**Novelty:** ${assessment.novelty}`);
+  lines.push(signalBits.join("  •  "));
+  lines.push("");
+
+  const blocking = task?.currentBlockingQuestion;
+  if (blocking && String(blocking).trim()) {
+    lines.push("## Blocking question");
+    lines.push("");
+    lines.push(`_${oneLine(blocking)}_`);
+    lines.push("");
+  }
+
+  const art = task?.specArtifacts;
+  if (!art || typeof art !== "object") {
+    lines.push("## Discovery & spec");
+    lines.push("");
+    lines.push("_No structured discovery/spec payload — address the blocking question or request a revision._");
+    lines.push("");
+    return lines.join("\n").replace(/\n+$/, "\n");
+  }
+
+  const d = art.discovery && typeof art.discovery === "object" ? art.discovery : {};
+  const specBlock = art.spec && typeof art.spec === "object" ? art.spec : {};
+
+  const pushSimpleBullets = (heading, items) => {
+    const arr = Array.isArray(items) ? items.map((x) => oneLine(String(x))).filter(Boolean) : [];
+    if (arr.length === 0) return;
+    lines.push(`### ${heading}`);
+    lines.push("");
+    for (const x of arr) {
+      lines.push(`- ${x}`);
+    }
+    lines.push("");
+  };
+
+  lines.push("## Discovery");
+  lines.push("");
+  if (d.intent && String(d.intent).trim()) {
+    lines.push(`### Intent`);
+    lines.push("");
+    lines.push(oneLine(d.intent));
+    lines.push("");
+  }
+
+  pushSimpleBullets("Constraints", d.constraints);
+  pushSimpleBullets("Assumptions", d.assumptions);
+  pushSimpleBullets("Non-goals", d.nonGoals);
+  pushSimpleBullets("Open questions", d.openQuestions);
+
+  const decisions = Array.isArray(d.decisions) ? d.decisions : [];
+  if (decisions.length > 0) {
+    lines.push("### Decisions");
+    lines.push("");
+    for (const dec of decisions) {
+      if (!dec || typeof dec !== "object") continue;
+      const title = oneLine(dec.decision) || "(decision)";
+      lines.push(`- **${title}**`);
+      if (dec.reason) lines.push(`  - Reason: ${oneLine(dec.reason)}`);
+      const alt = Array.isArray(dec.alternativesRejected)
+        ? dec.alternativesRejected.map((x) => oneLine(String(x))).filter(Boolean)
+        : [];
+      if (alt.length > 0) lines.push(`  - Alternatives rejected: ${alt.join("; ")}`);
+      if (dec.consequence) lines.push(`  - Consequence: ${oneLine(dec.consequence)}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("## Spec");
+  lines.push("");
+  if (specBlock.problem && String(specBlock.problem).trim()) {
+    lines.push(oneLine(specBlock.problem));
+    lines.push("");
+  }
+
+  pushSimpleBullets("Desired behavior", specBlock.desiredBehavior);
+  pushSimpleBullets("Acceptance criteria", specBlock.acceptanceCriteria);
+  pushSimpleBullets("Verification", specBlock.verification);
+  pushSimpleBullets("Risks", specBlock.risks);
 
   return lines.join("\n").replace(/\n+$/, "\n");
 }
@@ -122,10 +346,15 @@ function renderPlanMarkdown(task) {
 //   - - unordered list items (two levels of indent)
 //   - **bold** and `inline code` inline
 //   - _italic_ (single underscore pair)
+//   - > blockquotes (single-line)
+//   - <details><summary>…</summary> / </details> wrappers (the only raw HTML
+//     this renderer emits — used by renderPlanMarkdown for collapsed Shared
+//     Understanding panels)
 //   - blank lines separate paragraphs
 //
-// Escapes all input first, then re-enables structural HTML. Safe because
-// escaping happens before any tag insertion.
+// Escapes all input first, then re-enables structural HTML. The <details>
+// path is safe because input is generated by renderPlanMarkdown — a closed
+// loop. We still escape the summary text via applyInline.
 function markdownToHtml(md) {
   const raw = String(md ?? "");
   const src = escHtml(raw).split("\n");
@@ -143,6 +372,29 @@ function markdownToHtml(md) {
 
     // Blank line — skip.
     if (line.trim() === "") {
+      i++;
+      continue;
+    }
+
+    // <details><summary>…</summary> / </details>. These are the only raw HTML
+    // tags this renderer recognises. Note: input was escaped above, so the
+    // tags appear as &lt;details&gt; etc. here.
+    const detailsOpen = line.match(/^&lt;details&gt;\s*&lt;summary&gt;(.*?)&lt;\/summary&gt;\s*$/);
+    if (detailsOpen) {
+      out.push(`<details><summary>${applyInline(detailsOpen[1])}</summary>`);
+      i++;
+      continue;
+    }
+    if (/^&lt;\/details&gt;\s*$/.test(line)) {
+      out.push("</details>");
+      i++;
+      continue;
+    }
+
+    // Blockquote — single-line `> …`. Wraps the line content in a <blockquote>.
+    const blockquote = line.match(/^&gt;\s+(.*)$/);
+    if (blockquote) {
+      out.push(`<blockquote>${applyInline(blockquote[1])}</blockquote>`);
       i++;
       continue;
     }
@@ -219,13 +471,18 @@ function markdownToHtml(md) {
     }
 
     // Default: paragraph (collect consecutive non-blank, non-structural lines).
+    const isStructural = (s) =>
+      /^(#{1,6})\s+/.test(s) ||
+      /^(\s{0,4})[-*]\s+/.test(s) ||
+      /^&gt;\s+/.test(s) ||
+      /^&lt;details&gt;\s*&lt;summary&gt;/.test(s) ||
+      /^&lt;\/details&gt;\s*$/.test(s);
     const para = [line];
     i++;
     while (
       i < src.length &&
       src[i].trim() !== "" &&
-      !/^(#{1,6})\s+/.test(src[i]) &&
-      !/^(\s{0,4})[-*]\s+/.test(src[i])
+      !isStructural(src[i])
     ) {
       para.push(src[i]);
       i++;
@@ -239,10 +496,11 @@ function markdownToHtml(md) {
 // Browser exposure.
 if (typeof window !== "undefined") {
   window.renderPlanMarkdown = renderPlanMarkdown;
+  window.renderSpecMarkdown = renderSpecMarkdown;
   window.markdownToHtml = markdownToHtml;
 }
 
 // Node / Bun tests (CommonJS).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { renderPlanMarkdown, markdownToHtml };
+  module.exports = { renderPlanMarkdown, renderSpecMarkdown, markdownToHtml };
 }
