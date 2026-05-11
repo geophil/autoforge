@@ -1392,3 +1392,112 @@ button:disabled:not(.btn-working) {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+
+/* -----------------------------------------------------------------------
+   Execution Progress header — shown for executing/reviewing/reworking/documenting states
+   ----------------------------------------------------------------------- */
+.exec-progress-section {
+  border-left: 3px solid var(--orange);
+}
+
+.exec-progress-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.exec-progress-title {
+  /* Uses .detail-section h3 base styles (uppercase, muted, small) */
+  margin-bottom: 0 !important;
+}
+
+.exec-progress-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.exec-iter {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.exec-subtasks-done {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.exec-placeholder {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.exec-active {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  background: var(--bg-surface-hover);
+  border-radius: var(--radius-sm);
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.exec-active-seq {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.exec-active-agent {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background: var(--orange-dim);
+  color: var(--orange);
+  flex-shrink: 0;
+}
+
+.exec-active-desc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.exec-active-elapsed {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.exec-tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.8rem;
+}
+
+.exec-token-stat {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.exec-token-label {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}

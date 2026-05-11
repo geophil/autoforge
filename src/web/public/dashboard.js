@@ -6,6 +6,7 @@ let currentTaskId = null;
 let plannerMaxIterations = 3;
 let plannerSpecMaxIterations = 3;
 let taskListTab = 'active'; // 'active' | 'archived'
+let currentTask = null;
 
 // --- DOM refs ---
 const badge = document.getElementById("connection-badge");
@@ -95,6 +96,13 @@ async function refreshTasks() {
 const RUNNING_STATES = new Set([
   "assessing", "planning", "replanning", "executing", "reviewing", "reworking", "documenting"
 ]);
+
+// States that display the Execution Progress header in the task detail view
+const EXECUTION_STATES = new Set(["executing", "reviewing", "reworking", "documenting"]);
+
+// Maximum rework iterations shown in the Execution Progress header
+// (hardcoded rework cap; use server config if a dedicated setting is added later)
+const REWORK_MAX = 3;
 
 function renderTaskList() {
   if (tasks.length === 0) {
@@ -230,6 +238,7 @@ function collectPendingSteeringEvents(events) {
 }
 
 function renderTaskDetail(task) {
+  currentTask = task;
   const assessment = task.assessment || {};
   const subtasks = task.planSubtasks || [];
 
@@ -540,6 +549,11 @@ function renderTaskDetail(task) {
       ${assessment.rationale ? `<p style="margin-top: 0.75rem; font-size: 0.85rem; color: var(--text-muted);">${esc(assessment.rationale)}</p>` : ""}
     </div>
 
+    ${EXECUTION_STATES.has(task.state) ? `
+    <div class="detail-section exec-progress-section" id="exec-progress-header">
+      ${renderExecProgressContent(task, [])}
+    </div>` : ""}
+
     ${subtasks.length > 0 ? (() => {
       const subtaskCards = subtasks.map((s) => `
         <div class="subtask-item" data-subtask-id="${esc(s.id)}" data-subtask-status="pending">
@@ -586,6 +600,145 @@ function renderTaskDetail(task) {
   wireCritiqueInput(task);
   wireSpecCritiqueInput(task);
   loadEvents(task.id);
+}
+
+/**
+ * Compute execution progress info from the event list for the current task.
+ * Returns current iteration, how many subtasks are done in that iteration,
+ * the active subtask object (if any), and elapsed seconds since it started.
+ */
+function computeExecProgressInfo(task, events) {
+  const currentIteration = task.iteration ?? 1;
+  const subtasks = task.planSubtasks || [];
+  const totalSubtasks = subtasks.length;
+
+  // Determine if modern subtask_started events are present (with iteration info)
+  const hasStartedEvents = events.some(
+    (ev) => ev.type === "subtask_started" && ev.payload?.iteration != null
+  );
+
+  let doneInCurrentIter = 0;
+  let activeSubtask = null;
+  let activeStartedEvent = null;
+
+  if (hasStartedEvents) {
+    // Walk events to find the last subtask_started index per subtask in the
+    // current iteration, and whether a subtask_done appeared after it.
+    const lastStartedIdx = {}; // subtaskId -> event index
+    const doneIndicesBySubtaskId = {}; // subtaskId -> [event indices]
+
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
+      if (ev.type === "subtask_started" && ev.payload?.subtaskId) {
+        if (ev.payload.iteration === currentIteration) {
+          lastStartedIdx[ev.payload.subtaskId] = i;
+        }
+      }
+      if (ev.type === "subtask_done" && ev.payload?.subtaskId) {
+        const sid = ev.payload.subtaskId;
+        if (!doneIndicesBySubtaskId[sid]) doneIndicesBySubtaskId[sid] = [];
+        doneIndicesBySubtaskId[sid].push(i);
+      }
+    }
+
+    let lastActiveIdx = -1;
+    for (const [subtaskId, startIdx] of Object.entries(lastStartedIdx)) {
+      const doneIndices = doneIndicesBySubtaskId[subtaskId] || [];
+      const hasDoneAfterStart = doneIndices.some((di) => di > startIdx);
+      if (hasDoneAfterStart) {
+        doneInCurrentIter++;
+      } else if (startIdx > lastActiveIdx) {
+        lastActiveIdx = startIdx;
+        activeSubtask = subtasks.find((s) => s.id === subtaskId) || null;
+        activeStartedEvent = events[startIdx];
+      }
+    }
+  } else {
+    // Legacy path: no subtask_started events — infer from subtask_done only
+    const doneIds = new Set();
+    for (const ev of events) {
+      if (ev.type === "subtask_done" && ev.payload?.subtaskId) {
+        doneIds.add(ev.payload.subtaskId);
+      }
+    }
+    doneInCurrentIter = doneIds.size;
+    activeSubtask = subtasks.find((s) => !doneIds.has(s.id)) || null;
+  }
+
+  let elapsedSeconds = null;
+  if (activeStartedEvent?.timestamp) {
+    elapsedSeconds = (Date.now() - new Date(activeStartedEvent.timestamp).getTime()) / 1000;
+  }
+
+  return { currentIteration, doneInCurrentIter, totalSubtasks, activeSubtask, elapsedSeconds };
+}
+
+/**
+ * Render the Execution Progress header HTML content.
+ * Called with empty events on initial paint (shows placeholders),
+ * and again with real events after loadEvents completes.
+ */
+function renderExecProgressContent(task, events) {
+  const { currentIteration, doneInCurrentIter, totalSubtasks, activeSubtask, elapsedSeconds } =
+    computeExecProgressInfo(task, events);
+
+  const hasEvents = events.length > 0;
+  const { inputTokens, outputTokens, estimatedCostUsd } = summarizeTokenUsage(events);
+
+  const stateBadge = `<span class="badge badge-state" data-state="${esc(task.state)}">${formatState(task.state)}</span>`;
+  const iterLine = `<span class="exec-iter">Iteration ${currentIteration} of ${REWORK_MAX}</span>`;
+  const subtaskNoun = totalSubtasks !== 1 ? "subtasks" : "subtask";
+  const subtaskLine = hasEvents
+    ? `<span class="exec-subtasks-done">${doneInCurrentIter} of ${totalSubtasks} ${subtaskNoun} done in iteration ${currentIteration}</span>`
+    : `<span class="exec-subtasks-done exec-placeholder">— of ${totalSubtasks} ${subtaskNoun} done</span>`;
+
+  let activeHtml;
+  if (activeSubtask) {
+    const desc = activeSubtask.description || "";
+    const truncDesc = desc.length > 80 ? desc.slice(0, 77) + "…" : desc;
+    const agentType = activeSubtask.agentType ?? "coder";
+    const elapsedSpan = elapsedSeconds != null
+      ? `<span class="exec-active-elapsed">${formatElapsed(elapsedSeconds)}</span>`
+      : "";
+    activeHtml = `
+      <div class="exec-active">
+        <span class="exec-active-seq">#${activeSubtask.sequence}</span>
+        <span class="exec-active-agent">${esc(agentType)}</span>
+        <span class="exec-active-desc">${esc(truncDesc)}</span>
+        ${elapsedSpan}
+      </div>`;
+  } else if (!hasEvents) {
+    activeHtml = `<div class="exec-active exec-placeholder">Loading active subtask…</div>`;
+  } else {
+    activeHtml = `<div class="exec-active exec-placeholder">No active subtask</div>`;
+  }
+
+  const tokensHtml = hasEvents && (inputTokens > 0 || outputTokens > 0)
+    ? `<div class="exec-tokens">
+        <span class="exec-token-stat"><span class="exec-token-label">Input</span> ${inputTokens.toLocaleString()}</span>
+        <span class="exec-token-stat"><span class="exec-token-label">Output</span> ${outputTokens.toLocaleString()}</span>
+        <span class="exec-token-stat"><span class="exec-token-label">Est. cost</span> $${estimatedCostUsd.toFixed(4)}</span>
+      </div>`
+    : `<div class="exec-tokens exec-placeholder">Token usage will appear after the first agent event.</div>`;
+
+  return `
+    <div class="exec-progress-title-row">
+      <h3 class="exec-progress-title">Execution Progress</h3>
+      ${stateBadge}
+    </div>
+    <div class="exec-progress-meta">
+      ${iterLine}
+      ${subtaskLine}
+    </div>
+    ${activeHtml}
+    ${tokensHtml}`;
+}
+
+/** Update the exec progress header in-place after events load. */
+function updateExecProgressHeader(events) {
+  const header = document.getElementById("exec-progress-header");
+  if (!header || !currentTask) return;
+  header.innerHTML = renderExecProgressContent(currentTask, events);
 }
 
 function wireCritiqueInput(task) {
@@ -744,6 +897,7 @@ async function loadEvents(taskId) {
     }
 
     markSubtaskProgress(events);
+    if (currentTask && currentTask.id === taskId) updateExecProgressHeader(events);
   } catch {
     container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Could not load events.</span>`;
   }
