@@ -25,6 +25,46 @@ export type AutoforgeMessage<T = unknown> = Omit<z.infer<typeof AutoforgeMessage
   payload: T;
 };
 
+export const WorkspaceToolRequestSchema = z.object({
+  correlationId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  toolName: z.string().min(1),
+  input: z.record(z.string(), z.unknown()).default({})
+});
+
+export const WorkspaceToolResponseSchema = z.object({
+  correlationId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  ok: z.boolean(),
+  result: z.unknown().optional(),
+  error: z.string().optional()
+});
+
+export const WorkspaceToolStreamSchema = z.object({
+  correlationId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  stream: z.enum(["stdout", "stderr"]),
+  chunk: z.string()
+});
+
+export type WorkspaceToolRequest = z.infer<typeof WorkspaceToolRequestSchema>;
+export type WorkspaceToolResponse = z.infer<typeof WorkspaceToolResponseSchema>;
+export type WorkspaceToolStream = z.infer<typeof WorkspaceToolStreamSchema>;
+
 export function taskSubject(projectId: string, taskId: string, event: string): string {
   return `autoforge.task.${projectId}.${taskId}.${event}`;
+}
+
+export function workspaceSubject(
+  workspaceId: string,
+  kind: "request" | "response" | "stream",
+  correlationId?: string
+): string {
+  if (kind === "request") {
+    return `autoforge.workspace.${workspaceId}.tool.request`;
+  }
+  if (!correlationId) {
+    throw new Error(`workspace ${kind} subject requires a correlation id`);
+  }
+  return `autoforge.workspace.${workspaceId}.tool.${kind}.${correlationId}`;
 }
