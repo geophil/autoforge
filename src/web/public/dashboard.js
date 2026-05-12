@@ -979,23 +979,34 @@ function updateSubtaskCards(events, task) {
 
     // Determine current status for this subtask
     let status = "pending";
-    let latestDoneEvent = null;
-    let latestStartedEvent = null;
+    let latestDoneEvent = null;    // latest done event (any iteration) — for runtime display
+    let latestStartedEvent = null; // latest started event (any iteration) — for history strip
+    let currentIterStartedEvent = null; // current iteration started event — for live elapsed
     let latestIter = null;
 
     if (hasStartedEvents) {
       const runs = subtaskRuns[subtaskId] || {};
       const iters = Object.keys(runs).map(Number).sort((a, b) => a - b);
+
+      // Latest run data across all iterations — for runtime display and history strip failure dot
       if (iters.length > 0) {
         latestIter = iters[iters.length - 1];
         const latestRun = runs[latestIter];
         latestStartedEvent = latestRun.startedEvent;
         latestDoneEvent = latestRun.doneEvent;
+      }
 
-        if (latestDoneEvent) {
-          const s = latestDoneEvent.payload?.status ?? latestDoneEvent.status ?? "done";
+      // Status is driven by the CURRENT iteration specifically:
+      //   running = subtask_started exists in current iteration with no matching subtask_done
+      //   done/done_with_concerns = from subtask_done status field in current iteration
+      //   failed = failure_analysis whose payload.subtask_id matches (any iteration)
+      const currentIterRun = runs[currentIteration];
+      if (currentIterRun) {
+        currentIterStartedEvent = currentIterRun.startedEvent;
+        if (currentIterRun.doneEvent) {
+          const s = currentIterRun.doneEvent.payload?.status ?? currentIterRun.doneEvent.status ?? "done";
           status = s === "done_with_concerns" ? "done_with_concerns" : "done";
-        } else if (latestStartedEvent) {
+        } else if (currentIterRun.startedEvent) {
           status = failedSubtaskIds.has(subtaskId) ? "failed" : "running";
         }
       } else if (failedSubtaskIds.has(subtaskId)) {
@@ -1016,7 +1027,8 @@ function updateSubtaskCards(events, task) {
     // --- Populate runtime div (executor, elapsed, tokens) ---
     const runtimeEl = el.querySelector(".subtask-runtime");
     if (runtimeEl) {
-      if (latestDoneEvent || latestStartedEvent) {
+      // Show runtime info if there is a completed run (any iteration) or we are live-running
+      if (latestDoneEvent || (currentIterStartedEvent && status === "running")) {
         const parts = [];
 
         let executorUsed = null;
@@ -1024,6 +1036,7 @@ function updateSubtaskCards(events, task) {
         let tokenDisplay = null;
 
         if (latestDoneEvent) {
+          // Executor/elapsed/tokens from most recent completed run
           executorUsed =
             latestDoneEvent.payload?.executorUsed ??
             latestDoneEvent.payload?.executor_used ??
@@ -1044,9 +1057,10 @@ function updateSubtaskCards(events, task) {
             ).toFixed(4);
             tokenDisplay = `${tu.input.toLocaleString()} in / ${tu.output.toLocaleString()} out · $${cost}`;
           }
-        } else if (latestStartedEvent && status === "running") {
+        } else if (currentIterStartedEvent && status === "running") {
+          // Live elapsed from the current iteration's started event (executor unknown until done)
           const elapsed =
-            (Date.now() - new Date(latestStartedEvent.timestamp).getTime()) / 1000;
+            (Date.now() - new Date(currentIterStartedEvent.timestamp).getTime()) / 1000;
           elapsedDisplay = formatElapsed(elapsed);
         }
 
