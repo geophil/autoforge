@@ -1,4 +1,4 @@
 {
   "status": "DONE",
-  "artifacts": ["tests/unit/subtask-started.test.ts"]
+  "artifacts": ["src/web/public/dashboard.js", "src/web/public/styles.css"]
 }
