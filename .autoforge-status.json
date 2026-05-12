@@ -1,15 +1,8 @@
 {
-  "status": "DONE_WITH_CONCERNS",
-  "artifacts": [".autoforge-review.md"],
-  "concerns": "One MAJOR defect confirmed: dashboard.js:1284 reads `p.candidate_executor ?? p.executor` but shadow.ts emits the field as `candidate_executor_used`. The executor column in the shadow variants strip will always display '—' for all tasks. Fix: change line 1284 to `p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null`. All 565 tests pass. All other acceptance criteria pass.",
-  "output": {
-    "findings": [
-      {
-        "severity": "MAJOR",
-        "category": "correctness",
-        "description": "Shadow variants strip executor column always shows '—'. dashboard.js:1284 reads `p.candidate_executor ?? p.executor` but shadow.ts recordShadowRunCompleted emits the field as `candidate_executor_used` (see shadow.ts lines 70, 93, 132, 141). Neither fallback key matches the payload, so the executor value is always null. Fix: `p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null`.",
-        "filePath": "src/web/public/dashboard.js"
-      }
-    ]
-  }
+  "status": "DONE",
+  "artifacts": [
+    "src/orchestrator/service.ts",
+    "src/orchestrator/shadow.ts",
+    "tests/unit/subtask-started.test.ts"
+  ]
 }
