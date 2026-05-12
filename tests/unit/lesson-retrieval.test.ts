@@ -94,6 +94,32 @@ describe("retrieveLessonsForDispatch", () => {
     expect(lessons).toEqual([]);
   });
 
+  test("can use bounded recent-lesson fallback when overlap is zero", async () => {
+    const db = freshDb();
+    const oldId = seedLesson(db, "vCoder", "coder", "database migration", "x".repeat(160));
+    const recentId = seedLesson(db, "vCoder", "coder", "backend schema", "x".repeat(40));
+
+    const lessons = await retrieveLessonsForDispatch(
+      db,
+      "vCoder",
+      "coder",
+      "Add a dark-mode toggle",
+      5,
+      9999,
+      {
+        zeroOverlapFallback: {
+          enabled: true,
+          maxLessons: 1,
+          maxTokens: 15
+        }
+      }
+    );
+
+    expect(lessons).toHaveLength(1);
+    expect(lessons[0]?.id).toBe(recentId);
+    expect(lessons[0]?.id).not.toBe(oldId);
+  });
+
   test("truncates tail to respect maxTokens (approx 4 chars = 1 token)", async () => {
     const db = freshDb();
     const bigBody = "word ".repeat(500);  // ~2500 chars ≈ 625 tokens

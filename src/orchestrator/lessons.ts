@@ -7,6 +7,14 @@ export interface RetrievedLesson {
   outcome_kind: "corrective" | "reinforcing";
 }
 
+export interface LessonRetrievalOptions {
+  zeroOverlapFallback?: {
+    enabled: boolean;
+    maxLessons: number;
+    maxTokens: number;
+  };
+}
+
 const STOPWORDS = new Set([
   "the", "a", "an", "to", "of", "for", "and", "or", "in", "on", "with", "is", "are", "be"
 ]);
@@ -44,7 +52,8 @@ export async function retrieveLessonsForDispatch(
   agentType: string,
   taskDescription: string,
   maxLessons = 5,
-  maxTokens = 1500
+  maxTokens = 1500,
+  options: LessonRetrievalOptions = {}
 ): Promise<RetrievedLesson[]> {
   const lineageRootId = db.resolveLineageRoot(variantId);
   if (!lineageRootId) return [];
@@ -71,11 +80,30 @@ export async function retrieveLessonsForDispatch(
     })
     .slice(0, maxLessons);
 
+  const fallbackEnabled = options.zeroOverlapFallback?.enabled === true;
+  const fallbackMaxLessons = Math.max(0, options.zeroOverlapFallback?.maxLessons ?? 1);
+  const fallbackMaxTokens = Math.max(0, options.zeroOverlapFallback?.maxTokens ?? maxTokens);
+  const fallbackBudget = Math.min(maxTokens, fallbackMaxTokens);
+  const selected =
+    ranked.length > 0
+      ? ranked
+      : fallbackEnabled
+        ? scored
+          .sort((a, b) => {
+            const createdOrder = b.row.created_at.localeCompare(a.row.created_at);
+            return createdOrder === 0 ? b.row.id.localeCompare(a.row.id) : createdOrder;
+          })
+        : [];
+
   const out: RetrievedLesson[] = [];
-  let tokenBudget = maxTokens;
-  for (const { row } of ranked) {
+  let tokenBudget = ranked.length > 0 ? maxTokens : fallbackBudget;
+  for (const { row } of selected) {
+    if (ranked.length === 0 && out.length >= fallbackMaxLessons) break;
     const cost = approxTokens(row.body);
-    if (cost > tokenBudget) break;
+    if (cost > tokenBudget) {
+      if (ranked.length > 0) break;
+      continue;
+    }
     tokenBudget -= cost;
     out.push({
       id: row.id,

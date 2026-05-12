@@ -28,7 +28,7 @@ services:
   autoforge:
     image: oven/bun:latest
     working_dir: /app
-    command: ["bun", "run", "src/index.ts"]
+    command: ["sh", "-lc", "bun install --frozen-lockfile && bun run src/index.ts"]
     depends_on:
       nats:
         condition: service_started
@@ -40,8 +40,11 @@ services:
       - NATS_URL=nats://nats:4222
       - DATABASE_PATH=/app/data/autoforge.sqlite
       - HOST=0.0.0.0
-      - PORT=3000
+      - PORT=${PORT:-3000}
       - EXECUTOR_DEFAULT=harness
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - QMD_MCP_URL=http://qmd:8181/mcp
     volumes:
       - ./:/app

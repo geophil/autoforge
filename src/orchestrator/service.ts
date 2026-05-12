@@ -45,6 +45,7 @@ import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type
 import { LocalWorkspace } from "../runtime/local-workspace";
 import type { Workspace } from "../runtime/workspace";
 import { isPlannerFallbackOutput, parsePlannerStructuredOutput } from "./planner-output";
+import { buildContextEnvelopeFromTask, hashContextEnvelope } from "./context-envelope";
 import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
 
@@ -707,6 +708,7 @@ export class OrchestratorService {
       model: this.plannerModel(tier),
       lessons: plannerLessons.block || undefined
     } as const;
+    const plannerContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(plannerTask));
     const plannerResult = await plannerExecutor.execute(plannerTask);
     this.recordSteeringConsumed({
       taskId,
@@ -843,7 +845,8 @@ export class OrchestratorService {
           : undefined,
       executorUsed: plannerExecutor.name,
       personaVersionId: plannerPersonaId,
-      skillVersionIds: plannerSkillIds
+      skillVersionIds: plannerSkillIds,
+      contextEnvelopeHash: plannerContextEnvelopeHash
     });
 
     return parsed;
@@ -1265,6 +1268,7 @@ export class OrchestratorService {
         metadata: { taskId, description: task.description },
         lessons: docLessons.block || undefined
       } as const;
+      const docContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(docTask));
       const docResult = await docExecutor.execute(docTask);
       this.recordSteeringConsumed({
         taskId,
@@ -1305,7 +1309,8 @@ export class OrchestratorService {
         } : undefined,
         executorUsed: docExecutor.name,
         personaVersionId: docPersonaId,
-        skillVersionIds: docSkillIds
+        skillVersionIds: docSkillIds,
+        contextEnvelopeHash: docContextEnvelopeHash
       });
 
       const worktreeBranch = `autoforge/${taskId}`;
@@ -2466,6 +2471,7 @@ export class OrchestratorService {
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
         };
+        const subtaskContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(liveTask));
         this.recordEvent({
           taskId,
           projectId,
@@ -2568,7 +2574,8 @@ export class OrchestratorService {
           } : undefined,
           executorUsed: coderExecutor.name,
           personaVersionId: subtaskPersonaId,
-          skillVersionIds: subtaskSkillIds
+          skillVersionIds: subtaskSkillIds,
+          contextEnvelopeHash: subtaskContextEnvelopeHash
         });
 
         // Orchestrator commits agent output — agents never push directly.
@@ -2633,6 +2640,7 @@ export class OrchestratorService {
         metadata: { taskId, iteration, description },
         lessons: reviewerLessons.block || undefined
       } as const;
+      const reviewerContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(reviewerTask));
       const reviewResult = await reviewerExecutor.execute(reviewerTask);
       this.recordSteeringConsumed({
         taskId,
@@ -2712,7 +2720,8 @@ export class OrchestratorService {
         } : undefined,
         executorUsed: reviewerExecutor.name,
         personaVersionId: reviewerPersonaId,
-        skillVersionIds: reviewerSkillIds
+        skillVersionIds: reviewerSkillIds,
+        contextEnvelopeHash: reviewerContextEnvelopeHash
       });
 
       for (const finding of unresolvedFindings) {
@@ -3187,7 +3196,12 @@ export class OrchestratorService {
         agentType,
         taskDescription,
         retrieval.maxLessons,
-        retrieval.maxTokens
+        retrieval.maxTokens,
+        {
+          zeroOverlapFallback: agentType === "planner"
+            ? { enabled: true, maxLessons: 1, maxTokens: 180 }
+            : undefined
+        }
       );
       if (lessons.length === 0) return { block: "", ids: [] };
       const parts: string[] = ["# Lessons from past tasks in this lineage", ""];
@@ -3221,6 +3235,7 @@ export class OrchestratorService {
     skillVersionIds?: string[];
     resumable?: boolean;
     analyticsOnly?: boolean;
+    contextEnvelopeHash?: string;
   }): void {
     const provenance: Record<string, unknown> = {};
     if (input.personaVersionId) provenance.persona_version_id = input.personaVersionId;
@@ -3244,7 +3259,10 @@ export class OrchestratorService {
     };
 
     this.deps.db.transaction(() => {
-      this.deps.db.appendEvent(message, { executorUsed: input.executorUsed });
+      this.deps.db.appendEvent(message, {
+        executorUsed: input.executorUsed,
+        contextEnvelopeHash: input.contextEnvelopeHash
+      });
       if (!input.analyticsOnly) {
         this.deps.db.applyEvent(message);
       }

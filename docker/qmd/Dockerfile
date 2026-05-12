@@ -2,10 +2,14 @@ FROM node:22-slim
 
 # SQLite with extension support (required by QMD)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends sqlite3 libsqlite3-dev && \
+    apt-get install -y --no-install-recommends sqlite3 libsqlite3-dev python3 make g++ && \
     rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @tobilu/qmd
+# Install QMD plus tree-sitter WASM grammars used by AST chunking.
+RUN npm install -g @tobilu/qmd \
+    tree-sitter-typescript \
+    tree-sitter-python \
+    tree-sitter-go
 
 # ─── QMD bind patch ────────────────────────────────────────────────────────
 # Upstream `qmd mcp --http` hardcodes a `localhost`-only bind in
