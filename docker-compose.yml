@@ -41,7 +41,7 @@ services:
       - DATABASE_PATH=/app/data/autoforge.sqlite
       - HOST=0.0.0.0
       - PORT=3000
-      - EXECUTOR_DEFAULT=claude-code
+      - EXECUTOR_DEFAULT=harness
       - QMD_MCP_URL=http://qmd:8181/mcp
     volumes:
       - ./:/app

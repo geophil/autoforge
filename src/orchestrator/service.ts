@@ -35,7 +35,6 @@ import { runShadowDispatches, type ShadowRunner } from "./shadow";
 import { defaultDispatchConfig } from "../config/dispatch";
 import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
 import { runAuthenticatedTests } from "../privileged/tests";
-import type { ExecutorSet } from "../executors/factory";
 import { validateMetaOutput } from "../schemas/meta-output";
 import { handleMetaOperation } from "./meta-operations";
 import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
@@ -60,7 +59,6 @@ interface ServiceDeps {
   env: AppEnv;
   db: DbClient;
   executor: AgentExecutor;
-  executors?: ExecutorSet;
   worktrees: WorktreeManager;
   nats?: NatsClient;
   testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
@@ -3284,34 +3282,13 @@ export class OrchestratorService {
   }
 
   /**
-   * Route to the most appropriate executor for a given tier and agent type.
-   * SDK executor is used for EXPRESS tier simple tasks (cheaper, sufficient).
-   * Claude Code is used for STANDARD/THOROUGH and for agents that need full filesystem access.
-   * Falls back to the configured primary executor when routing is not available.
+   * Route all real dispatches through the single configured executor.
+   * Tier/agent type still affect budget, model, and prompt policy upstream.
    */
   private routeExecutor(tier: Tier, agentType: AgentType): AgentExecutor {
-    const set = this.deps.executors;
-    if (!set) return this.deps.executor;
-
-    // Planner always routed to SDK so we can capture transcripts and pick
-    // the model per run (Opus for STANDARD/THOROUGH). Falls back to Claude
-    // Code if no SDK executor is configured (e.g. local dev without API key).
-    if (agentType === "planner") return set.sdk ?? set.claudeCode;
-
-    // Reflector is an SDK-executor job so we can get structured JSON output
-    // reliably. Claude Code fallback for local dev without SDK credentials.
-    if (agentType === "reflector") return set.sdk ?? set.claudeCode;
-
-    // Diagnostician should prefer SDK for structured JSON payloads.
-    if (agentType === "diagnostician") return set.sdk ?? set.claudeCode;
-
-    // Meta agent always gets Claude Code — needs broad exploration.
-    if (agentType === "meta") return set.claudeCode;
-
-    // SDK executor for EXPRESS tier (existing behavior).
-    if (tier === "EXPRESS" && set.sdk) return set.sdk;
-
-    return set.claudeCode;
+    void tier;
+    void agentType;
+    return this.deps.executor;
   }
 
   private recordCheckpoint(input: {

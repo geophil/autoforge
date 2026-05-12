@@ -4,6 +4,7 @@ import { createTestService } from "../helpers/create-service";
 import { createWebServer } from "../../src/web/server";
 import type { DbClient } from "../../src/db/client";
 import type { AgentExecutor } from "../../src/executors/interface";
+import { loadEnv } from "../../src/config/env";
 
 function seedBaselineCoderVariant(db: DbClient): void {
   db.sqlite.query(`
@@ -97,7 +98,7 @@ describe("Spec D autonomous loop", () => {
         };
       }
     });
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, loadEnv({ NODE_ENV: "test", EXECUTOR_DEFAULT: "mock" }));
 
     try {
       seedBaselineCoderVariant(db);
@@ -188,7 +189,7 @@ describe("Spec D autonomous loop", () => {
 });
 
 describe("diagnostic executor routing", () => {
-  test("routes diagnostician to SDK executor when both executors are configured", async () => {
+  test("routes diagnostician to the single configured executor", async () => {
     const { service, db, cleanup } = createTestService();
     try {
       seedBaselineCoderVariant(db);
@@ -196,12 +197,11 @@ describe("diagnostic executor routing", () => {
         seedCompletedCoderTask(db, i);
       }
 
-      let sdkCalls = 0;
-      let claudeCalls = 0;
-      const sdk: AgentExecutor = {
-        name: "sdk-stub",
+      let harnessCalls = 0;
+      const harness: AgentExecutor = {
+        name: "harness-stub",
         async execute() {
-          sdkCalls += 1;
+          harnessCalls += 1;
           return {
             status: "DONE",
             artifacts: [],
@@ -213,34 +213,11 @@ describe("diagnostic executor routing", () => {
           return true;
         }
       };
-      const claude: AgentExecutor = {
-        name: "claude-stub",
-        async execute() {
-          claudeCalls += 1;
-          return {
-            status: "DONE",
-            artifacts: [],
-            output: { clusters: [] },
-            metrics: { elapsedSeconds: 0.01 }
-          };
-        },
-        async healthCheck() {
-          return true;
-        }
-      };
-
-      (service as unknown as {
-        deps: { executors?: { primary: AgentExecutor; sdk: AgentExecutor; claudeCode: AgentExecutor } };
-      }).deps.executors = {
-        primary: claude,
-        sdk,
-        claudeCode: claude
-      };
+      (service as unknown as { deps: { executor: AgentExecutor } }).deps.executor = harness;
 
       const result = await service.runPopulationDiagnostic("coder", "manual");
       expect(result.clustersProposed).toBe(0);
-      expect(sdkCalls).toBe(1);
-      expect(claudeCalls).toBe(0);
+      expect(harnessCalls).toBe(1);
     } finally {
       cleanup();
     }

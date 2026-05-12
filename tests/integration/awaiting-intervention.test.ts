@@ -309,7 +309,7 @@ describe("awaiting_intervention: coder failures surface with forensics", () => {
             stderrExcerpt: "Invalid MCP configuration",
             stdoutExcerpt: "Loading config...",
             command: "claude --print",
-            executorMode: "claude-code"
+            executorMode: "harness"
           },
           metrics: { elapsedSeconds: 0.15 }
         })
@@ -327,7 +327,7 @@ describe("awaiting_intervention: coder failures surface with forensics", () => {
     expect(failure!.payload.stderr_excerpt).toContain("Invalid MCP configuration");
     expect(failure!.payload.stdout_excerpt).toContain("Loading config");
     expect(failure!.payload.command).toContain("claude");
-    expect(failure!.payload.executor_mode).toBe("claude-code");
+    expect(failure!.payload.executor_mode).toBe("harness");
     expect(typeof failure!.payload.workspace_id).toBe("string");
     expect(failure!.payload.checkpoint_stage).toBe("task_start");
     expect(typeof failure!.payload.checkpoint_id).toBe("string");
