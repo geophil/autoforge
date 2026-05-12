@@ -1,25 +1,30 @@
 {
   "status": "DONE_WITH_CONCERNS",
-  "artifacts": [],
+  "artifacts": [
+    "src/web/public/dashboard.js",
+    "src/web/public/styles.css",
+    ".autoforge-review.md"
+  ],
+  "concerns": "One MAJOR defect confirmed: dashboard.js:1284 reads `p.candidate_executor ?? p.executor ?? null` but shadow.ts emits the field as `candidate_executor_used`. The executor column in the shadow variants strip will always display \"—\" instead of the actual executor value. Fix: change to `p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null`. All 565 tests pass. All other acceptance criteria in .autoforge-review.md are PASS.",
   "output": {
     "findings": [
       {
-        "severity": "CRITICAL",
-        "category": "correctness",
-        "description": "tests/unit/task-archive-routes.test.ts line 20 uses `plan: []` but PipelineTask defines the field as `planSubtasks: PlanSubtask[]`. This causes `bun run lint` (tsc --noEmit) to exit with code 2. The spec criterion 'Type check / build command passes' is not met.",
-        "filePath": "tests/unit/task-archive-routes.test.ts"
-      },
-      {
         "severity": "MAJOR",
-        "category": "spec_compliance",
-        "description": "README.md has no 'Archiving tasks' section. The spec explicitly requires a one-paragraph section describing the UI (archive/restore/delete buttons) and the archive endpoints (POST /archive, POST /unarchive, DELETE /:id). The criterion is entirely unmet.",
-        "filePath": "README.md"
+        "category": "correctness",
+        "description": "dashboard.js:1284 reads `p.candidate_executor ?? p.executor ?? null` but shadow.ts records the field as `candidate_executor_used` (lines 70, 93, 132, 141). The executor column in the shadow variants strip will always show \"—\" instead of the real executor value. Fix: `p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null`.",
+        "filePath": "src/web/public/dashboard.js"
       },
       {
         "severity": "MINOR",
-        "category": "spec_compliance",
-        "description": "projections.ts has no comment documenting that `archived_at` is projection state (not event-sourced) and that rebuildProjectionsFromEvents() therefore leaves it as NULL for all tasks. The spec explicitly asks for this comment.",
-        "filePath": "src/db/projections.ts"
+        "category": "correctness",
+        "description": "computeExecProgressInfo (dashboard.js:620) uses `task.iteration ?? 1` as a fallback. The first iteration is 0, not 1. In practice this cannot bite (all tasks with subtask_started events have task.iteration=0), but the fallback is semantically wrong and would silently display no active subtasks if task.iteration were ever missing on a modern task.",
+        "filePath": "src/web/public/dashboard.js"
+      },
+      {
+        "severity": "MINOR",
+        "category": "documentation",
+        "description": ".autoforge-review.md describes a 'Latent bug: early return at dashboard.js:1131' but there is no early return there — the code only conditionally clears historyEl.innerHTML inside the `if (historyEl)` block; shadow strip rendering at line 1230 proceeds unconditionally regardless. The N-A conclusion is correct but the premise is inaccurate.",
+        "filePath": ".autoforge-review.md"
       }
     ]
   }

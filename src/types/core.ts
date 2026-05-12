@@ -3,6 +3,7 @@ export type AgentType = "planner" | "coder" | "reviewer" | "doc" | "doc-review" 
 export type TaskStatus =
   | "pending"
   | "in_progress"
+  | "running"
   | "done"
   | "done_with_concerns"
   | "blocked"

@@ -251,6 +251,7 @@ h2 {
 .badge-state[data-state="awaiting_approval"] { background: var(--cyan-dim); color: var(--cyan); }
 .badge-state[data-state="executing"],
 .badge-state[data-state="reviewing"],
+.badge-state[data-state="reworking"],
 .badge-state[data-state="planning"],
 .badge-state[data-state="documenting"] { background: var(--orange-dim); color: var(--orange); }
 
@@ -266,6 +267,7 @@ h2 {
 .badge-state[data-state="awaiting_approval"]::before { content: "⇡"; }
 .badge-state[data-state="executing"]::before,
 .badge-state[data-state="reviewing"]::before,
+.badge-state[data-state="reworking"]::before,
 .badge-state[data-state="planning"]::before,
 .badge-state[data-state="documenting"]::before { content: "●"; }
 .badge-state[data-state="completed"]::before { content: "✓"; }
@@ -1236,6 +1238,175 @@ button:disabled:not(.btn-working) {
   border-left: 3px solid var(--orange);
   padding-left: calc(0.75rem - 3px);
 }
+.subtask-item[data-subtask-status="done_with_concerns"] .subtask-status-icon {
+  background: var(--yellow);
+  color: var(--bg);
+}
+.subtask-item[data-subtask-status="done_with_concerns"] .subtask-status-icon::before {
+  content: "!";
+}
+.subtask-item[data-subtask-status="done_with_concerns"] {
+  opacity: 0.85;
+}
+.subtask-item[data-subtask-status="failed"] .subtask-status-icon {
+  background: var(--red);
+  color: var(--bg);
+}
+.subtask-item[data-subtask-status="failed"] .subtask-status-icon::before {
+  content: "✕";
+}
+.subtask-item[data-subtask-status="failed"] {
+  border-left: 3px solid var(--red);
+  padding-left: calc(0.75rem - 3px);
+}
+
+/* Subtask runtime row (executor, elapsed, token usage) */
+.subtask-runtime-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.3rem;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+.subtask-runtime-sep {
+  color: var(--text-dim);
+}
+.subtask-executor {
+  color: var(--text-muted);
+}
+.subtask-elapsed {
+  color: var(--text-muted);
+}
+.subtask-tokens {
+  color: var(--text-dim);
+}
+
+/* Per-iteration history strip */
+.subtask-history-strip-inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid var(--border);
+}
+.subtask-history-entry {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+}
+.subtask-history-dot {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-surface-active);
+  flex-shrink: 0;
+  transition: transform 0.15s;
+}
+.subtask-history-dot[onclick]:hover {
+  transform: scale(1.2);
+  cursor: pointer;
+}
+.subtask-history-dot--success {
+  background: var(--green);
+  border-color: var(--green);
+}
+.subtask-history-dot--concerns {
+  background: var(--yellow);
+  border-color: var(--yellow);
+}
+.subtask-history-dot--failure {
+  background: var(--red);
+  border-color: var(--red);
+}
+.subtask-history-dot--running {
+  background: var(--orange);
+  border-color: var(--orange);
+  animation: pulse 1.6s ease-out infinite;
+}
+.subtask-history-dot--expanded {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Findings count badge overlaid on iteration dot */
+.subtask-findings-badge {
+  position: absolute;
+  top: -0.35rem;
+  right: -0.35rem;
+  display: flex;
+  gap: 0.1rem;
+  pointer-events: none;
+}
+.subtask-findings-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0.9rem;
+  height: 0.9rem;
+  padding: 0 0.15rem;
+  border-radius: 999px;
+  font-size: 0.55rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.subtask-findings-count--high {
+  background: var(--red);
+  color: #fff;
+}
+.subtask-findings-count--low {
+  background: var(--yellow);
+  color: var(--bg);
+}
+
+/* Inline findings panel (expanded from iteration dot) */
+.subtask-findings-panel {
+  margin-top: 0.1rem;
+  padding: 0.5rem 0.65rem;
+  background: var(--bg-surface-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  min-width: 14rem;
+  max-width: 26rem;
+}
+.subtask-findings-header {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+.subtask-finding-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.subtask-finding-item:last-child {
+  border-bottom: none;
+}
+.subtask-finding-body {
+  flex: 1;
+  min-width: 0;
+}
+.subtask-finding-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  font-size: 0.78rem;
+}
 
 /* Global "N running" header badge */
 .running-badge {
@@ -1391,6 +1562,323 @@ button:disabled:not(.btn-working) {
   font-weight: normal;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+
+/* -----------------------------------------------------------------------
+   Execution Progress header — shown for executing/reviewing/reworking/documenting states
+   ----------------------------------------------------------------------- */
+.exec-progress-section {
+  border-left: 3px solid var(--orange);
+}
+
+.exec-progress-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.exec-progress-title {
+  /* Uses .detail-section h3 base styles (uppercase, muted, small) */
+  margin-bottom: 0 !important;
+}
+
+.exec-progress-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.exec-iter {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.exec-subtasks-done {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.exec-placeholder {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.exec-active {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  background: var(--bg-surface-hover);
+  border-radius: var(--radius-sm);
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.exec-active-seq {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.exec-active-agent {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background: var(--orange-dim);
+  color: var(--orange);
+  flex-shrink: 0;
+}
+
+.exec-active-desc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.exec-active-elapsed {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.exec-tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.8rem;
+}
+
+.exec-token-stat {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.exec-token-label {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+
+/* -----------------------------------------------------------------------
+   Shadow variants strip inside subtask cards
+   ----------------------------------------------------------------------- */
+.subtask-shadow-strip {
+  margin-top: 0.5rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid var(--border);
+}
+
+.subtask-shadow-summary {
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  user-select: none;
+  padding: 0.1rem 0;
+}
+
+.subtask-shadow-summary::-webkit-details-marker { display: none; }
+.subtask-shadow-summary::before {
+  content: "▸";
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.subtask-shadow-strip[open] > .subtask-shadow-summary::before { content: "▾"; }
+.subtask-shadow-summary:hover { color: var(--text-muted); }
+
+.shadow-rows {
+  margin-top: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.shadow-row {
+  font-size: 0.78rem;
+}
+
+.shadow-row-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  list-style: none;
+  flex-wrap: wrap;
+}
+
+.shadow-row-summary::-webkit-details-marker { display: none; }
+.shadow-row-summary:hover { background: var(--bg-surface-hover); }
+
+.shadow-variant-id {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.shadow-executor {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  flex-shrink: 0;
+}
+
+.shadow-delta {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.shadow-delta--positive { color: var(--green); }
+.shadow-delta--negative { color: var(--red); }
+.shadow-delta--null { color: var(--text-dim); }
+
+.shadow-lessons {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.shadow-error-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.05rem 0.3rem;
+  border-radius: var(--radius-sm);
+  background: var(--red-dim);
+  color: var(--red);
+  flex-shrink: 0;
+}
+
+.shadow-iter-label {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.shadow-components {
+  margin: 0.25rem 0.4rem 0.35rem 0.4rem;
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.shadow-components-section {
+  flex: 1;
+  min-width: 8rem;
+}
+
+.shadow-components-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  font-weight: 600;
+  margin-bottom: 0.2rem;
+}
+
+.shadow-kv-row {
+  display: flex;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.05rem 0;
+}
+
+.shadow-kv-key {
+  color: var(--text-dim);
+  flex-shrink: 0;
+  min-width: 5rem;
+}
+
+.shadow-kv-value {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.shadow-components-empty {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.shadow-view-all {
+  margin-top: 0.35rem;
+  padding: 0.15rem 0.4rem;
+}
+
+.shadow-view-all a {
+  font-size: 0.72rem;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.shadow-view-all a:hover { text-decoration: underline; }
+
+/* -----------------------------------------------------------------------
+   Event log (forensics) — collapsible details + filter input
+   ----------------------------------------------------------------------- */
+.event-log-details > summary.event-log-summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.25rem 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  user-select: none;
+}
+.event-log-details > summary.event-log-summary::-webkit-details-marker { display: none; }
+.event-log-details > summary.event-log-summary::before {
+  content: "▸";
+  font-size: 0.75rem;
+}
+.event-log-details[open] > summary.event-log-summary::before { content: "▾"; }
+
+.event-log-filter {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0.6rem 0 0.5rem;
+  padding: 0.35rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.82rem;
+  outline: none;
+}
+.event-log-filter:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
 }
 
 /* Planning wizard */
