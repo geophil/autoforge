@@ -1112,10 +1112,13 @@ function updateSubtaskCards(events, task) {
           parts.push(`<span class="subtask-tokens">${esc(tokenDisplay)}</span>`);
         }
 
-        runtimeEl.innerHTML = `<div class="subtask-runtime-row">${parts.join(
+        const newRuntimeHtml = `<div class="subtask-runtime-row">${parts.join(
           '<span class="subtask-runtime-sep"> · </span>'
         )}</div>`;
-      } else {
+        if (runtimeEl.innerHTML !== newRuntimeHtml) {
+          runtimeEl.innerHTML = newRuntimeHtml;
+        }
+      } else if (runtimeEl.innerHTML !== "") {
         runtimeEl.innerHTML = "";
       }
     }
@@ -1127,10 +1130,8 @@ function updateSubtaskCards(events, task) {
       const iters = Object.keys(runs).map(Number).sort((a, b) => a - b);
 
       if (iters.length === 0) {
-        historyEl.innerHTML = "";
-        return;
-      }
-
+        if (historyEl.innerHTML !== "") historyEl.innerHTML = "";
+      } else {
       const entriesHtml = iters.map((iter) => {
         const run = runs[iter];
         let dotClass = "subtask-history-dot";
@@ -1219,14 +1220,21 @@ function updateSubtaskCards(events, task) {
           </div>`;
       }).join("");
 
-      historyEl.innerHTML = `<div class="subtask-history-strip-inner">${entriesHtml}</div>`;
+      const newHistoryHtml = `<div class="subtask-history-strip-inner">${entriesHtml}</div>`;
+      if (historyEl.innerHTML !== newHistoryHtml) {
+        historyEl.innerHTML = newHistoryHtml;
+      }
+      } // end else (iters.length > 0)
     }
 
     // --- Populate shadow variants strip ---
     const shadowWrapEl = el.querySelector(".subtask-shadow-wrap");
     if (shadowWrapEl) {
       const shadowEvents = shadowBySubtask[subtaskId] || [];
-      shadowWrapEl.innerHTML = renderShadowVariantsStrip(shadowEvents);
+      const newShadowHtml = renderShadowVariantsStrip(shadowEvents);
+      if (shadowWrapEl.innerHTML !== newShadowHtml) {
+        shadowWrapEl.innerHTML = newShadowHtml;
+      }
     }
   });
 }
