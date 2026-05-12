@@ -1,5 +1,4 @@
 {
-  "status": "DONE_WITH_CONCERNS",
-  "artifacts": ["src/web/public/dashboard.js"],
-  "concerns": "The per-subtask card enrichment (status indicator, agent type, executor/elapsed/token runtime row, per-iteration history strip with findings badges and expandable panels) was already fully implemented by prior subtasks in updateSubtaskCards. This subtask applied two targeted fixes: (1) removed a premature `return` inside the history-strip block that caused the shadow variants strip to be skipped when a subtask had no iteration history; (2) added innerHTML equality checks before setting runtimeEl, historyEl, and shadowWrapEl to avoid unnecessary DOM thrashing and preserve expanded findings-panel state across SSE-driven re-renders. No CSS changes were required — all needed selectors were already present. All 565 tests pass."
+  "status": "DONE",
+  "artifacts": ["src/web/public/dashboard.js", "src/web/public/styles.css"]
 }
