@@ -36,11 +36,10 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 ### `EXECUTOR_DEFAULT`
 
-- **Type**: `"claude-code" | "anthropic-sdk" | "mock"`
-- **Default**: `"claude-code"`
-- **Affects**: `domain-agent-execution.md` — primary fallback in `ExecutorSet`; `OrchestratorService.routeExecutor()` can still choose the SDK or Claude Code executor per tier and agent type.
-  - `claude-code`: spawns the Claude CLI subprocess
-  - `anthropic-sdk`: uses Anthropic Messages API with tool-use loop (requires `ANTHROPIC_API_KEY`)
+- **Type**: `"harness" | "mock"`
+- **Default**: `"harness"`
+- **Affects**: `domain-agent-execution.md` — selects the single runtime path used for real dispatches.
+  - `harness`: runs `HarnessExecutor` with `AnthropicProvider` + `RuntimeToolRegistry`
   - `mock`: deterministic responses, used in tests
 
 ### `EXECUTOR_TIMEOUT_SECONDS`
@@ -67,12 +66,6 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Default**: unset
 - **Affects**: `domain-pr-gate.md` — required for real GitHub PR creation, merge, and close via `gh` CLI. If unset, `createPullRequest` returns a placeholder URL and logs a warning. **Never passed to agent executors.**
 
-### `CLAUDE_COMMAND`
-
-- **Type**: string
-- **Default**: `"claude"`
-- **Affects**: `domain-agent-execution.md` / `ClaudeCodeExecutor` — override if the Claude binary is not on `PATH` (e.g. `/usr/local/bin/claude`).
-
 ### `SKILLS_DIR`
 
 - **Type**: string (directory path)
@@ -83,13 +76,13 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 - **Type**: string (optional)
 - **Default**: unset
-- **Affects**: `domain-agent-execution.md` / `AnthropicSdkExecutor` — required when `EXECUTOR_DEFAULT=anthropic-sdk`; when set, it also makes the SDK executor available for planner, reflector, and EXPRESS routing. **Never passed to Claude Code agent subprocess.**
+- **Affects**: `domain-agent-execution.md` / `AnthropicProvider` — required for `EXECUTOR_DEFAULT=harness` so the harness runtime can call Anthropic models. **Never passed to agent subprocess tools.**
 
 ### `ANTHROPIC_MODEL`
 
 - **Type**: string
 - **Default**: `"claude-sonnet-4-6"`
-- **Affects**: `domain-agent-execution.md` / `AnthropicSdkExecutor` — model ID used for API calls.
+- **Affects**: `domain-agent-execution.md` / `HarnessExecutor` — default model ID for harness provider calls.
 
 ### `OPENAI_API_KEY`
 
@@ -113,7 +106,7 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 - **Type**: string (optional)
 - **Default**: unset
-- **Affects**: `domain-agent-execution.md` — when set, `OrchestratorService.agentEnvironment()` forwards this non-secret URL to task-facing planner/coder/reviewer/doc/doc-review runs. `ClaudeCodeExecutor` writes a temporary `--mcp-config`; `AnthropicSdkExecutor` opens an in-process MCP client. Both expose QMD tools (`query`, `get`, `multi_get`, `status`) to agents that receive the environment. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
+- **Affects**: `domain-agent-execution.md` — when set, `OrchestratorService.agentEnvironment()` forwards this non-secret URL to task-facing planner/coder/reviewer/doc/doc-review runs. The harness `exec` tool can use it to reach QMD MCP-backed flows where configured. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
 
 ### `AUTOFORGE_URL`
 
@@ -133,12 +126,11 @@ const EnvSchema = z.object({
   PORT:                     z.coerce.number().int().positive().default(3000),
   NATS_URL:                 z.string().default("nats://127.0.0.1:4222"),
   DATABASE_PATH:            z.string().default("./data/autoforge.sqlite"),
-  EXECUTOR_DEFAULT:         z.string().default("claude-code"),
+  EXECUTOR_DEFAULT:         z.enum(["harness", "mock"]).default("harness"),
   EXECUTOR_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
   TEST_PASS_THRESHOLD:      z.coerce.number().min(0).max(1).default(1),
   REVIEW_SCORE_THRESHOLD:   z.coerce.number().min(0).max(1).default(0.7),
   GITHUB_TOKEN:             z.string().optional(),
-  CLAUDE_COMMAND:           z.string().default("claude"),
   SKILLS_DIR:               z.string().default("./skills"),
   ANTHROPIC_API_KEY:        z.string().optional(),
   ANTHROPIC_MODEL:          z.string().default("claude-sonnet-4-6"),
@@ -162,7 +154,7 @@ environment:
   - DATABASE_PATH=/app/data/autoforge.sqlite
   - HOST=0.0.0.0
   - PORT=3000
-  - EXECUTOR_DEFAULT=claude-code
+  - EXECUTOR_DEFAULT=harness
   - QMD_MCP_URL=http://qmd:8181/mcp
 ```
 

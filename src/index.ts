@@ -35,7 +35,6 @@ const service = new OrchestratorService({
   env,
   db,
   executor: executors.primary,
-  executors,
   worktrees,
   nats
 });

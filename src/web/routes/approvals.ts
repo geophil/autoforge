@@ -29,6 +29,8 @@ const RetrySchema = z.object({
   checkpointId: z.string().min(1).optional(),
   operatorNote: z.string().min(1).max(4000).optional(),
   planningPhase: z.enum(["spec", "execution_plan"]).optional(),
+  resumeSubtaskId: z.string().min(1).optional(),
+  forceFullReplay: z.boolean().optional(),
   /**
    * Acknowledged-override for the `cannot_rollback_to_approved_spec` guard.
    * Required when the operator wants to redo a spec phase that was already
@@ -92,6 +94,8 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
     let fromStage: "planning" | "executing" | undefined;
     let checkpointId: string | undefined;
     let planningPhase: "spec" | "execution_plan" | undefined;
+    let resumeSubtaskId: string | undefined;
+    let forceFullReplay: boolean | undefined;
     let operatorNote: string | undefined;
     let force: boolean | undefined;
     try {
@@ -100,6 +104,8 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
       checkpointId = body.checkpointId;
       operatorNote = body.operatorNote;
       planningPhase = body.planningPhase;
+      resumeSubtaskId = body.resumeSubtaskId;
+      forceFullReplay = body.forceFullReplay;
       force = body.force;
     } catch (err) {
       return ctx.json({ error: "invalid_body", details: err instanceof Error ? err.message : String(err) }, 400);
@@ -110,6 +116,8 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
         checkpointId,
         operatorNote,
         planningPhase,
+        resumeSubtaskId,
+        forceFullReplay,
         force
       });
       events.publish({ type: "task.updated", data: task });

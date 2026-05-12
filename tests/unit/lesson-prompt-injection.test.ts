@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildSystemPromptForTest } from "../../src/executors/anthropic-sdk";
+import { buildSystemPromptForTask } from "../../src/runtime/harness-executor";
 import type { AgentTask } from "../../src/executors/interface";
 import { MockWorkspace } from "../../src/runtime/mock-workspace";
 
@@ -19,7 +19,7 @@ function makeTask(overrides: Partial<AgentTask> = {}): AgentTask {
 
 describe("buildSystemPrompt lesson injection", () => {
   test("inserts # Lessons section between persona and other sections when skills is empty", () => {
-    const prompt = buildSystemPromptForTest(makeTask({
+    const prompt = buildSystemPromptForTask(makeTask({
       lessons: "# Lessons from past tasks in this lineage\n\n## Lesson L1 (corrective)\nTRIGGER: styling\nOBSERVATION: ...\nPRINCIPLE: ...\nEVIDENCE: ..."
     }));
 
@@ -34,12 +34,12 @@ describe("buildSystemPrompt lesson injection", () => {
   });
 
   test("omits lesson section entirely when lessons is undefined", () => {
-    const prompt = buildSystemPromptForTest(makeTask());
+    const prompt = buildSystemPromptForTask(makeTask());
     expect(prompt).not.toContain("# Lessons");
   });
 
   test("omits lesson section when lessons is empty string or whitespace only", () => {
-    expect(buildSystemPromptForTest(makeTask({ lessons: "" }))).not.toContain("# Lessons");
-    expect(buildSystemPromptForTest(makeTask({ lessons: "   \n\n  " }))).not.toContain("# Lessons");
+    expect(buildSystemPromptForTask(makeTask({ lessons: "" }))).not.toContain("# Lessons");
+    expect(buildSystemPromptForTask(makeTask({ lessons: "   \n\n  " }))).not.toContain("# Lessons");
   });
 });

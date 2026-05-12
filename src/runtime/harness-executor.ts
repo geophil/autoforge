@@ -27,7 +27,7 @@ export class HarnessExecutor implements AgentExecutor {
   async execute(task: AgentTask): Promise<AgentResult> {
     const start = Date.now();
     const deadlineMs = start + task.budgetSeconds * 1000;
-    const systemPrompt = buildSystemPrompt(task);
+    const systemPrompt = buildSystemPromptForTask(task);
     const history: ModelMessage[] = [{ role: "user", content: [{ type: "text", text: task.prompt }] }];
     const turns: AgentTranscriptTurn[] = [];
     const loadedSkills: string[] = [];
@@ -154,7 +154,7 @@ export class HarnessExecutor implements AgentExecutor {
   }
 }
 
-function buildSystemPrompt(task: AgentTask): string {
+export function buildSystemPromptForTask(task: Pick<AgentTask, "systemPrompt" | "lessons" | "skillFiles" | "budgetSeconds">): string {
   const sections: string[] = [];
   if (task.systemPrompt) sections.push(task.systemPrompt);
   if (task.lessons && task.lessons.trim().length > 0) sections.push(task.lessons.trim());

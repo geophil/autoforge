@@ -1,6 +1,108 @@
 # Agent Execution
 
-The Agent Execution domain abstracts over different AI runtimes (Claude Code CLI, Anthropic API, mock, and the new harness) behind a single `AgentExecutor` interface. `createExecutors()` builds an `ExecutorSet`, and `OrchestratorService.routeExecutor()` chooses the runtime per tier and agent type. The domain now separates where tools run (`Workspace`), which model API is called (`ModelProvider`), and which persona/skills define the agent.
+Autoforge now runs a single production execution path:
+
+- `HarnessExecutor` drives the agent loop.
+- `AnthropicProvider` is the model provider.
+- `RuntimeToolRegistry` provides the runtime tool surface.
+- `Workspace` is the file/exec sandbox boundary.
+
+The only alternate mode is `mock` for deterministic tests.
+
+## Runtime Contract
+
+### Executors
+
+`createExecutors(env)` returns one `primary` executor:
+
+- `EXECUTOR_DEFAULT=harness` -> real runtime (`HarnessExecutor`)
+- `EXECUTOR_DEFAULT=mock` -> test runtime (`MockExecutor`)
+
+`OrchestratorService.routeExecutor()` always returns the configured primary executor. Tier and agent type still affect budget/model/prompt policy, but not executor selection.
+
+### Status File Invariant
+
+All agents must write `.autoforge-status.json`:
+
+```json
+{
+  "status": "DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT",
+  "artifacts": ["relative/path/to/file1"],
+  "concerns": "(optional)",
+  "blockReason": "(optional)"
+}
+```
+
+If the status file is missing, the runtime returns `DONE_WITH_CONCERNS`.
+
+### Workspace Boundary
+
+`AgentTask.workspace` is the only file/exec surface. `LocalWorkspace` enforces root-constrained paths and controlled child-process environment.
+
+### Provider Boundary
+
+`ModelProvider` abstracts model APIs. `AnthropicProvider` currently implements this boundary for production.
+
+## Harness Loop
+
+`HarnessExecutor`:
+
+1. Builds the system prompt from persona + lessons + skills + status instructions.
+2. Calls the provider with tool definitions.
+3. Executes `tool_use` calls through `RuntimeToolRegistry`.
+4. Appends tool results back into history.
+5. Finalizes from `.autoforge-status.json`.
+
+Important behavior:
+
+- Deadline checked before each provider and tool call.
+- Timeout-like failures return `TIMEOUT`.
+- Tool failures become `tool_result` errors unless timeout-like.
+- Transcript includes assistant and tool_result turns plus loaded skill attribution.
+
+## Runtime Tools
+
+`createRuntimeToolRegistry()` registers:
+
+- `read_file`
+- `write_file`
+- `exec`
+- `done`
+- `lookup_skill` (when skill registry is provided)
+- `load_skill` (when skill registry is provided)
+
+## Configuration Touchpoints
+
+- `EXECUTOR_DEFAULT`: `harness | mock`
+- `ANTHROPIC_API_KEY`: required for `harness`
+- `ANTHROPIC_MODEL`: default model for harness provider calls
+- `QMD_MCP_URL`: forwarded as non-secret agent environment context
+
+## Integration Points
+
+- `OrchestratorService` dispatches planner/coder/reviewer/doc/meta/reflector/diagnostician through the same executor interface.
+- `PersonaRegistry` resolves persona content for `systemPrompt`.
+- `SkillRegistry` resolves `skillFiles`.
+- `DbClient` persists events/transcripts with executor provenance (`executor_used`).
+
+## File Map
+
+| File | Purpose |
+|------|---------|
+| `src/executors/interface.ts` | `AgentExecutor`, `AgentTask`, `AgentResult` contracts |
+| `src/executors/factory.ts` | Builds harness or mock executor |
+| `src/executors/mock.ts` | Deterministic executor for tests |
+| `src/runtime/harness-executor.ts` | Production executor loop |
+| `src/runtime/anthropic-provider.ts` | Anthropic model provider adapter |
+| `src/runtime/model-provider.ts` | Provider abstraction |
+| `src/runtime/tool-registry.ts` | Tool registry and execution context |
+| `src/runtime/tools.ts` | Runtime tool implementations |
+| `src/runtime/workspace.ts` | Workspace interface |
+| `src/runtime/local-workspace.ts` | Local workspace implementation |
+| `src/orchestrator/service.ts` | Dispatch lifecycle and runtime integration |
+# Agent Execution
+
+The Agent Execution domain uses a single production runtime path behind `AgentExecutor`: `HarnessExecutor` with `AnthropicProvider` and `RuntimeToolRegistry`. `createExecutors()` now configures either `harness` (real traffic) or `mock` (tests). The domain separates where tools run (`Workspace`), which model API is called (`ModelProvider`), and which persona/skills define the agent.
 
 ## Business Rules and Invariants
 
@@ -130,38 +232,26 @@ Important harness rules:
 - `pause_turn`, `refusal`, `stop_sequence`, `max_tokens`, and `end_turn` are terminal provider stops.
 - `load_skill` records loaded skill attribution only after the markdown content is successfully read.
 
-### ExecutorSet Routes Runtime Per Tier and Agent Type
+### Single Runtime Routing
 
-`createExecutors(env)` builds a primary executor plus optional SDK and Claude Code executors. `EXECUTOR_DEFAULT` still chooses the primary fallback, but task execution is routed per dispatch through `OrchestratorService.routeExecutor()`.
+`createExecutors(env)` builds one primary executor. For production, that is `HarnessExecutor`; for tests, `MockExecutor`. `OrchestratorService.routeExecutor()` always returns the configured primary executor.
 
 ```typescript
 // src/executors/factory.ts
 export interface ExecutorSet {
   primary: AgentExecutor;
-  sdk: AnthropicSdkExecutor | null;
-  claudeCode: ClaudeCodeExecutor;
 }
 
 export function createExecutors(env: AppEnv): ExecutorSet {
-  const claudeCode = new ClaudeCodeExecutor();
-  const sdk = env.ANTHROPIC_API_KEY
-    ? new AnthropicSdkExecutor(env.ANTHROPIC_API_KEY, env.ANTHROPIC_MODEL)
-    : null;
-  // EXECUTOR_DEFAULT chooses primary; routeExecutor can still use sdk/claudeCode.
+  if (env.EXECUTOR_DEFAULT === "mock") return { primary: new MockExecutor() };
+  return { primary: new HarnessExecutor(...) };
 }
 ```
 
 ```typescript
 // src/orchestrator/service.ts
 private routeExecutor(tier: Tier, agentType: AgentType): AgentExecutor {
-  const set = this.deps.executors;
-  if (!set) return this.deps.executor;
-if (agentType === "planner") return set.sdk ?? set.claudeCode;
-if (agentType === "reflector") return set.sdk ?? set.claudeCode;
-if (agentType === "diagnostician") return set.sdk ?? set.claudeCode;
-  if (agentType === "meta") return set.claudeCode;
-  if (tier === "EXPRESS" && set.sdk) return set.sdk;
-  return set.claudeCode;
+  return this.deps.executor;
 }
 ```
 
@@ -396,16 +486,14 @@ export interface AgentExecutor {
 - **Task Orchestration**: `OrchestratorService` calls `executor.execute()` for planner, coder, reviewer, doc, meta, reflector, and diagnostician agents. The executor instance is injected as a dependency.
 - **Persona Registry**: `PersonaRegistry.resolve(agentType)` provides `systemPrompt`. DB-first resolution allows the meta-loop to activate improved personas without file changes.
 - **Skills Registry**: `SkillRegistry.skillsForAgent(agentType)` resolves skill file paths; passed as `AgentTask.skillFiles`.
-- **Configuration**: `EXECUTOR_DEFAULT` chooses the primary fallback executor, while `ExecutorSet` enables per-tier/per-agent routing; `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` configure the SDK executor; `CLAUDE_COMMAND` overrides the Claude binary path; `QMD_MCP_URL` enables QMD access for task-facing agents that receive `agentEnvironment()`.
+- **Configuration**: `EXECUTOR_DEFAULT` chooses between `harness` and `mock`; `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` configure the harness provider; `QMD_MCP_URL` enables QMD access for task-facing agents that receive `agentEnvironment()`.
 
 ## File Map
 
 | File | Purpose |
 |------|---------|
 | `src/executors/interface.ts` | `AgentExecutor`, `AgentTask`, `AgentResult` interfaces |
-| `src/executors/factory.ts` | `createExecutors(env)` — builds the primary/SDK/Claude Code executor set |
-| `src/executors/claude-code.ts` | `ClaudeCodeExecutor` — spawns Claude CLI subprocess; supports MCP |
-| `src/executors/anthropic-sdk.ts` | `AnthropicSdkExecutor` — Anthropic Messages API tool-use loop |
+| `src/executors/factory.ts` | `createExecutors(env)` — builds the harness or mock executor |
 | `src/executors/mock.ts` | `MockExecutor` — deterministic responses for tests |
 | `src/runtime/workspace.ts` | `Workspace` interface shared by local and future cloud sandboxes |
 | `src/runtime/local-workspace.ts` | `LocalWorkspace` — root-constrained files and streaming subprocess execution |
