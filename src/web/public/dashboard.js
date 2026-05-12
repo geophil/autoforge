@@ -597,9 +597,12 @@ function renderTaskDetail(task) {
     })() : ""}
 
     <div class="detail-section" id="findings-section">
-      <h3>Pipeline Event Log</h3>
       <div id="cost-summary" class="cost-summary"></div>
-      <div id="findings-list"><span style="color: var(--text-dim); font-size: 0.85rem;">Loading...</span></div>
+      <details class="event-log-details"${["completed", "failed", "awaiting_intervention"].includes(task.state) ? " open" : ""}>
+        <summary class="event-log-summary">Event log (forensics)</summary>
+        <input type="text" id="event-log-filter" class="event-log-filter" placeholder="Filter by type or agent…" autocomplete="off">
+        <div id="findings-list"><span style="color: var(--text-dim); font-size: 0.85rem;">Loading...</span></div>
+      </details>
     </div>
   `;
 
@@ -887,7 +890,7 @@ async function loadEvents(taskId, preloadedRawEvents = null) {
           ? `style="cursor:pointer" onclick="openTranscript('${transcriptId}')" title="View transcript"`
           : "";
         return `
-          <div class="tl-item" ${clickAttr}>
+          <div class="tl-item" data-type="${esc(ev.type)}" data-agent="${esc(ev.agent ?? "")}" ${clickAttr}>
             <span class="tl-dot" style="background:${dotColor}"></span>
             <div class="tl-body">
               <span class="tl-agent" style="color:${agentCol}">${esc(ev.agent)}</span>
@@ -910,9 +913,31 @@ async function loadEvents(taskId, preloadedRawEvents = null) {
 
     updateSubtaskCards(events, currentTask);
     if (currentTask && currentTask.id === taskId) updateExecProgressHeader(events);
+    wireEventLogFilter();
   } catch {
     container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Could not load events.</span>`;
   }
+}
+
+function wireEventLogFilter() {
+  const input = document.getElementById("event-log-filter");
+  if (!input) return;
+  let debounceTimer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const query = input.value.trim().toLowerCase();
+      document.querySelectorAll(".tl-item").forEach((row) => {
+        if (!query) {
+          row.hidden = false;
+          return;
+        }
+        const type = (row.dataset.type ?? "").toLowerCase();
+        const agent = (row.dataset.agent ?? "").toLowerCase();
+        row.hidden = !type.includes(query) && !agent.includes(query);
+      });
+    }, 80);
+  });
 }
 
 /**
