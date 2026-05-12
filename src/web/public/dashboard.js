@@ -207,6 +207,9 @@ async function refreshTaskDetail(taskId) {
         .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
         .slice(0, 10);
       task.pendingSteering = collectPendingSteeringEvents(allEvents);
+      // Stash raw events so renderTaskDetail can pass them to loadEvents,
+      // avoiding a duplicate fetch and the brief "pending" flicker on re-renders.
+      task.preloadedEvents = allEvents;
     }
     renderTaskDetail(task);
   } catch {
@@ -602,7 +605,7 @@ function renderTaskDetail(task) {
 
   wireCritiqueInput(task);
   wireSpecCritiqueInput(task);
-  loadEvents(task.id);
+  loadEvents(task.id, task.preloadedEvents ?? null);
 }
 
 /**
@@ -839,12 +842,18 @@ function statusColor(status) {
   return STATUS_COLORS[status] || "var(--text-dim)";
 }
 
-async function loadEvents(taskId) {
+async function loadEvents(taskId, preloadedRawEvents = null) {
   const container = document.getElementById("findings-list");
   const costSummary = document.getElementById("cost-summary");
   try {
-    const res = await fetch(`${API}/api/tasks/${taskId}/events`);
-    const events = (await res.json()).map((ev) => ({
+    let rawEvents;
+    if (preloadedRawEvents) {
+      rawEvents = preloadedRawEvents;
+    } else {
+      const res = await fetch(`${API}/api/tasks/${taskId}/events`);
+      rawEvents = await res.json();
+    }
+    const events = rawEvents.map((ev) => ({
       ...ev,
       payload: typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload
     }));
