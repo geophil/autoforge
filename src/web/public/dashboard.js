@@ -897,7 +897,16 @@ function updateSubtaskCards(events, task) {
     }
     if (ev.type === "subtask_done" && ev.payload?.subtaskId) {
       const sid = ev.payload.subtaskId;
-      const iter = ev.payload.iteration ?? currentIteration;
+      let iter = ev.payload?.iteration;
+      // Older subtask_done payloads do not carry iteration. Infer from the
+      // latest open started run for this subtask to avoid mis-attributing
+      // completions to the task's current iteration during rework cycles.
+      if (iter == null) {
+        const runs = subtaskRuns[sid] || {};
+        const knownIters = Object.keys(runs).map(Number).sort((a, b) => b - a);
+        const openIter = knownIters.find((i) => runs[i].startedEvent && !runs[i].doneEvent);
+        iter = openIter ?? knownIters[0] ?? 1;
+      }
       if (!subtaskRuns[sid]) subtaskRuns[sid] = {};
       if (!subtaskRuns[sid][iter]) subtaskRuns[sid][iter] = { startedEvent: null, doneEvent: null };
       subtaskRuns[sid][iter].doneEvent = ev;
@@ -1187,7 +1196,11 @@ function buildShadowRunsPerSubtask(events) {
     }
     if (ev.type === "shadow_run_completed") {
       const sid = ev.payload?.subtask_id ?? lastSubtaskDoneId;
-      if (sid) {
+      // Legacy fallback attachment is only safe for coder shadow runs.
+      // Reviewer/doc shadow events can be task-level and should not be
+      // projected into a specific subtask without explicit subtask_id.
+      const canAttachLegacy = ev.payload?.subtask_id != null || ev.agent === "coder";
+      if (sid && canAttachLegacy) {
         if (!shadowBySubtask[sid]) shadowBySubtask[sid] = [];
         shadowBySubtask[sid].push(ev);
       }
@@ -1213,7 +1226,11 @@ function renderShadowVariantsStrip(shadowEvents) {
     const p = ev.payload ?? {};
     const variantId = p.candidate_variant_id;
     const shortId = variantId ? String(variantId).slice(-8) : "—";
-    const executor = p.candidate_executor ?? p.executor ?? null;
+    const executor =
+      p.candidate_executor_used ??
+      p.candidate_executor ??
+      p.executor ??
+      null;
     const executorDisplay = executor ? esc(executor) : "—";
 
     const baselineComposite = p.baseline_composite != null ? Number(p.baseline_composite) : null;
