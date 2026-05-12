@@ -104,6 +104,8 @@ publish(event: { type: string; data: unknown }): void {
 | `POST` | `/api/diagnostic/run` | `diagnostic.ts` | Manually run the diagnostician for an agent type |
 | `GET`  | `/api/metrics/:projectId` | `metrics.ts` | Project metrics (total/completed tasks, unresolved findings) |
 | `GET`  | `/api/metrics/:projectId/trends` | `metrics.ts` | Trend data (stub, returns empty points) |
+| `GET`  | `/api/metrics/:projectId/token-kpis` | `metrics.ts` | Planner token KPI summary (median, share, retries) scoped to project/window |
+| `GET`  | `/api/metrics/:projectId/envelope-reuse` | `metrics.ts` | Repeated `context_envelope_hash` rows with occurrence count + avg token input |
 | `GET`  | `/api/events` | `server.ts` | SSE stream for live updates |
 | `GET`  | `/static/*` | `server.ts` | Static asset serving (`src/web/public/`) |
 
@@ -202,7 +204,7 @@ app.post("/run", async (ctx) => {
 
 ## Data Entities
 
-### Metrics Response
+### Metrics Responses
 
 ```typescript
 // src/db/client.ts metricsForProject()
@@ -210,6 +212,35 @@ app.post("/run", async (ctx) => {
   totalTasks: number;
   completedTasks: number;
   unresolvedFindings: number;
+}
+```
+
+```typescript
+// src/web/routes/metrics.ts GET /api/metrics/:projectId/token-kpis
+{
+  projectId: string;
+  windowDays: number;
+  plannerRows: number;
+  summary: {
+    plannerMedianInputTokens: number;
+    totalInputTokens: number;
+    plannerInputShare: number;
+    plannerRetries: number;
+  };
+}
+```
+
+```typescript
+// src/web/routes/metrics.ts GET /api/metrics/:projectId/envelope-reuse
+{
+  projectId: string;
+  windowDays: number;
+  limit: number;
+  rows: Array<{
+    contextEnvelopeHash: string;
+    occurrences: number;
+    avgTokenInput: number;
+  }>;
 }
 ```
 
@@ -240,5 +271,5 @@ Approval-surface mutating routes (including retry/rollback and steering) current
 | `src/web/routes/experiments.ts` | `GET /api/experiments?status=proposed&operation=fork`, `POST /api/experiments/:id/approve-fork`, `POST /api/experiments/:id/reject-fork` |
 | `src/web/routes/variants.ts` | `GET /api/variants/:agentType`, `GET /api/variants/:id/scores`, `GET /api/variants/:id/shadow` |
 | `src/web/routes/diagnostic.ts` | `POST /api/diagnostic/run` |
-| `src/web/routes/metrics.ts` | `GET /api/metrics/:projectId`, `GET /api/metrics/:projectId/trends` |
+| `src/web/routes/metrics.ts` | `GET /api/metrics/:projectId`, `GET /api/metrics/:projectId/trends`, `GET /api/metrics/:projectId/token-kpis`, `GET /api/metrics/:projectId/envelope-reuse` |
 | `src/web/events.ts` | `LiveEventHub` — in-memory SSE fan-out |

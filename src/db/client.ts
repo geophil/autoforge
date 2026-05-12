@@ -1332,6 +1332,35 @@ export class DbClient {
       unresolvedFindings: findings.unresolved ?? 0
     };
   }
+
+  envelopeHashStats(projectId: string, contextEnvelopeHash: string): {
+    occurrences: number;
+    lastTokenInput: number | null;
+  } {
+    const row = this.sqlite.query(`
+      SELECT
+        COUNT(*) AS occurrences,
+        (
+          SELECT token_input
+          FROM events
+          WHERE project_id = $project_id
+            AND context_envelope_hash = $context_envelope_hash
+            AND token_input IS NOT NULL
+          ORDER BY timestamp DESC, rowid DESC
+          LIMIT 1
+        ) AS last_token_input
+      FROM events
+      WHERE project_id = $project_id
+        AND context_envelope_hash = $context_envelope_hash
+    `).get({
+      $project_id: projectId,
+      $context_envelope_hash: contextEnvelopeHash
+    }) as { occurrences: number; last_token_input: number | null };
+    return {
+      occurrences: row.occurrences ?? 0,
+      lastTokenInput: row.last_token_input ?? null
+    };
+  }
 }
 
 function finiteNumberOrNull(value: unknown): number | null {

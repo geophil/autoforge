@@ -18,7 +18,7 @@ This document captures the assessment of autoforge's current feedback loop quali
 | `token_input`, `token_output`, `estimated_cost` | Yes | For SDK executor only; Claude Code doesn't report tokens |
 | `payload` (JSON blob) | Yes | Includes `persona_version_id`, `skill_version_ids`, failure `reason` |
 | `executor_used` | Yes | Column exists |
-| `context_envelope_hash` | Yes (unused) | Reserved for future prompt hashing |
+| `context_envelope_hash` | Yes | Deterministic prompt-envelope fingerprint persisted on token events |
 | Per-tool-call stats (reads, writes, iterations) | **No** | Not captured anywhere |
 | Planner output quality (did it fall back?) | **No** | Always logs `planned/done` even on bad output |
 | WHY the task failed (structured category) | **Partial** | `reason` string in payload, but not normalized or queryable through views |

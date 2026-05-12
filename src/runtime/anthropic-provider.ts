@@ -39,6 +39,7 @@ export class AnthropicProvider implements ModelProvider {
     timeoutSeconds?: number;
   }): Promise<ModelResponse> {
     const timeout = (args.timeoutSeconds ?? 120) * 1000;
+    const cachedMessages = applyPromptCachingToMessages(args.history);
     const params: Anthropic.MessageCreateParamsNonStreaming = {
       model: args.model,
       max_tokens: args.maxTokens ?? 8192,
@@ -49,7 +50,7 @@ export class AnthropicProvider implements ModelProvider {
           cache_control: { type: "ephemeral" }
         }
       ],
-      messages: args.history as unknown as Anthropic.MessageParam[],
+      messages: cachedMessages,
       tools: args.tools.map(toAnthropicTool)
     };
 
@@ -66,6 +67,20 @@ export class AnthropicProvider implements ModelProvider {
       }
     };
   }
+}
+
+function applyPromptCachingToMessages(history: ModelMessage[]): Anthropic.MessageParam[] {
+  return history.map((message, messageIndex) => {
+    const content = message.content.map((block, blockIndex) => {
+      if (block.type !== "text") return block;
+      // Cache the first user text block as a stable prefix across retries.
+      if (message.role === "user" && messageIndex === 0 && blockIndex === 0) {
+        return { ...block, cache_control: { type: "ephemeral" as const } };
+      }
+      return block;
+    });
+    return { ...message, content } as unknown as Anthropic.MessageParam;
+  });
 }
 
 export function toToolDefinition(tool: Anthropic.Tool): ToolDefinition {

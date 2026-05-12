@@ -45,7 +45,9 @@ import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type
 import { LocalWorkspace } from "../runtime/local-workspace";
 import type { Workspace } from "../runtime/workspace";
 import { isPlannerFallbackOutput, parsePlannerStructuredOutput } from "./planner-output";
-import { buildContextEnvelopeFromTask, hashContextEnvelope } from "./context-envelope";
+import { buildPlannerPrompt as buildPlannerPromptText, retryPromptExceedsTokenCap } from "./planner-prompt";
+import { buildPlannerDispatchEnvelope } from "./planner-envelope";
+import { buildAgentDispatchEnvelope } from "./dispatch-envelope";
 import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
 
@@ -666,7 +668,7 @@ export class OrchestratorService {
 
     const attempt = this.nextTranscriptAttempt(taskId, transcriptStage);
     const plannerExecutor = this.routeExecutor(tier, "planner");
-    const userPrompt = this.buildPlannerPrompt({
+    const userPrompt = buildPlannerPromptText({
       description,
       tier,
       phase: requestedPhase,
@@ -678,7 +680,6 @@ export class OrchestratorService {
       currentBlockingQuestion
     });
     const plannerSteering = this.steeringForDispatch(taskId);
-    const plannerPrompt = plannerSteering.prompt ? `${plannerSteering.prompt}\n\n${userPrompt}` : userPrompt;
     const plannerDispatch = await this.selectPersonaForDispatch("planner", { description, tier, projectId });
     const plannerPersonaId = plannerDispatch.selection.variantId;
     const plannerSkillIds = this.skills.snapshotIds("planner");
@@ -695,20 +696,39 @@ export class OrchestratorService {
       injectedLessonIds: plannerLessons.ids
     });
 
-    const plannerTask = {
-      id: taskId,
-      type: "planner",
+    const plannerEnvelope = buildPlannerDispatchEnvelope({
+      taskId,
+      description,
+      tier,
+      attempt,
+      model: this.plannerModel(tier),
       systemPrompt: plannerDispatch.content,
-      prompt: plannerPrompt,
+      userPrompt,
+      steeringPrompt: plannerSteering.prompt,
+      lessons: plannerLessons.block || undefined,
       workspace: this.localWorkspace(worktreePath, taskId, "planner", projectId),
       budgetSeconds: this.budgetForTier(tier, "planner"),
       environment: this.agentEnvironment(),
-      skillFiles: this.skills.skillsForAgent("planner"),
-      metadata: { description, tier, attempt },
-      model: this.plannerModel(tier),
-      lessons: plannerLessons.block || undefined
-    } as const;
-    const plannerContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(plannerTask));
+      skillFiles: this.skills.skillsForAgent("planner")
+    });
+    const plannerTask = plannerEnvelope.task;
+    const plannerContextEnvelopeHash = plannerEnvelope.contextEnvelopeHash;
+    if (attempt > 0 && retryPromptExceedsTokenCap(plannerTask.prompt)) {
+      const currentTask = this.requireTask(taskId);
+      this.pauseForIntervention({
+        taskId,
+        projectId,
+        fromStage: currentTask.state,
+        failureCategory: "planner_prompt_budget_exceeded",
+        failureReason: "planner retry prompt exceeded token budget; request narrower critique/scope",
+        forensics: {
+          agent: "planner",
+          transcript_stage: transcriptStage,
+          attempt,
+          estimated_prompt_tokens: Math.ceil(plannerTask.prompt.length / 4)
+        }
+      });
+    }
     const plannerResult = await plannerExecutor.execute(plannerTask);
     this.recordSteeringConsumed({
       taskId,
@@ -744,7 +764,7 @@ export class OrchestratorService {
       executorUsed: plannerExecutor.name,
       model: this.plannerModel(tier),
       systemPrompt: transcript?.systemPrompt ?? plannerDispatch.content,
-      userPrompt: transcript?.userPrompt ?? plannerPrompt,
+      userPrompt: transcript?.userPrompt ?? plannerTask.prompt,
       transcript: turnsJsonl,
       output: plannerResult.output ? JSON.stringify(plannerResult.output) : null,
       critique,
@@ -850,93 +870,6 @@ export class OrchestratorService {
     });
 
     return parsed;
-  }
-
-  private buildPlannerPrompt(params: {
-    description: string;
-    tier: Tier;
-    phase: PlannerRequestedPhase;
-    transcriptAttemptIndex: number;
-    priorPlan?: PlanSubtask[];
-    approvedSpec?: PlannerSpecArtifacts | null;
-    priorSpecArtifacts?: PlannerSpecArtifacts | null;
-    critique: string | null;
-    currentBlockingQuestion?: string | null;
-  }): string {
-    const assessment = assessComplexity(params.description);
-    const lines: string[] = [];
-    lines.push("## Phase");
-    lines.push(params.phase);
-    lines.push("");
-    lines.push(`## Task`);
-    lines.push(params.description);
-    lines.push("");
-    lines.push(`## Complexity signals`);
-    lines.push(
-      `Tier: ${params.tier} | Scope: ${assessment.scope} | Risk: ${assessment.risk} | Coupling: ${assessment.coupling}`
-    );
-    lines.push("");
-    lines.push("## Knowledgebase requirement");
-    lines.push(
-      "If QMD is configured (QMD_MCP_URL present), you MUST build context from QMD first and emit planningContext.qmdContext evidence in .autoforge-status.json."
-    );
-    lines.push(
-      "Outputs missing required QMD evidence are rejected and the task is paused for intervention."
-    );
-
-    if (params.phase === "execution_plan" && params.approvedSpec) {
-      lines.push("");
-      lines.push("## Approved Spec");
-      lines.push(JSON.stringify(params.approvedSpec, null, 2));
-    }
-
-    const attempt = params.transcriptAttemptIndex;
-    const crit = params.critique?.trim() ?? "";
-
-    if (params.phase === "execution_plan" && attempt > 0 && params.priorPlan && crit.length > 0) {
-      lines.push("");
-      lines.push(`## Prior plan (attempt ${attempt - 1})`);
-      lines.push(JSON.stringify(params.priorPlan, null, 2));
-      if (params.approvedSpec) {
-        lines.push("");
-        lines.push("## Approved Spec (reference)");
-        lines.push(JSON.stringify(params.approvedSpec, null, 2));
-      }
-      lines.push("");
-      lines.push("## Human feedback on prior plan");
-      lines.push(crit);
-      lines.push("");
-      lines.push("## Instructions");
-      lines.push(
-        "Revise the plan to address the feedback. Prefer minimal changes — keep subtasks that were not critiqued, unless the feedback implies they should change."
-      );
-      return lines.join("\n");
-    }
-
-    if (params.phase === "spec" && attempt > 0 && params.priorSpecArtifacts && crit.length > 0) {
-      lines.push("");
-      lines.push(`## Prior discovery/spec (attempt ${attempt - 1})`);
-      lines.push(JSON.stringify(params.priorSpecArtifacts, null, 2));
-      lines.push("");
-      if (params.currentBlockingQuestion && params.currentBlockingQuestion.trim()) {
-        lines.push("## Operator Answer To Question");
-        lines.push(`> Q: ${params.currentBlockingQuestion}`);
-        lines.push("");
-        lines.push("A:");
-        lines.push(crit);
-      } else {
-        lines.push("## Operator Critique");
-        lines.push(crit);
-      }
-      lines.push("");
-      lines.push("## Instructions");
-      lines.push(
-        "Revise discovery/spec to address the feedback. Prefer minimal edits — retain validated intent unless the critique explicitly challenges it."
-      );
-      return lines.join("\n");
-    }
-
-    return lines.join("\n");
   }
 
   async approveSpec(taskId: string): Promise<PipelineTask> {
@@ -1253,22 +1186,21 @@ export class OrchestratorService {
       });
       const docSteering = this.steeringForDispatch(taskId);
       const baseDocPrompt = buildDocPrompt(task.description, task.planSubtasks);
-      const docPrompt = docSteering.prompt
-        ? `${docSteering.prompt}\n\n${baseDocPrompt}`
-        : baseDocPrompt;
-      const docTask = {
+      const docEnvelope = buildAgentDispatchEnvelope({
         id: `${taskId}-doc`,
         type: "doc",
         systemPrompt: docDispatch.content,
-        prompt: docPrompt,
+        basePrompt: baseDocPrompt,
+        steeringPrompt: docSteering.prompt,
         workspace: this.localWorkspace(worktreePath, taskId, "doc", task.projectId),
         budgetSeconds: this.budgetForTier(task.tier, "doc"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("doc"),
         metadata: { taskId, description: task.description },
         lessons: docLessons.block || undefined
-      } as const;
-      const docContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(docTask));
+      });
+      const docTask = docEnvelope.task;
+      const docContextEnvelopeHash = docEnvelope.contextEnvelopeHash;
       const docResult = await docExecutor.execute(docTask);
       this.recordSteeringConsumed({
         taskId,
@@ -2456,22 +2388,21 @@ export class OrchestratorService {
 
         const coderSteering = this.steeringForDispatch(taskId);
         const baseCoderPrompt = buildCoderPrompt(description, subtask, iteration);
-        const coderPrompt = coderSteering.prompt
-          ? `${coderSteering.prompt}\n\n${baseCoderPrompt}`
-          : baseCoderPrompt;
-        const liveTask = {
+        const coderEnvelope = buildAgentDispatchEnvelope({
           id: subtask.id,
           type: subtaskAgentType,
           systemPrompt: subtaskDispatch.content,
-          prompt: coderPrompt,
+          basePrompt: baseCoderPrompt,
+          steeringPrompt: coderSteering.prompt,
           workspace: this.localWorkspace(worktreePath, taskId, subtask.id, projectId),
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
-        };
-        const subtaskContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(liveTask));
+        });
+        const liveTask = coderEnvelope.task;
+        const subtaskContextEnvelopeHash = coderEnvelope.contextEnvelopeHash;
         this.recordEvent({
           taskId,
           projectId,
@@ -2625,22 +2556,21 @@ export class OrchestratorService {
 
       const reviewerSteering = this.steeringForDispatch(taskId);
       const baseReviewerPrompt = buildReviewerPrompt(description, planSubtasks);
-      const reviewerPrompt = reviewerSteering.prompt
-        ? `${reviewerSteering.prompt}\n\n${baseReviewerPrompt}`
-        : baseReviewerPrompt;
-      const reviewerTask = {
+      const reviewerEnvelope = buildAgentDispatchEnvelope({
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
         systemPrompt: reviewerDispatch.content,
-        prompt: reviewerPrompt,
+        basePrompt: baseReviewerPrompt,
+        steeringPrompt: reviewerSteering.prompt,
         workspace: this.localWorkspace(worktreePath, taskId, `reviewer-${iteration}`, projectId),
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description },
         lessons: reviewerLessons.block || undefined
-      } as const;
-      const reviewerContextEnvelopeHash = hashContextEnvelope(buildContextEnvelopeFromTask(reviewerTask));
+      });
+      const reviewerTask = reviewerEnvelope.task;
+      const reviewerContextEnvelopeHash = reviewerEnvelope.contextEnvelopeHash;
       const reviewResult = await reviewerExecutor.execute(reviewerTask);
       this.recordSteeringConsumed({
         taskId,
@@ -3241,6 +3171,13 @@ export class OrchestratorService {
     if (input.personaVersionId) provenance.persona_version_id = input.personaVersionId;
     if (input.skillVersionIds?.length) provenance.skill_version_ids = input.skillVersionIds;
     if (input.analyticsOnly) provenance.__analytics_only = true;
+    if (input.contextEnvelopeHash) provenance.context_envelope_hash = input.contextEnvelopeHash;
+    if (input.contextEnvelopeHash && input.tokenUsage) {
+      const stats = this.deps.db.envelopeHashStats(input.projectId, input.contextEnvelopeHash);
+      provenance.context_envelope_prior_occurrences = stats.occurrences;
+      provenance.token_input_delta_from_last_hash =
+        stats.lastTokenInput === null ? null : input.tokenUsage.input - stats.lastTokenInput;
+    }
 
     const message: AutoforgeMessage = {
       id: randomUUID(),

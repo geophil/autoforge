@@ -37,7 +37,7 @@ describe("AnthropicProvider", () => {
       model: "claude-sonnet-test",
       max_tokens: 1234,
       system: [{ type: "text", text: "system", cache_control: { type: "ephemeral" } }],
-      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      messages: [{ role: "user", content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] }],
       tools: [
         {
           name: "read_file",
@@ -71,5 +71,34 @@ describe("AnthropicProvider", () => {
     });
 
     expect(response.stopReason).toBe("refusal");
+  });
+
+  test("only caches the first user text block", async () => {
+    const captured: { params?: any } = {};
+    const provider = new AnthropicProvider({
+      apiKey: "test-key",
+      createMessage: async (params) => {
+        captured.params = params;
+        return {
+          usage: { input_tokens: 1, output_tokens: 1 },
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "done" }]
+        };
+      }
+    });
+
+    await provider.message({
+      model: "claude-sonnet-test",
+      systemPrompt: "system",
+      history: [
+        { role: "user", content: [{ type: "text", text: "first" }] },
+        { role: "assistant", content: [{ type: "text", text: "ack" }] },
+        { role: "user", content: [{ type: "text", text: "second" }] }
+      ],
+      tools: []
+    });
+
+    expect(captured.params.messages[0].content[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(captured.params.messages[2].content[0].cache_control).toBeUndefined();
   });
 });
