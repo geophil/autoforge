@@ -251,6 +251,7 @@ h2 {
 .badge-state[data-state="awaiting_approval"] { background: var(--cyan-dim); color: var(--cyan); }
 .badge-state[data-state="executing"],
 .badge-state[data-state="reviewing"],
+.badge-state[data-state="reworking"],
 .badge-state[data-state="planning"],
 .badge-state[data-state="documenting"] { background: var(--orange-dim); color: var(--orange); }
 
@@ -266,6 +267,7 @@ h2 {
 .badge-state[data-state="awaiting_approval"]::before { content: "⇡"; }
 .badge-state[data-state="executing"]::before,
 .badge-state[data-state="reviewing"]::before,
+.badge-state[data-state="reworking"]::before,
 .badge-state[data-state="planning"]::before,
 .badge-state[data-state="documenting"]::before { content: "●"; }
 .badge-state[data-state="completed"]::before { content: "✓"; }
