@@ -1,20 +1,4 @@
 {
-  "status": "DONE_WITH_CONCERNS",
-  "artifacts": [".autoforge-review.md"],
-  "concerns": "One MAJOR defect: dashboard.js:1276 reads `p.candidate_executor` but shadow.ts emits `candidate_executor_used`. The executor column in the shadow variants strip always displays '—'. Fix: `p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null`.",
-  "output": {
-    "findings": [
-      {
-        "severity": "MAJOR",
-        "category": "correctness",
-        "description": "Field name mismatch between producer and consumer: shadow.ts records the candidate executor as `candidate_executor_used` (lines 70, 93, 132, 141), but dashboard.js:1276 reads `p.candidate_executor ?? p.executor`. Neither field exists in the payload, so the executor column always renders '—'. Fix: change to `p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null`.",
-        "filePath": "src/web/public/dashboard.js"
-      }
-    ]
-  },
-  "testResults": {
-    "passed": 565,
-    "failed": 0,
-    "files": 77
-  }
+  "status": "DONE",
+  "artifacts": ["src/orchestrator/service.ts", "src/orchestrator/shadow.ts", "tests/unit/subtask-started.test.ts"]
 }
