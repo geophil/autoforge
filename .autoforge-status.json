@@ -1,4 +1,4 @@
 {
   "status": "DONE",
-  "artifacts": ["src/web/public/dashboard.js", "src/web/public/styles.css"]
+  "artifacts": ["src/orchestrator/service.ts", "src/orchestrator/shadow.ts"]
 }

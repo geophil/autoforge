@@ -898,7 +898,7 @@ async function loadEvents(taskId) {
         <span class="cost-stat"><span class="cost-label">Est. cost</span> $${estimatedCostUsd.toFixed(4)}</span>`;
     }
 
-    markSubtaskProgress(events);
+    updateSubtaskCards(events, currentTask);
     if (currentTask && currentTask.id === taskId) updateExecProgressHeader(events);
   } catch {
     container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">Could not load events.</span>`;
@@ -906,31 +906,268 @@ async function loadEvents(taskId) {
 }
 
 /**
- * Walk event history and mark each subtask card with its current status.
- * - subtask_done → done (green check)
- * - if a subtask_done fired for subtask N but not yet for N+1, and the task
- *   is in a running state, mark N+1 as "running" (pulse)
- * - otherwise pending (dim)
+ * Walk event history and update each subtask card with enriched status,
+ * runtime info (executor, elapsed, tokens), per-iteration history strip,
+ * and review findings badges. Replaces the simpler markSubtaskProgress.
  */
-function markSubtaskProgress(events) {
-  const doneIds = new Set();
+function updateSubtaskCards(events, task) {
+  if (!task) return;
+  const currentIteration = task.iteration ?? 1;
+  const subtasks = task.planSubtasks || [];
+
+  // --- Pass 1: collect per-subtask, per-iteration run data ---
+  // subtaskRuns[subtaskId][iteration] = { startedEvent, doneEvent }
+  const subtaskRuns = {};
+  const failedSubtaskIds = new Set();
+
   for (const ev of events) {
+    if (ev.type === "subtask_started" && ev.payload?.subtaskId) {
+      const sid = ev.payload.subtaskId;
+      const iter = ev.payload.iteration ?? currentIteration;
+      if (!subtaskRuns[sid]) subtaskRuns[sid] = {};
+      if (!subtaskRuns[sid][iter]) subtaskRuns[sid][iter] = { startedEvent: null, doneEvent: null };
+      subtaskRuns[sid][iter].startedEvent = ev;
+    }
     if (ev.type === "subtask_done" && ev.payload?.subtaskId) {
-      doneIds.add(ev.payload.subtaskId);
+      const sid = ev.payload.subtaskId;
+      const iter = ev.payload.iteration ?? currentIteration;
+      if (!subtaskRuns[sid]) subtaskRuns[sid] = {};
+      if (!subtaskRuns[sid][iter]) subtaskRuns[sid][iter] = { startedEvent: null, doneEvent: null };
+      subtaskRuns[sid][iter].doneEvent = ev;
+    }
+    if (ev.type === "failure_analysis" && ev.payload?.subtask_id) {
+      failedSubtaskIds.add(ev.payload.subtask_id);
     }
   }
 
+  // --- Pass 2: collect review findings per iteration ---
+  const reviewByIteration = {};
+  for (const ev of events) {
+    if (ev.type === "review_finding") {
+      const iter = ev.payload?.iteration ?? currentIteration;
+      if (!reviewByIteration[iter]) reviewByIteration[iter] = { findings: [], hasDone: false };
+      reviewByIteration[iter].findings.push({
+        severity: ev.payload?.severity ?? "MINOR",
+        title: ev.payload?.title ?? ev.payload?.description ?? ev.payload?.finding ?? "",
+        location: ev.payload?.location ?? ev.payload?.file_path ?? ev.payload?.path ?? ""
+      });
+    }
+    if (ev.type === "review_done") {
+      const iter = ev.payload?.iteration ?? currentIteration;
+      if (!reviewByIteration[iter]) reviewByIteration[iter] = { findings: [], hasDone: false };
+      reviewByIteration[iter].hasDone = true;
+    }
+  }
+
+  // --- Legacy path setup (no subtask_started events) ---
+  const hasStartedEvents = events.some(
+    (ev) => ev.type === "subtask_started" && ev.payload?.subtaskId
+  );
+  const legacyDoneIds = hasStartedEvents
+    ? null
+    : new Set(
+        events
+          .filter((ev) => ev.type === "subtask_done" && ev.payload?.subtaskId)
+          .map((ev) => ev.payload.subtaskId)
+      );
+  let legacyRunningAssigned = false;
+
+  // --- Update each card ---
   const items = document.querySelectorAll("[data-subtask-id]");
-  let runningAssigned = false;
   items.forEach((el) => {
-    const id = el.getAttribute("data-subtask-id");
-    if (doneIds.has(id)) {
-      el.setAttribute("data-subtask-status", "done");
-    } else if (!runningAssigned) {
-      el.setAttribute("data-subtask-status", "running");
-      runningAssigned = true;
+    const subtaskId = el.getAttribute("data-subtask-id");
+
+    // Determine current status for this subtask
+    let status = "pending";
+    let latestDoneEvent = null;
+    let latestStartedEvent = null;
+    let latestIter = null;
+
+    if (hasStartedEvents) {
+      const runs = subtaskRuns[subtaskId] || {};
+      const iters = Object.keys(runs).map(Number).sort((a, b) => a - b);
+      if (iters.length > 0) {
+        latestIter = iters[iters.length - 1];
+        const latestRun = runs[latestIter];
+        latestStartedEvent = latestRun.startedEvent;
+        latestDoneEvent = latestRun.doneEvent;
+
+        if (latestDoneEvent) {
+          const s = latestDoneEvent.payload?.status ?? latestDoneEvent.status ?? "done";
+          status = s === "done_with_concerns" ? "done_with_concerns" : "done";
+        } else if (latestStartedEvent) {
+          status = failedSubtaskIds.has(subtaskId) ? "failed" : "running";
+        }
+      } else if (failedSubtaskIds.has(subtaskId)) {
+        status = "failed";
+      }
     } else {
-      el.setAttribute("data-subtask-status", "pending");
+      // Legacy: first non-done subtask is "running" if task is actively running
+      if (legacyDoneIds.has(subtaskId)) {
+        status = "done";
+      } else if (!legacyRunningAssigned && RUNNING_STATES.has(task.state)) {
+        status = "running";
+        legacyRunningAssigned = true;
+      }
+    }
+
+    el.setAttribute("data-subtask-status", status);
+
+    // --- Populate runtime div (executor, elapsed, tokens) ---
+    const runtimeEl = el.querySelector(".subtask-runtime");
+    if (runtimeEl) {
+      if (latestDoneEvent || latestStartedEvent) {
+        const parts = [];
+
+        let executorUsed = null;
+        let elapsedDisplay = null;
+        let tokenDisplay = null;
+
+        if (latestDoneEvent) {
+          executorUsed =
+            latestDoneEvent.payload?.executorUsed ??
+            latestDoneEvent.payload?.executor_used ??
+            latestDoneEvent.executorUsed ??
+            null;
+          const elapsed =
+            latestDoneEvent.elapsedSeconds ??
+            latestDoneEvent.payload?.elapsedSeconds ??
+            latestDoneEvent.payload?.elapsed_seconds ??
+            null;
+          if (elapsed != null) elapsedDisplay = formatElapsed(elapsed);
+          const tu =
+            latestDoneEvent.tokenUsage ?? latestDoneEvent.payload?.tokenUsage ?? null;
+          if (tu && (tu.input > 0 || tu.output > 0)) {
+            const cost = (
+              tu.input * INPUT_COST_PER_TOKEN +
+              tu.output * OUTPUT_COST_PER_TOKEN
+            ).toFixed(4);
+            tokenDisplay = `${tu.input.toLocaleString()} in / ${tu.output.toLocaleString()} out · $${cost}`;
+          }
+        } else if (latestStartedEvent && status === "running") {
+          const elapsed =
+            (Date.now() - new Date(latestStartedEvent.timestamp).getTime()) / 1000;
+          elapsedDisplay = formatElapsed(elapsed);
+        }
+
+        parts.push(
+          `<span class="subtask-executor">${esc(executorUsed || "—")}</span>`
+        );
+        if (elapsedDisplay) {
+          parts.push(`<span class="subtask-elapsed">${esc(elapsedDisplay)}</span>`);
+        }
+        if (tokenDisplay) {
+          parts.push(`<span class="subtask-tokens">${esc(tokenDisplay)}</span>`);
+        }
+
+        runtimeEl.innerHTML = `<div class="subtask-runtime-row">${parts.join(
+          '<span class="subtask-runtime-sep"> · </span>'
+        )}</div>`;
+      } else {
+        runtimeEl.innerHTML = "";
+      }
+    }
+
+    // --- Populate history strip (one dot per iteration the subtask ran) ---
+    const historyEl = el.querySelector(".subtask-history-strip");
+    if (historyEl) {
+      const runs = subtaskRuns[subtaskId] || {};
+      const iters = Object.keys(runs).map(Number).sort((a, b) => a - b);
+
+      if (iters.length === 0) {
+        historyEl.innerHTML = "";
+        return;
+      }
+
+      const entriesHtml = iters.map((iter) => {
+        const run = runs[iter];
+        let dotClass = "subtask-history-dot";
+        let dotTitle = `Iter ${iter}`;
+
+        if (run.doneEvent) {
+          const s = run.doneEvent.payload?.status ?? run.doneEvent.status ?? "done";
+          if (s === "done_with_concerns") {
+            dotClass += " subtask-history-dot--concerns";
+            dotTitle += ": done with concerns";
+          } else {
+            dotClass += " subtask-history-dot--success";
+            dotTitle += ": done";
+          }
+        } else if (run.startedEvent) {
+          if (failedSubtaskIds.has(subtaskId) && iter === latestIter) {
+            dotClass += " subtask-history-dot--failure";
+            dotTitle += ": failed";
+          } else {
+            dotClass += " subtask-history-dot--running";
+            dotTitle += ": running";
+          }
+        } else {
+          dotClass += " subtask-history-dot--success";
+          dotTitle += ": completed";
+        }
+
+        // Review findings badge for this iteration
+        const review = reviewByIteration[iter];
+        let badgeHtml = "";
+        let panelId = null;
+        let findingsPanelHtml = "";
+
+        if (review) {
+          const high = review.findings.filter(
+            (f) => f.severity === "CRITICAL" || f.severity === "MAJOR"
+          ).length;
+          const low = review.findings.filter(
+            (f) => f.severity === "MINOR" || f.severity === "NITPICK"
+          ).length;
+
+          if (high > 0 || low > 0) {
+            const highBadge = high > 0
+              ? `<span class="subtask-findings-count subtask-findings-count--high">${high}</span>`
+              : "";
+            const lowBadge = low > 0
+              ? `<span class="subtask-findings-count subtask-findings-count--low">${low}</span>`
+              : "";
+            badgeHtml = `<span class="subtask-findings-badge" aria-hidden="true">${highBadge}${lowBadge}</span>`;
+          }
+
+          if (review.findings.length > 0 || review.hasDone) {
+            panelId = `subtask-findings-${subtaskId}-iter-${iter}`;
+            const findingsHtml =
+              review.findings.length > 0
+                ? review.findings
+                    .map(
+                      (f) => `
+                  <div class="subtask-finding-item">
+                    <span class="finding-severity" data-severity="${esc(f.severity)}">${esc(f.severity)}</span>
+                    <div class="subtask-finding-body">
+                      <div class="finding-text">${esc(f.title)}</div>
+                      ${f.location ? `<div class="finding-path">${esc(f.location)}</div>` : ""}
+                    </div>
+                  </div>`
+                    )
+                    .join("")
+                : `<div class="subtask-finding-empty">No findings recorded.</div>`;
+            findingsPanelHtml = `
+              <div class="subtask-findings-panel" id="${panelId}" hidden>
+                <div class="subtask-findings-header">Review findings — iter ${iter}</div>
+                ${findingsHtml}
+              </div>`;
+            dotTitle += ` · ${review.findings.length} finding${review.findings.length !== 1 ? "s" : ""}`;
+          }
+        }
+
+        const clickAttr = panelId
+          ? `onclick="toggleFindingsPanel('${panelId}', this)" tabindex="0" role="button"`
+          : "";
+
+        return `
+          <div class="subtask-history-entry">
+            <span class="${dotClass}" ${clickAttr} title="${esc(dotTitle)}">${badgeHtml}</span>
+            ${findingsPanelHtml}
+          </div>`;
+      }).join("");
+
+      historyEl.innerHTML = `<div class="subtask-history-strip-inner">${entriesHtml}</div>`;
     }
   });
 }
@@ -1288,6 +1525,13 @@ async function deleteTask(taskId, event) {
     toast(`Delete failed: ${err.message}`, 'error');
   }
 }
+
+window.toggleFindingsPanel = (panelId, dotEl) => {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  panel.hidden = !panel.hidden;
+  dotEl.classList.toggle("subtask-history-dot--expanded", !panel.hidden);
+};
 
 // Make actions available from inline onclick handlers
 window.approveTask = approveTask;
