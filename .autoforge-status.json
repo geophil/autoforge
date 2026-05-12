@@ -1,4 +1,15 @@
 {
-  "status": "DONE",
-  "artifacts": ["src/web/public/dashboard.js", "src/web/public/styles.css"]
+  "status": "DONE_WITH_CONCERNS",
+  "artifacts": [".autoforge-review.md"],
+  "concerns": "One MAJOR defect: dashboard.js:1284 reads p.candidate_executor but shadow.ts emits candidate_executor_used — the executor column in the shadow variants strip will always render '—'. Fix: p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null. All 565 tests pass. All other acceptance criteria pass.",
+  "output": {
+    "findings": [
+      {
+        "severity": "MAJOR",
+        "category": "correctness",
+        "description": "Shadow variants strip executor column always shows '—': dashboard.js:1284 reads p.candidate_executor but shadow.ts emits the field as candidate_executor_used. Fix: change to p.candidate_executor_used ?? p.candidate_executor ?? p.executor ?? null.",
+        "filePath": "src/web/public/dashboard.js"
+      }
+    ]
+  }
 }
