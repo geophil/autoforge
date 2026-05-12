@@ -50,6 +50,11 @@ import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
 
 const QMD_TOOL_NAMES = new Set(["query", "get", "multi_get", "status"]);
+const ARTIFACT_VALIDATION_MISMATCH_THRESHOLD = 0.4;
+const ARTIFACT_VALIDATION_IGNORED_PATHS = new Set([
+  ".autoforge-status.json",
+  ".autoforge-worktree.json"
+]);
 
 interface ServiceDeps {
   env: AppEnv;
@@ -2532,13 +2537,30 @@ export class OrchestratorService {
           });
         }
 
+        const artifactValidation = this.validateArtifactReport(worktreePath, coderResult.artifacts);
+        const artifactMismatchConcern =
+          artifactValidation.status === "mismatch"
+            ? `reported artifacts diverge from changed files (ratio=${artifactValidation.mismatch_ratio})`
+            : null;
+        const subtaskConcerns = [coderResult.concerns, artifactMismatchConcern]
+          .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+          .join(" | ");
+
         this.recordEvent({
           taskId,
           projectId,
           agent: subtaskAgentType,
           type: "subtask_done",
-          status: coderResult.status === "DONE" ? "done" : "done_with_concerns",
-          payload: { subtaskId: subtask.id, artifacts: coderResult.artifacts, concerns: coderResult.concerns },
+          status:
+            coderResult.status === "DONE" && artifactValidation.status !== "mismatch"
+              ? "done"
+              : "done_with_concerns",
+          payload: {
+            subtaskId: subtask.id,
+            artifacts: coderResult.artifacts,
+            concerns: subtaskConcerns.length > 0 ? subtaskConcerns : undefined,
+            artifact_validation: artifactValidation
+          },
           budgetSeconds: this.budgetForTier(tier, "coder"),
           elapsedSeconds: coderResult.metrics.elapsedSeconds,
           tokenUsage: coderResult.metrics.tokenInput !== undefined ? {
@@ -2899,6 +2921,93 @@ export class OrchestratorService {
       };
     }
     return { checkpoint_id: null, checkpoint_stage: null };
+  }
+
+  private validateArtifactReport(worktreePath: string, reportedArtifacts: string[]): {
+    status: "ok" | "mismatch" | "unavailable";
+    reported_count: number;
+    observed_count: number;
+    overlap_count: number;
+    mismatch_ratio: number;
+    threshold: number;
+    missing_reported: string[];
+    unexpected_changed: string[];
+  } {
+    const observedFiles = this.listPendingChangedFiles(worktreePath);
+    if (observedFiles === null) {
+      return {
+        status: "unavailable",
+        reported_count: reportedArtifacts.length,
+        observed_count: 0,
+        overlap_count: 0,
+        mismatch_ratio: 0,
+        threshold: ARTIFACT_VALIDATION_MISMATCH_THRESHOLD,
+        missing_reported: [],
+        unexpected_changed: []
+      };
+    }
+
+    const reported = new Set(
+      reportedArtifacts
+        .map((path) => normalizeArtifactPath(path))
+        .filter((path): path is string => path.length > 0 && !ARTIFACT_VALIDATION_IGNORED_PATHS.has(path))
+    );
+    const observed = new Set(
+      observedFiles
+        .map((path) => normalizeArtifactPath(path))
+        .filter((path): path is string => path.length > 0 && !ARTIFACT_VALIDATION_IGNORED_PATHS.has(path))
+    );
+
+    const missingReported = [...reported].filter((path) => !observed.has(path)).sort();
+    const unexpectedChanged = [...observed].filter((path) => !reported.has(path)).sort();
+    const overlapCount = [...reported].filter((path) => observed.has(path)).length;
+    const unionSize = new Set([...reported, ...observed]).size;
+    const mismatchRatio =
+      unionSize === 0
+        ? 0
+        : Number(((missingReported.length + unexpectedChanged.length) / unionSize).toFixed(3));
+    const status =
+      mismatchRatio > ARTIFACT_VALIDATION_MISMATCH_THRESHOLD
+        ? "mismatch"
+        : "ok";
+
+    return {
+      status,
+      reported_count: reported.size,
+      observed_count: observed.size,
+      overlap_count: overlapCount,
+      mismatch_ratio: mismatchRatio,
+      threshold: ARTIFACT_VALIDATION_MISMATCH_THRESHOLD,
+      missing_reported: missingReported,
+      unexpected_changed: unexpectedChanged
+    };
+  }
+
+  private listPendingChangedFiles(worktreePath: string): string[] | null {
+    try {
+      const porcelain = execSync("git -c core.quotepath=false status --porcelain --untracked-files=all", {
+        cwd: worktreePath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      });
+      const rows = porcelain
+        .split("\n")
+        .map((line) => line.trimEnd())
+        .filter((line) => line.length >= 4);
+      const paths: string[] = [];
+      for (const row of rows) {
+        const body = row.slice(3).trim();
+        if (!body) continue;
+        const renamed = body.includes(" -> ")
+          ? body.slice(body.lastIndexOf(" -> ") + 4)
+          : body;
+        const normalized = normalizeArtifactPath(renamed);
+        if (normalized.length > 0) paths.push(normalized);
+      }
+      return [...new Set(paths)].sort();
+    } catch {
+      return null;
+    }
   }
 
   private failureDiagnosticsForResult(args: {
@@ -3598,4 +3707,9 @@ function normalizeToolStats(
     search_count: Number(stats.searchCount ?? stats.search_count ?? 0),
     iterations: Number(stats.iterations ?? 0)
   };
+}
+
+function normalizeArtifactPath(path: string): string {
+  const normalized = path.trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
+  return normalized;
 }
