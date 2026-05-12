@@ -33,7 +33,15 @@
 
       <dialog id="dialog-new-task">
         <form id="form-new-task" method="dialog">
-          <h3>Submit Task</h3>
+          <p class="wizard-describe-kicker">Step 1 of 4</p>
+          <h3>Describe Task</h3>
+          <p class="wizard-describe-copy">Define what you want built, then continue into Spec and Plan review.</p>
+          <div class="wizard-step-track wizard-step-track-dialog" aria-hidden="true">
+            <div class="wizard-step current"><span class="wizard-step-dot">1</span><span class="wizard-step-label">Describe</span></div>
+            <div class="wizard-step todo"><span class="wizard-step-dot">2</span><span class="wizard-step-label">Spec</span></div>
+            <div class="wizard-step todo"><span class="wizard-step-dot">3</span><span class="wizard-step-label">Plan</span></div>
+            <div class="wizard-step todo"><span class="wizard-step-dot">4</span><span class="wizard-step-label">Execute</span></div>
+          </div>
           <label>
             Project ID
             <input type="text" name="projectId" value="autoforge" required />
@@ -189,6 +197,7 @@
   </dialog>
 
   <script src="/static/plan-markdown.js"></script>
+  <script src="/static/planning-wizard.js"></script>
   <script src="/static/dashboard.js"></script>
 </body>
 </html>
