@@ -1869,10 +1869,10 @@ button:disabled:not(.btn-working) {
   box-sizing: border-box;
   margin: 0.6rem 0 0.5rem;
   padding: 0.35rem 0.6rem;
-  background: var(--bg-base);
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  color: var(--text-primary);
+  color: var(--text);
   font-size: 0.82rem;
   outline: none;
 }
