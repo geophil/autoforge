@@ -570,6 +570,7 @@ function renderTaskDetail(task) {
           </div>` : ""}
           <div class="subtask-runtime"></div>
           <div class="subtask-history-strip"></div>
+          <div class="subtask-shadow-wrap"></div>
         </div>
       `).join("");
       const heading = `Plan (${subtasks.length} subtask${subtasks.length !== 1 ? "s" : ""})`;
@@ -972,6 +973,9 @@ function updateSubtaskCards(events, task) {
       );
   let legacyRunningAssigned = false;
 
+  // --- Compute shadow runs per subtask (for shadow variants strip) ---
+  const shadowBySubtask = buildShadowRunsPerSubtask(events);
+
   // --- Update each card ---
   const items = document.querySelectorAll("[data-subtask-id]");
   items.forEach((el) => {
@@ -1183,7 +1187,118 @@ function updateSubtaskCards(events, task) {
 
       historyEl.innerHTML = `<div class="subtask-history-strip-inner">${entriesHtml}</div>`;
     }
+
+    // --- Populate shadow variants strip ---
+    const shadowWrapEl = el.querySelector(".subtask-shadow-wrap");
+    if (shadowWrapEl) {
+      const shadowEvents = shadowBySubtask[subtaskId] || [];
+      shadowWrapEl.innerHTML = renderShadowVariantsStrip(shadowEvents);
+    }
   });
+}
+
+/**
+ * Walk the event list and build a map of subtaskId → array of shadow_run_completed events.
+ * Attachment rule:
+ *   - event has payload.subtask_id → attach to that subtask
+ *   - no payload.subtask_id (legacy) → attach to nearest preceding subtask_done on the same task
+ */
+function buildShadowRunsPerSubtask(events) {
+  const shadowBySubtask = {};
+  let lastSubtaskDoneId = null;
+
+  for (const ev of events) {
+    if (ev.type === "subtask_done" && ev.payload?.subtaskId) {
+      lastSubtaskDoneId = ev.payload.subtaskId;
+    }
+    if (ev.type === "shadow_run_completed") {
+      const sid = ev.payload?.subtask_id ?? lastSubtaskDoneId;
+      if (sid) {
+        if (!shadowBySubtask[sid]) shadowBySubtask[sid] = [];
+        shadowBySubtask[sid].push(ev);
+      }
+    }
+  }
+  return shadowBySubtask;
+}
+
+const SHADOW_MAX_DISPLAY = 20;
+
+/**
+ * Render the collapsed-by-default Shadow variants <details> strip for a subtask card.
+ * Returns an empty string when there are no matching shadow events (strip is hidden entirely).
+ */
+function renderShadowVariantsStrip(shadowEvents) {
+  if (!shadowEvents || shadowEvents.length === 0) return "";
+
+  const totalCount = shadowEvents.length;
+  const displayEvents = shadowEvents.slice(-SHADOW_MAX_DISPLAY);
+  const hasMore = totalCount > SHADOW_MAX_DISPLAY;
+
+  const rowsHtml = displayEvents.map((ev) => {
+    const p = ev.payload ?? {};
+    const variantId = p.candidate_variant_id;
+    const shortId = variantId ? String(variantId).slice(-8) : "—";
+    const executor = p.candidate_executor ?? p.executor ?? null;
+    const executorDisplay = executor ? esc(executor) : "—";
+
+    const baselineComposite = p.baseline_composite != null ? Number(p.baseline_composite) : null;
+    const candidateComposite = p.candidate_composite != null ? Number(p.candidate_composite) : null;
+    let deltaHtml;
+    if (baselineComposite != null && candidateComposite != null) {
+      const delta = candidateComposite - baselineComposite;
+      const sign = delta >= 0 ? "+" : "";
+      const colorClass = delta >= 0 ? "shadow-delta--positive" : "shadow-delta--negative";
+      deltaHtml = `<span class="shadow-delta ${colorClass}">${sign}${delta.toFixed(2)}</span>`;
+    } else {
+      deltaHtml = `<span class="shadow-delta shadow-delta--null">—</span>`;
+    }
+
+    const lessonsInjected = p.candidate_lessons_injected ?? 0;
+    const errorBadge = p.error ? `<span class="shadow-error-badge">error</span>` : "";
+    const iterLabel = p.iteration != null
+      ? `<span class="shadow-iter-label">iter ${p.iteration}</span>`
+      : "";
+
+    const renderKV = (label, obj) => {
+      if (!obj || typeof obj !== "object") return "";
+      const entries = Object.entries(obj);
+      if (entries.length === 0) return "";
+      return `<div class="shadow-components-section">
+        <div class="shadow-components-label">${esc(label)}</div>
+        ${entries.map(([k, v]) =>
+          `<div class="shadow-kv-row"><span class="shadow-kv-key">${esc(k)}</span><span class="shadow-kv-value">${esc(String(v))}</span></div>`
+        ).join("")}
+      </div>`;
+    };
+
+    const baseKV = renderKV("Baseline", p.baseline_score_components);
+    const candidateKV = renderKV("Candidate", p.candidate_score_components);
+    const expandContent = (baseKV || candidateKV)
+      ? `<div class="shadow-components">${baseKV}${candidateKV}</div>`
+      : `<div class="shadow-components"><span class="shadow-components-empty">No score components recorded.</span></div>`;
+
+    return `<details class="shadow-row">
+      <summary class="shadow-row-summary">
+        <span class="shadow-variant-id" title="${esc(variantId ?? "")}">${esc(shortId)}</span>
+        <span class="shadow-executor">${executorDisplay}</span>
+        ${deltaHtml}
+        <span class="shadow-lessons">${lessonsInjected}</span>
+        ${errorBadge}
+        ${iterLabel}
+      </summary>
+      ${expandContent}
+    </details>`;
+  }).join("");
+
+  const viewAllLink = hasMore
+    ? `<div class="shadow-view-all"><a href="#findings-section" onclick="document.getElementById('findings-section')?.scrollIntoView({behavior:'smooth'}); return false;">View all ${totalCount} in event log →</a></div>`
+    : "";
+
+  return `<details class="subtask-shadow-strip">
+    <summary class="subtask-shadow-summary">Shadow variants (${totalCount})</summary>
+    <div class="shadow-rows">${rowsHtml}${viewAllLink}</div>
+  </details>`;
 }
 
 // --- Task Actions ---
