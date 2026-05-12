@@ -1,4 +1,4 @@
 {
   "status": "DONE",
-  "artifacts": ["src/orchestrator/service.ts", "src/orchestrator/shadow.ts"]
+  "artifacts": ["tests/unit/subtask-started.test.ts"]
 }
