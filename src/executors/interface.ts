@@ -60,6 +60,13 @@ export interface AgentResult {
   artifacts: string[];
   concerns?: string;
   blockReason?: string;
+  diagnostics?: {
+    exitCode?: number | null;
+    stderrExcerpt?: string;
+    stdoutExcerpt?: string;
+    command?: string | null;
+    executorMode?: string | null;
+  };
   output?: unknown;
   metrics: {
     elapsedSeconds: number;

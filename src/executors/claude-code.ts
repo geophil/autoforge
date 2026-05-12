@@ -7,6 +7,28 @@ import type { AgentExecutor, AgentResult, AgentTask } from "./interface";
 import { buildStatusReportingPrompt, loadSkillFiles, readStatusFileFromWorkspace } from "./status-convention";
 import { requireLocalWorkspaceRoot } from "../runtime/local-workspace";
 
+class ClaudeSpawnError extends Error {
+  readonly exitCode: number | null;
+  readonly stderr: string;
+  readonly stdout: string;
+  readonly command: string;
+
+  constructor(args: {
+    message: string;
+    exitCode: number | null;
+    stderr: string;
+    stdout: string;
+    command: string;
+  }) {
+    super(args.message);
+    this.name = "ClaudeSpawnError";
+    this.exitCode = args.exitCode;
+    this.stderr = args.stderr;
+    this.stdout = args.stdout;
+    this.command = args.command;
+  }
+}
+
 /**
  * @deprecated Transitional local-only executor.
  *
@@ -41,10 +63,25 @@ export class ClaudeCodeExecutor implements AgentExecutor {
       if (timedOut) {
         return { status: "TIMEOUT", artifacts: [], metrics: { elapsedSeconds: task.budgetSeconds } };
       }
+      const diagnostics = err instanceof ClaudeSpawnError
+        ? {
+            exitCode: err.exitCode,
+            stderrExcerpt: excerpt(err.stderr),
+            stdoutExcerpt: excerpt(err.stdout),
+            command: err.command,
+            executorMode: this.name
+          }
+        : {
+            stderrExcerpt: excerpt(err instanceof Error ? err.message : String(err)),
+            stdoutExcerpt: "",
+            command,
+            executorMode: this.name
+          };
       return {
         status: "FAILED",
         artifacts: [],
-        blockReason: err instanceof Error ? err.message : String(err),
+        blockReason: formatFailureReason(err),
+        diagnostics,
         metrics: { elapsedSeconds }
       };
     } finally {
@@ -174,6 +211,7 @@ async function spawnClaude(
     child.stdin.end();
 
     let stderr = "";
+    let stdout = "";
     let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
 
     const budgetTimer = setTimeout(() => {
@@ -190,11 +228,22 @@ async function spawnClaude(
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
 
     child.on("error", (error) => {
       clearTimeout(budgetTimer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
-      reject(error);
+      reject(
+        new ClaudeSpawnError({
+          message: error.message,
+          exitCode: null,
+          stderr,
+          stdout,
+          command
+        })
+      );
     });
 
     child.on("close", (code) => {
@@ -204,8 +253,37 @@ async function spawnClaude(
       if (code === 0 || code === null) {
         resolve();
       } else {
-        reject(new Error(`claude exited with code ${code}: ${stderr.slice(0, 500)}`));
+        reject(
+          new ClaudeSpawnError({
+            message: `claude exited with code ${code}: ${stderr.slice(0, 500)}`,
+            exitCode: code,
+            stderr,
+            stdout,
+            command
+          })
+        );
       }
     });
   });
+}
+
+function excerpt(input: string, maxLen = 500): string {
+  const trimmed = input.trim();
+  if (!trimmed) return "";
+  return trimmed.length <= maxLen ? trimmed : `${trimmed.slice(0, maxLen)}...`;
+}
+
+function formatFailureReason(err: unknown): string {
+  if (err instanceof ClaudeSpawnError) {
+    const stderrSnippet = excerpt(err.stderr, 400);
+    const stdoutSnippet = excerpt(err.stdout, 200);
+    if (stderrSnippet) {
+      return `claude exited with code ${err.exitCode ?? "unknown"}: ${stderrSnippet}`;
+    }
+    if (stdoutSnippet) {
+      return `claude exited with code ${err.exitCode ?? "unknown"} (stdout excerpt): ${stdoutSnippet}`;
+    }
+    return `claude exited with code ${err.exitCode ?? "unknown"} with no diagnostics`;
+  }
+  return err instanceof Error ? err.message : String(err);
 }

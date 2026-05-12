@@ -288,6 +288,49 @@ describe("awaiting_intervention: coder failures surface with forensics", () => {
     const failure = events.find((e) => e.type === "failure_analysis" && e.payload.stage_failed === "executing");
     expect(failure!.payload.failure_category).toBe("coder_failed");
     expect(failure!.payload.failure_reason).toContain("Invalid MCP configuration");
+    expect(failure!.payload).toHaveProperty("exit_code");
+    expect(failure!.payload).toHaveProperty("stderr_excerpt");
+    expect(failure!.payload).toHaveProperty("stdout_excerpt");
+    expect(failure!.payload).toHaveProperty("command");
+    expect(failure!.payload).toHaveProperty("workspace_id");
+    expect(failure!.payload).toHaveProperty("checkpoint_stage");
+    expect(failure!.payload).toHaveProperty("checkpoint_id");
+  });
+
+  test("coder failure diagnostics include excerpt + workspace/checkpoint context when provided", async () => {
+    const { service, db } = createTestService(
+      {
+        coder: async () => ({
+          status: "FAILED",
+          artifacts: [],
+          blockReason: "claude exited with code 1:",
+          diagnostics: {
+            exitCode: 1,
+            stderrExcerpt: "Invalid MCP configuration",
+            stdoutExcerpt: "Loading config...",
+            command: "claude --print",
+            executorMode: "claude-code"
+          },
+          metrics: { elapsedSeconds: 0.15 }
+        })
+      },
+      { AUTOFORGE_RESUME_SUBTASK_ENABLED: "1" }
+    );
+
+    const task = await service.submitTask("autoforge", "tiny coder task", { forceTier: "EXPRESS" });
+    expect(task.state).toBe("awaiting_intervention");
+
+    const events = db.listEvents(task.id);
+    const failure = events.find((e) => e.type === "failure_analysis" && e.payload.stage_failed === "executing");
+    expect(failure).toBeDefined();
+    expect(failure!.payload.exit_code).toBe(1);
+    expect(failure!.payload.stderr_excerpt).toContain("Invalid MCP configuration");
+    expect(failure!.payload.stdout_excerpt).toContain("Loading config");
+    expect(failure!.payload.command).toContain("claude");
+    expect(failure!.payload.executor_mode).toBe("claude-code");
+    expect(typeof failure!.payload.workspace_id).toBe("string");
+    expect(failure!.payload.checkpoint_stage).toBe("task_start");
+    expect(typeof failure!.payload.checkpoint_id).toBe("string");
   });
 });
 
@@ -678,6 +721,126 @@ describe("retryFromIntervention", () => {
     // to awaiting_approval.
     expect(retried.state).toBe("awaiting_approval");
     expect(coderCalls).toBe(2);
+  });
+
+  test("retry from executing resumes from failed subtask when feature flag is enabled", async () => {
+    const coderCalls: string[] = [];
+    const { service } = createTestService(
+      {
+        planner: async () => ({
+          status: "DONE",
+          artifacts: [],
+          output: {
+            subtasks: [
+              {
+                id: "sub-1",
+                sequence: 1,
+                description: "first subtask",
+                filesInScope: ["src/a.ts"],
+                dependencies: [],
+                testCriteria: ["passes"]
+              },
+              {
+                id: "sub-2",
+                sequence: 2,
+                description: "second subtask",
+                filesInScope: ["src/b.ts"],
+                dependencies: ["sub-1"],
+                testCriteria: ["passes"]
+              }
+            ]
+          },
+          metrics: { elapsedSeconds: 0.2 }
+        }),
+        coder: async (task) => {
+          const subtaskId = String((task.metadata?.subtask as { id?: string } | undefined)?.id ?? "unknown");
+          coderCalls.push(subtaskId);
+          if (coderCalls.length === 2) {
+            return {
+              status: "FAILED",
+              artifacts: [],
+              blockReason: "sub-2 failed",
+              metrics: { elapsedSeconds: 0.1 }
+            };
+          }
+          return {
+            status: "DONE",
+            artifacts: [`src/${subtaskId}.ts`],
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+      },
+      { AUTOFORGE_RESUME_SUBTASK_ENABLED: "1" }
+    );
+
+    const paused = await service.submitTask("autoforge", "tiny coder task", { forceTier: "EXPRESS", reviewPlan: false });
+    expect(paused.state).toBe("awaiting_intervention");
+    expect(coderCalls).toEqual(["sub-1", "sub-2"]);
+
+    const retried = await service.retryFromIntervention(paused.id, { fromStage: "executing" });
+    expect(retried.state).toBe("awaiting_approval");
+    expect(coderCalls).toEqual(["sub-1", "sub-2", "sub-2"]);
+  });
+
+  test("retry from executing can force full replay even when resume mode is enabled", async () => {
+    const coderCalls: string[] = [];
+    const { service } = createTestService(
+      {
+        planner: async () => ({
+          status: "DONE",
+          artifacts: [],
+          output: {
+            subtasks: [
+              {
+                id: "sub-1",
+                sequence: 1,
+                description: "first subtask",
+                filesInScope: ["src/a.ts"],
+                dependencies: [],
+                testCriteria: ["passes"]
+              },
+              {
+                id: "sub-2",
+                sequence: 2,
+                description: "second subtask",
+                filesInScope: ["src/b.ts"],
+                dependencies: ["sub-1"],
+                testCriteria: ["passes"]
+              }
+            ]
+          },
+          metrics: { elapsedSeconds: 0.2 }
+        }),
+        coder: async (task) => {
+          const subtaskId = String((task.metadata?.subtask as { id?: string } | undefined)?.id ?? "unknown");
+          coderCalls.push(subtaskId);
+          if (coderCalls.length === 2) {
+            return {
+              status: "FAILED",
+              artifacts: [],
+              blockReason: "sub-2 failed",
+              metrics: { elapsedSeconds: 0.1 }
+            };
+          }
+          return {
+            status: "DONE",
+            artifacts: [`src/${subtaskId}.ts`],
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+      },
+      { AUTOFORGE_RESUME_SUBTASK_ENABLED: "1" }
+    );
+
+    const paused = await service.submitTask("autoforge", "tiny coder task", { forceTier: "EXPRESS", reviewPlan: false });
+    expect(paused.state).toBe("awaiting_intervention");
+
+    const retried = await service.retryFromIntervention(paused.id, {
+      fromStage: "executing",
+      forceFullReplay: true
+    });
+    expect(retried.state).toBe("awaiting_approval");
+    expect(coderCalls).toEqual(["sub-1", "sub-2", "sub-1", "sub-2"]);
   });
 
   test("retry from planning that fails again pauses correctly (state-machine valid)", async () => {

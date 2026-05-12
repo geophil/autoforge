@@ -44,6 +44,7 @@ import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayloa
 import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
 import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
 import { LocalWorkspace } from "../runtime/local-workspace";
+import type { Workspace } from "../runtime/workspace";
 import { isPlannerFallbackOutput, parsePlannerStructuredOutput } from "./planner-output";
 import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
@@ -761,6 +762,12 @@ export class OrchestratorService {
           agent: "planner",
           executor_used: plannerExecutor.name,
           model: this.plannerModel(tier),
+          ...this.failureDiagnosticsForResult({
+            taskId,
+            result: plannerResult,
+            workspace: plannerTask.workspace,
+            executorMode: plannerExecutor.name
+          }),
           persona_version_id: plannerPersonaId,
           skill_version_ids: plannerSkillIds,
           tool_stats: plannerResult.metrics.toolStats ?? null,
@@ -1565,6 +1572,8 @@ export class OrchestratorService {
       checkpointId?: string;
       operatorNote?: string;
       planningPhase?: "spec" | "execution_plan";
+      resumeSubtaskId?: string;
+      forceFullReplay?: boolean;
       /**
        * Bypass the `cannot_rollback_to_approved_spec` guard.
        *
@@ -1697,6 +1706,8 @@ export class OrchestratorService {
         previously_failed_stage: failedStage,
         checkpoint_id: opts.checkpointId ?? null,
         planning_phase: opts.planningPhase ?? null,
+        resume_subtask_id: opts.resumeSubtaskId ?? null,
+        force_full_replay: opts.forceFullReplay === true,
         operator_note: opts.operatorNote ?? null,
         iteration: retryIteration,
         force: opts.force === true
@@ -1920,10 +1931,25 @@ export class OrchestratorService {
 
     if (targetStage === "executing") {
       this.transition(taskId, task.projectId, "awaiting_intervention", "executing", { retry: true, iteration: retryIteration });
+      const resumeEnabled = this.deps.env.AUTOFORGE_RESUME_SUBTASK_ENABLED === "1";
+      const automaticResumeSubtaskId =
+        typeof lastFailure?.payload?.subtask_id === "string" ? (lastFailure.payload.subtask_id as string) : null;
+      const requestedResumeSubtaskId =
+        opts.resumeSubtaskId ?? (resumeEnabled && !opts.forceFullReplay ? automaticResumeSubtaskId : null);
+      let firstIterationSubtaskStartIndex = 0;
+      if (resumeEnabled && !opts.forceFullReplay && requestedResumeSubtaskId) {
+        const idx = task.planSubtasks.findIndex((subtask) => subtask.id === requestedResumeSubtaskId);
+        if (idx >= 0) {
+          firstIterationSubtaskStartIndex = idx;
+        } else if (opts.resumeSubtaskId) {
+          throw new Error("resume_subtask_not_found");
+        }
+      }
       try {
         await this.executeAndReview(
           taskId, task.projectId, task.description, task.tier,
-          task.planSubtasks, retryIteration, worktreePath, branch
+          task.planSubtasks, retryIteration, worktreePath, branch,
+          { firstIterationSubtaskStartIndex }
         );
       } catch (err) {
         if (err instanceof StageFailedError) {
@@ -2371,7 +2397,10 @@ export class OrchestratorService {
     planSubtasks: PlanSubtask[],
     startingIteration: number,
     worktreePath: string,
-    branch: string
+    branch: string,
+    options: {
+      firstIterationSubtaskStartIndex?: number;
+    } = {}
   ): Promise<void> {
     let iteration = startingIteration;
     let unresolvedFindings: ReviewFinding[] = [];
@@ -2390,7 +2419,13 @@ export class OrchestratorService {
 
       this.captureIterationDiff(taskId, worktreePath, iteration);
 
-      for (const subtask of planSubtasks) {
+      const firstIterationStart = options.firstIterationSubtaskStartIndex ?? 0;
+      const subtasksForIteration =
+        iteration === startingIteration
+          ? planSubtasks.slice(Math.max(0, firstIterationStart))
+          : planSubtasks;
+
+      for (const subtask of subtasksForIteration) {
         const subtaskAgentType = subtask.agentType ?? "coder";
         const subtaskDispatch = await this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
         const subtaskPersonaId = subtaskDispatch.selection.variantId;
@@ -2476,6 +2511,12 @@ export class OrchestratorService {
               subtask_id: subtask.id,
               subtask_description: subtask.description,
               executor_used: coderExecutor.name,
+              ...this.failureDiagnosticsForResult({
+                taskId,
+                result: coderResult,
+                workspace: liveTask.workspace,
+                executorMode: coderExecutor.name
+              }),
               persona_version_id: subtaskPersonaId,
               skill_version_ids: subtaskSkillIds,
               tool_stats: coderResult.metrics.toolStats ?? null,
@@ -2615,6 +2656,12 @@ export class OrchestratorService {
           forensics: {
             agent: "reviewer",
             ...reviewerFailureForensics,
+            ...this.failureDiagnosticsForResult({
+              taskId,
+              result: reviewResult,
+              workspace: reviewerTask.workspace,
+              executorMode: reviewerExecutor.name
+            }),
             planner_fallback: planSubtasks.length === 1 &&
               planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
             budget_seconds: this.budgetForTier(tier, "reviewer"),
@@ -2814,7 +2861,7 @@ export class OrchestratorService {
         failure_reason: failureReason,
         failure_category: failureCategory,
         awaiting_intervention: true
-      }),
+      }, taskId),
       budgetSeconds: 60
     });
     this.transition(taskId, projectId, fromStage, "awaiting_intervention", {
@@ -2834,6 +2881,43 @@ export class OrchestratorService {
       });
     }
     throw new StageFailedError(taskId, fromStage, failureReason);
+  }
+
+  private latestCheckpointContext(taskId: string): {
+    checkpoint_id: string | null;
+    checkpoint_stage: string | null;
+  } {
+    const events = this.deps.db.listEvents(taskId);
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i];
+      if (event.type !== "checkpoint_created") continue;
+      const payload = parseCheckpointPayload(event.payload);
+      if (!payload) continue;
+      return {
+        checkpoint_id: payload.checkpoint_id,
+        checkpoint_stage: payload.label.replaceAll("-", "_")
+      };
+    }
+    return { checkpoint_id: null, checkpoint_stage: null };
+  }
+
+  private failureDiagnosticsForResult(args: {
+    taskId: string;
+    result: AgentResult;
+    workspace?: Workspace;
+    executorMode: string;
+  }): Record<string, unknown> {
+    const checkpoint = this.latestCheckpointContext(args.taskId);
+    return {
+      exit_code: args.result.diagnostics?.exitCode ?? null,
+      stderr_excerpt: (args.result.diagnostics?.stderrExcerpt ?? "").trim(),
+      stdout_excerpt: (args.result.diagnostics?.stdoutExcerpt ?? "").trim(),
+      command: args.result.diagnostics?.command ?? null,
+      executor_mode: args.result.diagnostics?.executorMode ?? args.executorMode,
+      workspace_id: args.workspace?.id ?? null,
+      checkpoint_stage: checkpoint.checkpoint_stage,
+      checkpoint_id: checkpoint.checkpoint_id
+    };
   }
 
   /**
@@ -2871,8 +2955,28 @@ export class OrchestratorService {
       }
     }
 
+    const exitCode =
+      typeof payload.exit_code === "number" && Number.isFinite(payload.exit_code)
+        ? payload.exit_code
+        : null;
+    const stderrExcerpt = typeof payload.stderr_excerpt === "string" ? payload.stderr_excerpt : "";
+    const stdoutExcerpt = typeof payload.stdout_excerpt === "string" ? payload.stdout_excerpt : "";
+    const command = typeof payload.command === "string" ? payload.command : null;
+    const executorMode = typeof payload.executor_mode === "string" ? payload.executor_mode : null;
+    const workspaceId = typeof payload.workspace_id === "string" ? payload.workspace_id : null;
+    const checkpointStage = typeof payload.checkpoint_stage === "string" ? payload.checkpoint_stage : null;
+    const checkpointId = typeof payload.checkpoint_id === "string" ? payload.checkpoint_id : null;
+
     return {
       ...payload,
+      exit_code: exitCode,
+      stderr_excerpt: stderrExcerpt,
+      stdout_excerpt: stdoutExcerpt,
+      command,
+      executor_mode: executorMode,
+      workspace_id: workspaceId,
+      checkpoint_stage: checkpointStage,
+      checkpoint_id: checkpointId,
       executor_used: executorUsed,
       persona_version_id: personaVersionId,
       skill_version_ids: skillVersionIds,
