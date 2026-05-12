@@ -568,6 +568,8 @@ function renderTaskDetail(task) {
             <div class="subtask-tests-label">Test criteria:</div>
             <ul>${s.testCriteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
           </div>` : ""}
+          <div class="subtask-runtime"></div>
+          <div class="subtask-history-strip"></div>
         </div>
       `).join("");
       const heading = `Plan (${subtasks.length} subtask${subtasks.length !== 1 ? "s" : ""})`;
