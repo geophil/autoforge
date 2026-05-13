@@ -212,7 +212,11 @@ describe("diagnostic parsing and persistence helpers", () => {
     expect(executor.task?.type).toBe("diagnostician");
     expect(executor.task?.budgetSeconds).toBe(90);
     expect(executor.task?.workspace).toBeInstanceOf(LocalWorkspace);
-    expect((executor.task?.workspace as LocalWorkspace | undefined)?.rootPath).toBe(process.cwd());
+    // Diagnostician must NOT receive process.cwd() (the autoforge repo). It
+    // gets an ephemeral tmpdir under autoforge-diagnostic-* instead.
+    const diagRootPath = (executor.task?.workspace as LocalWorkspace | undefined)?.rootPath ?? "";
+    expect(diagRootPath).not.toBe(process.cwd());
+    expect(diagRootPath).toContain("autoforge-diagnostic-");
     const diagnosticPrompt = JSON.parse(executor.task?.prompt ?? "{}") as {
       baseline_score_mean?: unknown;
       tasks?: unknown[];
@@ -257,30 +261,18 @@ describe("diagnostic parsing and persistence helpers", () => {
     });
   });
 
-  test("runDiagnostic uses injected workspace factory for diagnostician dispatch", async () => {
+  test("runDiagnostic gives the diagnostician a private local workspace not pointing at the project root", async () => {
     const db = freshDb();
     for (let i = 1; i <= 30; i++) {
       seedTerminalSelectedTask(db, i);
     }
 
-    let createInput: any = null;
-    let destroyCount = 0;
-    const fakeWorkspace = {
-      id: "diagnostic-coder-2026-04-28:diagnostician",
-      provider: "test",
-      readFile: async () => "{}",
-      writeFile: async () => {},
-      exec: async function* () {
-        yield { kind: "exit", exitCode: 0 } as const;
-      },
-      destroy: async () => {
-        destroyCount += 1;
-      }
-    };
+    let observedWorkspace: { id: string; provider: string; rootPath: string } | null = null;
     const executor = {
       name: "diagnostic-mock",
       async execute(task: AgentTask): Promise<AgentResult> {
-        expect(task.workspace).toBe(fakeWorkspace);
+        const ws = task.workspace as unknown as { id: string; provider: string; rootPath: string };
+        observedWorkspace = { id: ws.id, provider: ws.provider, rootPath: ws.rootPath };
         return {
           status: "DONE",
           artifacts: [],
@@ -300,21 +292,18 @@ describe("diagnostic parsing and persistence helpers", () => {
       agentType: "coder",
       trigger: "unit_test",
       workingDirectory: process.cwd(),
-      now: new Date("2026-04-28T12:00:00Z"),
-      workspaceFactory: {
-        create: async (input) => {
-          createInput = input;
-          return fakeWorkspace;
-        }
-      }
+      now: new Date("2026-04-28T12:00:00Z")
     });
 
-    expect(createInput).not.toBeNull();
-    if (!createInput) {
-      throw new Error("Expected workspace factory create input");
-    }
-    expect(createInput.dispatchId).toBe("diagnostician");
-    expect(destroyCount).toBe(1);
+    if (!observedWorkspace) throw new Error("executor was not invoked");
+    const obs: { id: string; provider: string; rootPath: string } = observedWorkspace;
+    expect(obs.provider).toBe("local");
+    expect(obs.id).toBe("diagnostic-coder-2026-04-28:diagnostician");
+    // The diagnostician must NOT see the project root, even when
+    // workingDirectory is process.cwd(); rootPath should be an ephemeral
+    // tmpdir that gets cleaned up.
+    expect(obs.rootPath.startsWith(process.cwd())).toBe(false);
+    expect(obs.rootPath).toContain("autoforge-diagnostic-");
   });
 
   test("diagnostic events remain analytics-only after projection rebuild", async () => {
@@ -392,25 +381,30 @@ describe("diagnostic parsing and persistence helpers", () => {
     });
   });
 
-  test("runDiagnostic logs completion event when workspace creation fails", async () => {
+  test("runDiagnostic logs completion event when the executor throws", async () => {
     const db = freshDb();
     for (let i = 1; i <= 30; i++) {
       seedTerminalSelectedTask(db, i);
     }
 
+    const failingExecutor = {
+      name: "diagnostic-failing",
+      async execute(): Promise<AgentResult> {
+        throw new Error("executor_blew_up");
+      },
+      async healthCheck(): Promise<boolean> {
+        return true;
+      }
+    };
+
     const proposed = await runDiagnostic({
       db,
-      executor: new DiagnosticMockExecutor(),
+      executor: failingExecutor,
       recordEvent: createRecorder(db),
       agentType: "coder",
       trigger: "unit_test",
       workingDirectory: process.cwd(),
-      now: new Date("2026-04-28T12:00:00Z"),
-      workspaceFactory: {
-        create: async () => {
-          throw new Error("workspace_create_failed");
-        }
-      }
+      now: new Date("2026-04-28T12:00:00Z")
     });
 
     expect(proposed).toBe(0);
@@ -423,7 +417,7 @@ describe("diagnostic parsing and persistence helpers", () => {
     `).get() as { payload: string } | undefined;
     expect(completion).toBeDefined();
     expect(JSON.parse(completion!.payload)).toMatchObject({
-      error: "workspace_create_failed"
+      error: "executor_blew_up"
     });
   });
 

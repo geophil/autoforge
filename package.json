@@ -8,7 +8,8 @@
     "build": "bun build src/index.ts --outdir dist",
     "test": "bun test",
     "cli": "bun run src/cli/index.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "image:agent": "docker build -t autoforge-agent:local docker/autoforge-agent"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.87.0",

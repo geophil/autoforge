@@ -28,6 +28,8 @@ export class WorkspaceFactory {
       | "WORKSPACE_DOCKER_CPUS"
       | "WORKSPACE_DOCKER_MEMORY"
       | "WORKSPACE_DOCKER_PRECHECK"
+      | "WORKSPACE_DOCKER_UID"
+      | "WORKSPACE_DOCKER_GID"
     >,
     private readonly options: WorkspaceFactoryOptions = {}
   ) {}
@@ -47,6 +49,8 @@ export class WorkspaceFactory {
       network: this.env.WORKSPACE_DOCKER_NETWORK,
       cpus: this.env.WORKSPACE_DOCKER_CPUS,
       memory: this.env.WORKSPACE_DOCKER_MEMORY,
+      uid: this.env.WORKSPACE_DOCKER_UID,
+      gid: this.env.WORKSPACE_DOCKER_GID,
       runner: this.options.runner ?? new DockerCliContainerRunner()
     });
   }

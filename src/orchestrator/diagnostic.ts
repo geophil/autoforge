@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DbClient } from "../db/client";
 import type { AgentExecutor } from "../executors/interface";
 import type { AgentType } from "../types/core";
 import type { AutoforgeMessage } from "../nats/messages";
+import { LocalWorkspace } from "../runtime/local-workspace";
 import type { Workspace } from "../runtime/workspace";
-import { WorkspaceFactory } from "../runtime/workspace-provider";
 
 export interface DiagnosticCluster {
   label: string;
@@ -42,7 +44,6 @@ export interface RunDiagnosticInput {
   workingDirectory?: string;
   now?: Date;
   systemPrompt?: string;
-  workspaceFactory?: Pick<WorkspaceFactory, "create">;
 }
 
 const DIAGNOSTIC_BUDGET_SECONDS = 90;
@@ -82,15 +83,6 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
   const startedAt = input.now ?? new Date();
   const generatedAt = startedAt.toISOString();
   const runTaskId = diagnosticTaskId(input.agentType, generatedAt);
-  const rootPath = input.workingDirectory ?? process.cwd();
-  const workspaceFactory = input.workspaceFactory ?? new WorkspaceFactory({
-    WORKSPACE_PROVIDER: "local",
-    WORKSPACE_DOCKER_IMAGE: "autoforge-agent:local",
-    WORKSPACE_DOCKER_NETWORK: "none",
-    WORKSPACE_DOCKER_CPUS: "2",
-    WORKSPACE_DOCKER_MEMORY: "2g",
-    WORKSPACE_DOCKER_PRECHECK: "1"
-  });
   const tasks = input.db.loadDiagnosticTaskHistory(input.agentType, DIAGNOSTIC_HISTORY_LIMIT);
 
   if (tasks.length < MIN_HISTORY_TASKS) {
@@ -105,10 +97,17 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
 
   const baselineScoreMean = meanCompositeFromHistory(tasks);
   const prompt = JSON.stringify({ agent_type: input.agentType, baseline_score_mean: baselineScoreMean, tasks });
+  // Diagnostic runs don't read project files — they build the prompt from the
+  // event log and only need a workspace to write `.autoforge-status.json`.
+  // Use an ephemeral local tmpdir so we never bind-mount the autoforge repo
+  // (or any other working directory) into a container, regardless of
+  // WORKSPACE_PROVIDER. The whole tmpdir is removed in the finally block.
+  let tmpRoot: string | null = null;
   let workspace: Workspace | null = null;
   try {
-    workspace = await workspaceFactory.create({
-      rootPath,
+    tmpRoot = await mkdtemp(join(tmpdir(), "autoforge-diagnostic-"));
+    workspace = new LocalWorkspace({
+      rootPath: tmpRoot,
       taskId: runTaskId,
       dispatchId: "diagnostician"
     });
@@ -197,6 +196,13 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
           `[diagnostic] workspace destroy failed for ${runTaskId}: ${destroyError instanceof Error ? destroyError.message : String(destroyError)}`
         );
       }
+    }
+    if (tmpRoot) {
+      await rm(tmpRoot, { recursive: true, force: true }).catch((err) => {
+        console.warn(
+          `[diagnostic] tmpdir cleanup failed for ${runTaskId}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
     }
   }
 }

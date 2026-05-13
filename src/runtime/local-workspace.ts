@@ -1,7 +1,12 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { dirname, resolve, sep } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { ExecEvent, ExecOptions, Workspace } from "./workspace";
+import {
+  assertRealPathInsideRoot,
+  assertWritablePathInsideRoot,
+  resolveInsideRoot
+} from "./workspace-paths";
 
 export interface LocalWorkspaceOptions {
   rootPath: string;
@@ -25,21 +30,21 @@ export class LocalWorkspace implements Workspace {
   }
 
   async readFile(path: string): Promise<string> {
-    const target = this.resolveInsideRoot(path);
-    await this.assertRealPathInsideRoot(target, path);
+    const target = resolveInsideRoot(this.rootPath, path);
+    await assertRealPathInsideRoot(this.rootPath, target, path);
     return readFile(target, "utf8");
   }
 
   async writeFile(path: string, content: string): Promise<void> {
-    const target = this.resolveInsideRoot(path);
-    await this.assertWritablePathInsideRoot(target, path);
+    const target = resolveInsideRoot(this.rootPath, path);
+    await assertWritablePathInsideRoot(this.rootPath, target, path);
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, content, "utf8");
   }
 
   async *exec(cmd: string, args: string[], opts: ExecOptions = {}): AsyncIterable<ExecEvent> {
-    const cwd = opts.cwd ? this.resolveInsideRoot(opts.cwd) : this.rootPath;
-    await this.assertRealPathInsideRoot(cwd, opts.cwd ?? ".");
+    const cwd = opts.cwd ? resolveInsideRoot(this.rootPath, opts.cwd) : this.rootPath;
+    await assertRealPathInsideRoot(this.rootPath, cwd, opts.cwd ?? ".");
 
     yield* spawnStreaming(cmd, args, {
       cwd,
@@ -51,58 +56,6 @@ export class LocalWorkspace implements Workspace {
   async destroy(): Promise<void> {
     // Local worktrees are owned by WorktreeManager; destroy is lifecycle-only.
   }
-
-  private resolveInsideRoot(path: string): string {
-    const target = resolve(this.rootPath, path);
-    if (target !== this.rootPath && !target.startsWith(`${this.rootPath}${sep}`)) {
-      throw new Error(`Path is outside workspace root: ${path}`);
-    }
-    return target;
-  }
-
-  private async assertRealPathInsideRoot(target: string, originalPath: string): Promise<void> {
-    const [rootRealPath, targetRealPath] = await Promise.all([
-      realpath(this.rootPath),
-      realpath(target)
-    ]);
-    if (!isPathInside(targetRealPath, rootRealPath)) {
-      throw new Error(`Path is outside workspace root: ${originalPath}`);
-    }
-  }
-
-  private async assertWritablePathInsideRoot(target: string, originalPath: string): Promise<void> {
-    const rootRealPath = await realpath(this.rootPath);
-
-    try {
-      const targetRealPath = await realpath(target);
-      if (!isPathInside(targetRealPath, rootRealPath)) {
-        throw new Error(`Path is outside workspace root: ${originalPath}`);
-      }
-      return;
-    } catch (error) {
-      if (error instanceof Error && !isMissingPathError(error)) {
-        throw error;
-      }
-    }
-
-    let ancestor = dirname(target);
-    while (ancestor !== dirname(ancestor)) {
-      try {
-        const ancestorRealPath = await realpath(ancestor);
-        if (!isPathInside(ancestorRealPath, rootRealPath)) {
-          throw new Error(`Path is outside workspace root: ${originalPath}`);
-        }
-        return;
-      } catch (error) {
-        if (error instanceof Error && !isMissingPathError(error)) {
-          throw error;
-        }
-        ancestor = dirname(ancestor);
-      }
-    }
-
-    throw new Error(`Path is outside workspace root: ${originalPath}`);
-  }
 }
 
 export function requireLocalWorkspaceRoot(workspace: Workspace): string {
@@ -110,14 +63,6 @@ export function requireLocalWorkspaceRoot(workspace: Workspace): string {
     return workspace.rootPath;
   }
   throw new Error(`Executor requires a local workspace, got provider: ${workspace.provider}`);
-}
-
-function isPathInside(candidate: string, root: string): boolean {
-  return candidate === root || candidate.startsWith(`${root}${sep}`);
-}
-
-function isMissingPathError(error: Error): boolean {
-  return "code" in error && error.code === "ENOENT";
 }
 
 function childProcessEnv(env: Record<string, string> | undefined): NodeJS.ProcessEnv {

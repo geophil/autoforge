@@ -119,7 +119,7 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 - **Type**: string
 - **Default**: `"autoforge-agent:local"`
-- **Affects**: Docker image used when `WORKSPACE_PROVIDER=docker`.
+- **Affects**: Docker image used when `WORKSPACE_PROVIDER=docker`. The default tag is built by `bun run image:agent` from `docker/autoforge-agent/Dockerfile`. Custom images must contain `bun` and `git` on PATH and a user matching `WORKSPACE_DOCKER_UID` / `WORKSPACE_DOCKER_GID`.
 
 ### `WORKSPACE_DOCKER_NETWORK`
 
@@ -144,6 +144,18 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Type**: `"0"` or `"1"`
 - **Default**: `"1"`
 - **Affects**: Whether Autoforge verifies Docker daemon and image availability before creating the first Docker workspace.
+
+### `WORKSPACE_DOCKER_UID`
+
+- **Type**: integer (≥0)
+- **Default**: `1000`
+- **Affects**: The numeric uid passed to `docker create -u <uid>:<gid>`. Must exist as a user inside `WORKSPACE_DOCKER_IMAGE`. Defaults match the `agent` user baked into `docker/autoforge-agent/Dockerfile`. Override only when running a custom image whose user has a different uid (note: the host user's uid is intentionally NOT used — most images do not have a matching `/etc/passwd` entry, which breaks many tools).
+
+### `WORKSPACE_DOCKER_GID`
+
+- **Type**: integer (≥0)
+- **Default**: `1000`
+- **Affects**: The numeric gid passed alongside `WORKSPACE_DOCKER_UID`. Must exist as a group inside `WORKSPACE_DOCKER_IMAGE`.
 
 ### `AUTOFORGE_URL`
 

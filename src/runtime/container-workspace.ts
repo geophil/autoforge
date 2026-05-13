@@ -1,4 +1,4 @@
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 import {
   dockerContainerName,
@@ -6,6 +6,11 @@ import {
   type ContainerRunner
 } from "./container-runner";
 import type { ExecEvent, ExecOptions, Workspace } from "./workspace";
+import {
+  assertRealPathInsideRoot,
+  assertWritablePathInsideRoot,
+  resolveInsideRoot
+} from "./workspace-paths";
 
 export interface ContainerWorkspaceOptions {
   rootPath: string;
@@ -15,6 +20,12 @@ export interface ContainerWorkspaceOptions {
   network: string;
   cpus: string;
   memory: string;
+  // Numeric uid/gid the container runs as. Must exist in the image, or match
+  // the host worktree's owner if the image runs as root and we want bind-mount
+  // writes to be owned by a non-root user. Defaults baked in for the
+  // autoforge-agent image (1000:1000); see docker/autoforge-agent/Dockerfile.
+  uid?: number;
+  gid?: number;
   runner?: ContainerRunner;
 }
 
@@ -50,8 +61,12 @@ export class ContainerWorkspace implements Workspace {
       network: options.network,
       cpus: options.cpus,
       memory: options.memory,
-      uid: process.getuid?.() ?? 1000,
-      gid: process.getgid?.() ?? 1000
+      // Image-defined defaults rather than process.getuid/getgid: the host
+      // user almost never exists inside the image (especially on macOS Docker
+      // Desktop), and arbitrary `-u <hostUid>:<hostGid>` makes the container
+      // run as a UID with no /etc/passwd entry, breaking many tools.
+      uid: options.uid ?? 1000,
+      gid: options.gid ?? 1000
     });
     try {
       await runner.start(containerId);
@@ -71,21 +86,25 @@ export class ContainerWorkspace implements Workspace {
   }
 
   async readFile(path: string): Promise<string> {
-    const target = this.resolveInsideRoot(path);
-    await this.assertRealPathInsideRoot(target, path);
+    const target = resolveInsideRoot(this.rootPath, path);
+    await assertRealPathInsideRoot(this.rootPath, target, path);
     return readFile(target, "utf8");
   }
 
   async writeFile(path: string, content: string): Promise<void> {
-    const target = this.resolveInsideRoot(path);
-    await this.assertWritablePathInsideRoot(target, path);
+    const target = resolveInsideRoot(this.rootPath, path);
+    await assertWritablePathInsideRoot(this.rootPath, target, path);
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, content, "utf8");
   }
 
   async *exec(cmd: string, args: string[], opts: ExecOptions = {}): AsyncIterable<ExecEvent> {
-    const cwd = opts.cwd ? this.resolveInsideRoot(opts.cwd) : this.rootPath;
-    await this.assertWritablePathInsideRoot(cwd, opts.cwd ?? ".");
+    const cwd = opts.cwd ? resolveInsideRoot(this.rootPath, opts.cwd) : this.rootPath;
+    // Strict check: the cwd must EXIST when we exec. The previous version
+    // used the writable-path check that tolerated missing leaves, which
+    // would happily run `docker exec -w /workspace/does-not-exist` and hand
+    // the user a confusing failure inside the container. Match LocalWorkspace.
+    await assertRealPathInsideRoot(this.rootPath, cwd, opts.cwd ?? ".");
     const containerCwd = `/workspace${cwd === this.rootPath ? "" : cwd.slice(this.rootPath.length).split(sep).join("/")}`;
     yield* this.runner.exec(this.containerId, cmd, args, {
       cwd: containerCwd,
@@ -99,63 +118,4 @@ export class ContainerWorkspace implements Workspace {
     this.destroyed = true;
     await this.runner.destroy(this.containerId);
   }
-
-  private resolveInsideRoot(path: string): string {
-    const target = resolve(this.rootPath, path);
-    if (target !== this.rootPath && !target.startsWith(`${this.rootPath}${sep}`)) {
-      throw new Error(`Path is outside workspace root: ${path}`);
-    }
-    return target;
-  }
-
-  private async assertRealPathInsideRoot(target: string, originalPath: string): Promise<void> {
-    const [rootRealPath, targetRealPath] = await Promise.all([
-      realpath(this.rootPath),
-      realpath(target)
-    ]);
-    if (!isPathInside(targetRealPath, rootRealPath)) {
-      throw new Error(`Path is outside workspace root: ${originalPath}`);
-    }
-  }
-
-  private async assertWritablePathInsideRoot(target: string, originalPath: string): Promise<void> {
-    const rootRealPath = await realpath(this.rootPath);
-    try {
-      const targetRealPath = await realpath(target);
-      if (!isPathInside(targetRealPath, rootRealPath)) {
-        throw new Error(`Path is outside workspace root: ${originalPath}`);
-      }
-      return;
-    } catch (error) {
-      if (error instanceof Error && !isMissingPathError(error)) {
-        throw error;
-      }
-    }
-
-    let ancestor = dirname(target);
-    while (ancestor !== dirname(ancestor)) {
-      try {
-        const ancestorRealPath = await realpath(ancestor);
-        if (!isPathInside(ancestorRealPath, rootRealPath)) {
-          throw new Error(`Path is outside workspace root: ${originalPath}`);
-        }
-        return;
-      } catch (error) {
-        if (error instanceof Error && !isMissingPathError(error)) {
-          throw error;
-        }
-        ancestor = dirname(ancestor);
-      }
-    }
-
-    throw new Error(`Path is outside workspace root: ${originalPath}`);
-  }
-}
-
-function isPathInside(candidate: string, root: string): boolean {
-  return candidate === root || candidate.startsWith(`${root}${sep}`);
-}
-
-function isMissingPathError(error: Error): boolean {
-  return "code" in error && error.code === "ENOENT";
 }

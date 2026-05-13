@@ -34,7 +34,12 @@ const EnvSchema = z.object({
   WORKSPACE_DOCKER_NETWORK: z.string().min(1).default("none"),
   WORKSPACE_DOCKER_CPUS: z.string().min(1).default("2"),
   WORKSPACE_DOCKER_MEMORY: z.string().min(1).default("2g"),
-  WORKSPACE_DOCKER_PRECHECK: z.enum(["0", "1"]).default("1")
+  WORKSPACE_DOCKER_PRECHECK: z.enum(["0", "1"]).default("1"),
+  // The container is started with `-u <uid>:<gid>`. The defaults match the
+  // `agent` user baked into docker/autoforge-agent/Dockerfile; override only
+  // when running a custom image whose user has different numeric ids.
+  WORKSPACE_DOCKER_UID: z.coerce.number().int().min(0).default(1000),
+  WORKSPACE_DOCKER_GID: z.coerce.number().int().min(0).default(1000)
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;

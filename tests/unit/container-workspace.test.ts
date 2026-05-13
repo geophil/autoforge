@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ContainerWorkspace } from "../../src/runtime/container-workspace";
@@ -116,6 +116,10 @@ describe("ContainerWorkspace", () => {
       memory: "2g",
       runner
     });
+    // cwd must exist on the host before exec — the strict check matches
+    // LocalWorkspace and protects against confusing "no such directory"
+    // failures inside the container.
+    await mkdir(join(rootPath, "nested"), { recursive: true });
 
     for await (const _event of workspace.exec("pwd", [], { cwd: "nested", env: { A: "B" }, timeoutSeconds: 5 })) {
       // drain events
@@ -127,6 +131,32 @@ describe("ContainerWorkspace", () => {
       args: [],
       opts: { cwd: "/workspace/nested", env: { A: "B" }, timeoutSeconds: 5 }
     });
+
+    await workspace.destroy();
+    await rm(rootPath, { recursive: true, force: true });
+  });
+
+  test("exec rejects a cwd that does not exist on the host", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "autoforge-container-workspace-"));
+    const runner = new FakeRunner();
+    const workspace = await ContainerWorkspace.create({
+      rootPath,
+      taskId: "task-1",
+      dispatchId: "coder",
+      image: "autoforge-agent:local",
+      network: "none",
+      cpus: "2",
+      memory: "2g",
+      runner
+    });
+
+    const drain = async (): Promise<void> => {
+      for await (const _event of workspace.exec("pwd", [], { cwd: "does-not-exist" })) {
+        void _event;
+      }
+    };
+    await expect(drain()).rejects.toThrow();
+    expect(runner.execs).toHaveLength(0);
 
     await workspace.destroy();
     await rm(rootPath, { recursive: true, force: true });
@@ -150,6 +180,41 @@ describe("ContainerWorkspace", () => {
     await workspace.destroy();
 
     expect(runner.destroys).toEqual([workspace.containerId]);
+    await rm(rootPath, { recursive: true, force: true });
+  });
+
+  test("passes uid/gid options through to the runner (defaults to 1000:1000)", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "autoforge-container-workspace-"));
+    const runner = new FakeRunner();
+
+    const ws1 = await ContainerWorkspace.create({
+      rootPath,
+      taskId: "task-1",
+      dispatchId: "coder",
+      image: "autoforge-agent:local",
+      network: "none",
+      cpus: "2",
+      memory: "2g",
+      runner
+    });
+    expect(runner.creates[0]).toMatchObject({ uid: 1000, gid: 1000 });
+    await ws1.destroy();
+
+    const ws2 = await ContainerWorkspace.create({
+      rootPath,
+      taskId: "task-2",
+      dispatchId: "coder",
+      image: "autoforge-agent:local",
+      network: "none",
+      cpus: "2",
+      memory: "2g",
+      uid: 501,
+      gid: 20,
+      runner
+    });
+    expect(runner.creates[1]).toMatchObject({ uid: 501, gid: 20 });
+    await ws2.destroy();
+
     await rm(rootPath, { recursive: true, force: true });
   });
 

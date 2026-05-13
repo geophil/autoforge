@@ -23,8 +23,8 @@ describe("reflector persona", () => {
     expect(text).toContain("outcome_kind");
   });
 
-  test("reflectOnTask uses injected workspace factory with reflector dispatch id", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "reflector-workspace-factory-test-"));
+  test("reflectOnTask gives the reflector a private local workspace not pointing at the working directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "reflector-workspace-test-"));
     const db = new DbClient(join(dir, `${randomUUID()}.sqlite`));
     db.initSchema(
       resolve(process.cwd(), "src/db/schema.sql"),
@@ -36,24 +36,12 @@ describe("reflector persona", () => {
 
     const personas = new PersonaRegistry(db, resolve(process.cwd(), "src/personas"));
     const skills = { skillsForAgent: () => [] };
-    let createInput: any = null;
-    let destroyCount = 0;
-    const fakeWorkspace = {
-      id: "t:reflector",
-      provider: "test",
-      readFile: async () => "{}",
-      writeFile: async () => {},
-      exec: async function* () {
-        yield { kind: "exit", exitCode: 0 } as const;
-      },
-      destroy: async () => {
-        destroyCount += 1;
-      }
-    };
+    let observedWorkspace: { id: string; provider: string; rootPath: string } | null = null;
     const executor = {
       name: "reflector-mock",
       async execute(task: AgentTask): Promise<AgentResult> {
-        expect(task.workspace).toBe(fakeWorkspace);
+        const ws = task.workspace as unknown as { id: string; provider: string; rootPath: string };
+        observedWorkspace = { id: ws.id, provider: ws.provider, rootPath: ws.rootPath };
         return {
           status: "DONE",
           artifacts: [],
@@ -72,21 +60,17 @@ describe("reflector persona", () => {
       personas,
       skills: skills as any,
       workingDirectory: dir,
-      workspaceFactory: {
-        create: async (input) => {
-          createInput = input;
-          return fakeWorkspace;
-        }
-      },
       recordEvent: () => {}
     });
 
-    expect(createInput).not.toBeNull();
-    if (!createInput) {
-      throw new Error("Expected workspace factory create input");
-    }
-    expect(createInput.dispatchId).toBe("reflector");
+    if (!observedWorkspace) throw new Error("executor was not invoked");
+    const obs: { id: string; provider: string; rootPath: string } = observedWorkspace;
+    expect(obs.provider).toBe("local");
+    expect(obs.id).toBe("t:reflector");
+    // The reflector must NOT see the working directory; rootPath must be an
+    // ephemeral tmpdir under autoforge-reflector-* that is NOT `dir`.
+    expect(obs.rootPath).not.toBe(dir);
+    expect(obs.rootPath).toContain("autoforge-reflector-");
     expect(result.skipped).toBe(true);
-    expect(destroyCount).toBe(1);
   });
 });

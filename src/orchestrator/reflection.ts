@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { DbClient } from "../db/client";
 import type { AgentExecutor, AgentResult } from "../executors/interface";
 import type { PersonaRegistry } from "../personas/registry";
@@ -5,7 +8,7 @@ import type { SkillRegistry } from "../skills/registry";
 import type { AgentType, PipelineTask } from "../types/core";
 import type { AgentTranscriptRow } from "../types/transcripts";
 import { REFLECTION_CONFIG } from "../config/reflection";
-import { WorkspaceFactory } from "../runtime/workspace-provider";
+import { LocalWorkspace } from "../runtime/local-workspace";
 
 /**
  * Whitelist of agent types the reflector is allowed to emit lessons for.
@@ -32,7 +35,6 @@ export interface ReflectionDeps {
   personas: PersonaRegistry;
   skills: SkillRegistry;
   workingDirectory: string;
-  workspaceFactory?: Pick<WorkspaceFactory, "create">;
   recordEvent: (e: {
     taskId: string;
     projectId: string;
@@ -137,16 +139,14 @@ export async function reflectOnTask(
   deps.personas.snapshotId("reflector");
 
   try {
-    const workspaceFactory = deps.workspaceFactory ?? new WorkspaceFactory({
-      WORKSPACE_PROVIDER: "local",
-      WORKSPACE_DOCKER_IMAGE: "autoforge-agent:local",
-      WORKSPACE_DOCKER_NETWORK: "none",
-      WORKSPACE_DOCKER_CPUS: "2",
-      WORKSPACE_DOCKER_MEMORY: "2g",
-      WORKSPACE_DOCKER_PRECHECK: "1"
-    });
-    const workspace = await workspaceFactory.create({
-      rootPath: deps.workingDirectory,
+    // Reflection only needs a workspace to write `.autoforge-status.json`;
+    // the prompt is built entirely from db queries (transcripts, findings,
+    // diff stats). Use a local tmpdir regardless of WORKSPACE_PROVIDER so we
+    // never bind-mount the task worktree (or the autoforge repo itself when
+    // workingDirectory falls back to process.cwd()) into a container.
+    const tmpRoot = await mkdtemp(join(tmpdir(), "autoforge-reflector-"));
+    const workspace = new LocalWorkspace({
+      rootPath: tmpRoot,
       taskId,
       dispatchId: "reflector"
     });
@@ -171,6 +171,11 @@ export async function reflectOnTask(
           `[reflector] workspace destroy failed for ${taskId}: ${destroyError instanceof Error ? destroyError.message : String(destroyError)}`
         );
       }
+      await rm(tmpRoot, { recursive: true, force: true }).catch((err) => {
+        console.warn(
+          `[reflector] tmpdir cleanup failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
     }
 
     if (result.status !== "DONE" || !result.output) {

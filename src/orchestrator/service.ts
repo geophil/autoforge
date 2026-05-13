@@ -227,8 +227,7 @@ export class OrchestratorService {
       recordEvent: (event) => this.recordEvent(event),
       agentType,
       trigger,
-      workingDirectory: process.cwd(),
-      workspaceFactory: this.workspaceFactory
+      workingDirectory: process.cwd()
     });
     return { clustersProposed };
   }
@@ -1435,7 +1434,6 @@ export class OrchestratorService {
       personas: this.personas,
       skills: this.skills,
       workingDirectory: worktree?.path ?? process.cwd(),
-      workspaceFactory: this.workspaceFactory,
       recordEvent: (e) =>
         this.recordEvent({
           taskId: e.taskId,
