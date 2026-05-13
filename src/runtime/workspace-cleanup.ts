@@ -23,6 +23,15 @@ export function workspaceCreatedPayload(input: WorkspaceCreatedPayloadInput): Wo
   });
 }
 
+/**
+ * Recovery helper: walk a task's event log and produce compensating
+ * `workspace_destroyed` payloads for any `workspace_created` event that
+ * lacks a paired destroy. Used by the orchestrator's cleanupWorktree path
+ * when the in-memory workspace handle has been lost (process restart),
+ * so the event-log invariant (every created has a destroyed) survives
+ * crashes. The actual container, if any, is reaped separately by the
+ * startup orphan reaper.
+ */
 export function pendingWorkspaceDestroyPayloads(
   events: Array<{ type: string; payload: Record<string, unknown> }>,
   reason: string

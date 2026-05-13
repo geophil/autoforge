@@ -102,12 +102,24 @@ export class StageFailedError extends Error {
   }
 }
 
+// Sentinel dispatchId used for the per-task workspace identity. Keeps
+// Workspace.id in the existing `${taskId}:${dispatchId}` shape (which the
+// event schema and downstream consumers depend on) while making it explicit
+// that the workspace now spans an entire task lifecycle, not a single
+// dispatch.
+const TASK_WORKSPACE_DISPATCH_ID = "task";
+
 export class OrchestratorService {
   private readonly skills: SkillRegistry;
   private readonly personas: PersonaRegistry;
   private readonly dispatcher: ReturnType<typeof createDispatcher>;
   private readonly embeddingProvider: EmbeddingProvider;
   private readonly workspaceFactory: Pick<WorkspaceFactory, "create">;
+  // One Workspace per task id. Created right after the worktree is set up
+  // and torn down in cleanupWorktree. Every dispatch (planner, coder
+  // subtasks, reviewer iterations, doc, meta) reads the same handle from
+  // this map — one container per task instead of one per dispatch.
+  private readonly taskWorkspaces = new Map<string, Workspace>();
   private readonly autoTuner = new AutoTuner();
   private terminalTaskCount = 0;
 
@@ -121,74 +133,122 @@ export class OrchestratorService {
     this.workspaceFactory = deps.workspaceFactory ?? new WorkspaceFactory(deps.env);
   }
 
-  private async createWorkspace(
+  /**
+   * Create the per-task workspace and emit a workspace_created event.
+   * Idempotent for retries within a process: the second call returns the
+   * cached handle without spawning another container or duplicating the
+   * event. Called by submitTask and submitMetaTask after worktree setup.
+   */
+  private async ensureTaskWorkspace(
     rootPath: string,
     taskId: string,
-    dispatchId: string,
-    projectId?: string
+    projectId: string
   ): Promise<Workspace> {
-    const workspace = await this.workspaceFactory.create({ rootPath, taskId, dispatchId } satisfies WorkspaceCreateInput);
-    if (projectId) {
-      const alreadyCreated = this.deps.db.listEvents(taskId).some((event) => {
-        return event.type === "workspace_created" && event.payload.workspace_id === workspace.id;
-      });
-      if (!alreadyCreated) {
-        this.recordEvent({
+    const existing = this.taskWorkspaces.get(taskId);
+    if (existing) return existing;
+
+    const workspace = await this.workspaceFactory.create({
+      rootPath,
+      taskId,
+      dispatchId: TASK_WORKSPACE_DISPATCH_ID
+    } satisfies WorkspaceCreateInput);
+    this.taskWorkspaces.set(taskId, workspace);
+
+    const alreadyRecorded = this.deps.db.listEvents(taskId).some((event) => {
+      return event.type === "workspace_created" && event.payload.workspace_id === workspace.id;
+    });
+    if (!alreadyRecorded) {
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "workspace_created",
+        status: "done",
+        payload: workspaceCreatedPayload({
+          workspaceId: workspace.id,
+          provider: workspace.provider,
           taskId,
-          projectId,
-          agent: "orchestrator",
-          type: "workspace_created",
-          status: "done",
-          payload: workspaceCreatedPayload({
-            workspaceId: workspace.id,
-            provider: workspace.provider,
-            taskId,
-            dispatchId,
-            rootPath: "rootPath" in workspace && typeof workspace.rootPath === "string" ? workspace.rootPath : undefined
-          }),
-          budgetSeconds: 0
-        });
-      }
+          dispatchId: TASK_WORKSPACE_DISPATCH_ID,
+          rootPath: "rootPath" in workspace && typeof workspace.rootPath === "string" ? workspace.rootPath : undefined
+        }),
+        budgetSeconds: 0
+      });
     }
     return workspace;
   }
 
-  private async destroyWorkspace(
-    workspace: Workspace,
-    taskId: string,
-    projectId: string,
-    reason: string
-  ): Promise<void> {
-    await workspace.destroy();
-    this.recordEvent({
-      taskId,
-      projectId,
-      agent: "orchestrator",
-      type: "workspace_destroyed",
-      status: "done",
-      payload: {
-        workspace_id: workspace.id,
-        provider: workspace.provider,
-        task_id: taskId,
-        dispatch_id: workspace.id.includes(":") ? workspace.id.split(":").slice(1).join(":") : workspace.id,
-        reason
-      },
-      budgetSeconds: 0
-    });
+  /**
+   * Look up the per-task workspace handle. Throws if missing — every
+   * dispatch site assumes the task workspace was created up front by
+   * submitTask/submitMetaTask.
+   */
+  private requireTaskWorkspace(taskId: string): Workspace {
+    const workspace = this.taskWorkspaces.get(taskId);
+    if (!workspace) {
+      throw new Error(`No workspace registered for task ${taskId}`);
+    }
+    return workspace;
   }
 
-  private async destroyWorkspaceBestEffort(
-    workspace: Workspace,
+  /**
+   * Destroy the per-task workspace and emit a workspace_destroyed event.
+   * Best-effort: if destroy() throws, we log and still emit the event so
+   * the lifecycle invariant (paired created/destroyed) holds in the event
+   * log. Idempotent: a second call after the workspace has been removed
+   * from the cache is a no-op for the current process.
+   *
+   * Recovery path: if no in-memory handle exists (this is a different
+   * process than the one that created the workspace, e.g. after a crash
+   * + restart), walk the event log and emit compensating destroyed events
+   * for any orphaned creates. The actual container is reaped separately
+   * by the startup orphan reaper.
+   */
+  private async destroyTaskWorkspaceIfPresent(
     taskId: string,
     projectId: string,
     reason: string
   ): Promise<void> {
-    try {
-      await this.destroyWorkspace(workspace, taskId, projectId, reason);
-    } catch (error) {
-      console.warn(
-        `[workspace] destroy failed for ${taskId}/${workspace.id}: ${error instanceof Error ? error.message : String(error)}`
-      );
+    const workspace = this.taskWorkspaces.get(taskId);
+    if (workspace) {
+      this.taskWorkspaces.delete(taskId);
+      try {
+        await workspace.destroy();
+      } catch (error) {
+        console.warn(
+          `[workspace] destroy failed for ${taskId}/${workspace.id}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "workspace_destroyed",
+        status: "done",
+        payload: {
+          workspace_id: workspace.id,
+          provider: workspace.provider,
+          task_id: taskId,
+          dispatch_id: TASK_WORKSPACE_DISPATCH_ID,
+          reason
+        },
+        budgetSeconds: 0
+      });
+      return;
+    }
+
+    // Recovery: no in-memory handle. Compensating destroyed events for
+    // anything the event log shows as still-created.
+    const events = this.deps.db.listEvents(taskId);
+    for (const payload of pendingWorkspaceDestroyPayloads(events, reason)) {
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "workspace_destroyed",
+        status: "done",
+        payload,
+        budgetSeconds: 0
+      });
     }
   }
 
@@ -288,7 +348,7 @@ export class OrchestratorService {
       throw new Error(`Cannot archive task ${taskId}: must be in a terminal state (completed or failed), current state: '${task.state}'`);
     }
     this.captureTaskDiffStats(taskId);
-    this.cleanupWorktree(taskId);
+    await this.cleanupWorktree(taskId);
     this.recordEvent({
       taskId,
       projectId: task.projectId,
@@ -361,6 +421,10 @@ export class OrchestratorService {
     const assessment = assessComplexity(description);
     const tier = opts.forceTier ?? routeTier(assessment);
     const worktree = this.deps.worktrees.create(taskId);
+    // Spin up the per-task workspace immediately so all subsequent
+    // dispatches (planner / coder.subtask / reviewer-N / doc) share one
+    // container instead of paying create+destroy cost per dispatch.
+    await this.ensureTaskWorkspace(worktree.path, taskId, projectId);
     const pauseReview = this.pausePolicySubmit(tier, opts.reviewPlan);
 
     this.recordEvent({
@@ -569,7 +633,7 @@ export class OrchestratorService {
       }
       // Unexpected errors (e.g. PR creation failure while already in `reviewing`)
       // do not run finalizeTerminalTask; avoid leaking the task worktree.
-      this.cleanupWorktree(taskId);
+      await this.cleanupWorktree(taskId);
       throw err;
     }
     const task = this.deps.db.getTask(taskId);
@@ -743,8 +807,12 @@ export class OrchestratorService {
       injectedLessonIds: plannerLessons.ids
     });
 
-    const plannerWorkspace = await this.createWorkspace(worktreePath, taskId, "planner", projectId);
-    try {
+    const plannerWorkspace = this.requireTaskWorkspace(taskId);
+    // Block scope kept from the previous try/finally so plannerEnvelope and
+    // local variables declared inside don't leak; the workspace is now
+    // owned by the per-task lifecycle (see ensureTaskWorkspace) so no
+    // finally block is needed here.
+    {
       const plannerEnvelope = buildPlannerDispatchEnvelope({
         taskId,
         description,
@@ -919,8 +987,6 @@ export class OrchestratorService {
       });
 
       return parsed;
-    } finally {
-      await this.destroyWorkspaceBestEffort(plannerWorkspace, taskId, projectId, "planner_dispatch_complete");
     }
   }
 
@@ -1238,8 +1304,8 @@ export class OrchestratorService {
       });
       const docSteering = this.steeringForDispatch(taskId);
       const baseDocPrompt = buildDocPrompt(task.description, task.planSubtasks);
-      const docWorkspace = await this.createWorkspace(worktreePath, taskId, "doc", task.projectId);
-      try {
+      const docWorkspace = this.requireTaskWorkspace(taskId);
+      {
         const docEnvelope = buildAgentDispatchEnvelope({
           id: `${taskId}-doc`,
           type: "doc",
@@ -1298,8 +1364,6 @@ export class OrchestratorService {
           skillVersionIds: docSkillIds,
           contextEnvelopeHash: docContextEnvelopeHash
         });
-      } finally {
-        await this.destroyWorkspaceBestEffort(docWorkspace, taskId, task.projectId, "doc_dispatch_complete");
       }
 
       const worktreeBranch = `autoforge/${taskId}`;
@@ -1469,7 +1533,7 @@ export class OrchestratorService {
         }
       }
     } finally {
-      this.cleanupWorktree(taskId);
+      await this.cleanupWorktree(taskId);
     }
   }
 
@@ -2031,6 +2095,7 @@ export class OrchestratorService {
   ): Promise<{ experimentId: string | null; status: string; reason?: string }> {
     const metaTaskId = randomUUID();
     const worktree = this.deps.worktrees.create(metaTaskId);
+    await this.ensureTaskWorkspace(worktree.path, metaTaskId, projectId);
 
     try {
       const dbPath = this.deps.env.DATABASE_PATH;
@@ -2073,23 +2138,18 @@ export class OrchestratorService {
         budgetSeconds: 600
       });
 
-      const metaWorkspace = await this.createWorkspace(worktree.path, metaTaskId, "meta", projectId);
-      let metaResult: AgentResult;
-      try {
-        metaResult = await metaExecutor.execute({
-          id: metaTaskId,
-          type: "meta",
-          systemPrompt: metaDispatch.content,
-          prompt,
-          workspace: metaWorkspace,
-          budgetSeconds: 600,
-          environment: {},
-          skillFiles: this.skills.skillsForAgent("meta"),
-          metadata: { projectId, focus }
-        });
-      } finally {
-        await this.destroyWorkspaceBestEffort(metaWorkspace, metaTaskId, projectId, "meta_dispatch_complete");
-      }
+      const metaWorkspace = this.requireTaskWorkspace(metaTaskId);
+      const metaResult = await metaExecutor.execute({
+        id: metaTaskId,
+        type: "meta",
+        systemPrompt: metaDispatch.content,
+        prompt,
+        workspace: metaWorkspace,
+        budgetSeconds: 600,
+        environment: {},
+        skillFiles: this.skills.skillsForAgent("meta"),
+        metadata: { projectId, focus }
+      });
 
       this.recordEvent({
         taskId: metaTaskId,
@@ -2171,7 +2231,7 @@ export class OrchestratorService {
     } finally {
       this.captureTaskDiffStats(metaTaskId);
       try {
-        this.cleanupWorktree(metaTaskId);
+        await this.cleanupWorktree(metaTaskId);
       } catch (cleanupErr) {
         console.warn(
           `[meta] cleanupWorktree threw for ${metaTaskId}: ${(cleanupErr as Error).message ?? cleanupErr}`
@@ -2451,39 +2511,32 @@ export class OrchestratorService {
 
         const coderSteering = this.steeringForDispatch(taskId);
         const baseCoderPrompt = buildCoderPrompt(description, subtask, iteration);
-        const coderWorkspace = await this.createWorkspace(worktreePath, taskId, subtask.id, projectId);
-        let liveTask: AgentTask;
-        let subtaskContextEnvelopeHash = "";
-        let coderResult: AgentResult;
-        try {
-          const coderEnvelope = buildAgentDispatchEnvelope({
-            id: subtask.id,
-            type: subtaskAgentType,
-            systemPrompt: subtaskDispatch.content,
-            basePrompt: baseCoderPrompt,
-            steeringPrompt: coderSteering.prompt,
-            workspace: coderWorkspace,
-            budgetSeconds: this.budgetForTier(tier, "coder"),
-            environment: this.agentEnvironment(),
-            skillFiles: this.skills.skillsForAgent(subtaskAgentType),
-            metadata: { taskId, subtask, description },
-            lessons: coderLessons.block || undefined
-          });
-          liveTask = coderEnvelope.task;
-          subtaskContextEnvelopeHash = coderEnvelope.contextEnvelopeHash;
-          this.recordEvent({
-            taskId,
-            projectId,
-            agent: subtaskAgentType,
-            type: "subtask_started",
-            status: "running",
-            payload: { subtaskId: subtask.id, iteration, sequence: subtask.sequence, agentType: subtaskAgentType },
-            budgetSeconds: this.budgetForTier(tier, "coder")
-          });
-          coderResult = await coderExecutor.execute(liveTask);
-        } finally {
-          await this.destroyWorkspaceBestEffort(coderWorkspace, taskId, projectId, `${subtask.id}_dispatch_complete`);
-        }
+        const coderWorkspace = this.requireTaskWorkspace(taskId);
+        const coderEnvelope = buildAgentDispatchEnvelope({
+          id: subtask.id,
+          type: subtaskAgentType,
+          systemPrompt: subtaskDispatch.content,
+          basePrompt: baseCoderPrompt,
+          steeringPrompt: coderSteering.prompt,
+          workspace: coderWorkspace,
+          budgetSeconds: this.budgetForTier(tier, "coder"),
+          environment: this.agentEnvironment(),
+          skillFiles: this.skills.skillsForAgent(subtaskAgentType),
+          metadata: { taskId, subtask, description },
+          lessons: coderLessons.block || undefined
+        });
+        const liveTask = coderEnvelope.task;
+        const subtaskContextEnvelopeHash = coderEnvelope.contextEnvelopeHash;
+        this.recordEvent({
+          taskId,
+          projectId,
+          agent: subtaskAgentType,
+          type: "subtask_started",
+          status: "running",
+          payload: { subtaskId: subtask.id, iteration, sequence: subtask.sequence, agentType: subtaskAgentType },
+          budgetSeconds: this.budgetForTier(tier, "coder")
+        });
+        const coderResult = await coderExecutor.execute(liveTask);
         this.recordSteeringConsumed({
           taskId,
           projectId,
@@ -2627,30 +2680,23 @@ export class OrchestratorService {
 
       const reviewerSteering = this.steeringForDispatch(taskId);
       const baseReviewerPrompt = buildReviewerPrompt(description, planSubtasks);
-      const reviewerWorkspace = await this.createWorkspace(worktreePath, taskId, `reviewer-${iteration}`, projectId);
-      let reviewerTask: AgentTask;
-      let reviewerContextEnvelopeHash = "";
-      let reviewResult: AgentResult;
-      try {
-        const reviewerEnvelope = buildAgentDispatchEnvelope({
-          id: `${taskId}-review-${iteration}`,
-          type: "reviewer",
-          systemPrompt: reviewerDispatch.content,
-          basePrompt: baseReviewerPrompt,
-          steeringPrompt: reviewerSteering.prompt,
-          workspace: reviewerWorkspace,
-          budgetSeconds: this.budgetForTier(tier, "reviewer"),
-          environment: this.agentEnvironment(),
-          skillFiles: this.skills.skillsForAgent("reviewer"),
-          metadata: { taskId, iteration, description },
-          lessons: reviewerLessons.block || undefined
-        });
-        reviewerTask = reviewerEnvelope.task;
-        reviewerContextEnvelopeHash = reviewerEnvelope.contextEnvelopeHash;
-        reviewResult = await reviewerExecutor.execute(reviewerTask);
-      } finally {
-        await this.destroyWorkspaceBestEffort(reviewerWorkspace, taskId, projectId, `reviewer-${iteration}_dispatch_complete`);
-      }
+      const reviewerWorkspace = this.requireTaskWorkspace(taskId);
+      const reviewerEnvelope = buildAgentDispatchEnvelope({
+        id: `${taskId}-review-${iteration}`,
+        type: "reviewer",
+        systemPrompt: reviewerDispatch.content,
+        basePrompt: baseReviewerPrompt,
+        steeringPrompt: reviewerSteering.prompt,
+        workspace: reviewerWorkspace,
+        budgetSeconds: this.budgetForTier(tier, "reviewer"),
+        environment: this.agentEnvironment(),
+        skillFiles: this.skills.skillsForAgent("reviewer"),
+        metadata: { taskId, iteration, description },
+        lessons: reviewerLessons.block || undefined
+      });
+      const reviewerTask = reviewerEnvelope.task;
+      const reviewerContextEnvelopeHash = reviewerEnvelope.contextEnvelopeHash;
+      const reviewResult = await reviewerExecutor.execute(reviewerTask);
       this.recordSteeringConsumed({
         taskId,
         projectId,
@@ -3485,10 +3531,13 @@ export class OrchestratorService {
     };
   }
 
-  private cleanupWorktree(taskId: string): void {
+  private async cleanupWorktree(taskId: string): Promise<void> {
     const task = this.deps.db.getTask(taskId);
     if (task) {
-      this.emitPendingWorkspaceDestroyed(task.id, task.projectId, "terminal_task");
+      // Per-task workspace lifecycle: destroy the container (or no-op the
+      // local workspace) and emit the paired workspace_destroyed event.
+      // Idempotent — second call after the workspace is gone does nothing.
+      await this.destroyTaskWorkspaceIfPresent(task.id, task.projectId, "terminal_task");
     }
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (worktreePath) {
@@ -3496,21 +3545,6 @@ export class OrchestratorService {
       this.deps.worktrees.remove({ branch, path: worktreePath });
     }
     this.cleanupIterationTags(taskId);
-  }
-
-  private emitPendingWorkspaceDestroyed(taskId: string, projectId: string, reason: string): void {
-    const events = this.deps.db.listEvents(taskId);
-    for (const payload of pendingWorkspaceDestroyPayloads(events, reason)) {
-      this.recordEvent({
-        taskId,
-        projectId,
-        agent: "orchestrator",
-        type: "workspace_destroyed",
-        status: "done",
-        payload,
-        budgetSeconds: 0
-      });
-    }
   }
 
   private captureTaskDiffStats(taskId: string): void {

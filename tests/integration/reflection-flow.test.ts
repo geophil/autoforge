@@ -259,7 +259,12 @@ describe("reflection flow", () => {
       const atPlan = service.getTask(task.id)!;
       expect(atPlan.state).toBe("awaiting_plan_approval");
 
-      (service as unknown as { cleanupWorktree: (taskId: string) => void }).cleanupWorktree(task.id);
+      // cleanupWorktree is async (per-task workspace destroy + worktree
+      // removal). Await it so the worktree-missing branch in critiquePlan
+      // fires deterministically.
+      await (service as unknown as {
+        cleanupWorktree: (taskId: string) => Promise<void>;
+      }).cleanupWorktree(task.id);
 
       await expect(service.critiquePlan(task.id, "please rewrite the plan")).rejects.toThrow(/worktree missing/i);
 

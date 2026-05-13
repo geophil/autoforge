@@ -8,11 +8,13 @@ import {
 } from "../../src/runtime/workspace-cleanup";
 
 describe("workspace cleanup helpers", () => {
-  test("task dispatch destroys factory-created workspaces after execution", async () => {
+  test("submitTask creates exactly one workspace per task and reuses it across dispatches", async () => {
+    let createCount = 0;
     let destroyCount = 0;
     const { service, cleanup } = createTestService({}, {}, {
       workspaceFactory: {
         create: async ({ rootPath, taskId, dispatchId }) => {
+          createCount += 1;
           const { LocalWorkspace } = await import("../../src/runtime/local-workspace");
           const workspace = new LocalWorkspace({ rootPath, taskId, dispatchId });
           const originalDestroy = workspace.destroy.bind(workspace);
@@ -29,38 +31,41 @@ describe("workspace cleanup helpers", () => {
       const task = await service.submitTask("autoforge", "no-op plan", { reviewPlan: false });
 
       expect(task.state).toBe("awaiting_approval");
-      expect(destroyCount).toBeGreaterThanOrEqual(1);
+      // Per-task lifecycle: planner ran inside the same workspace that
+      // submitTask created. The workspace stays alive until cleanupWorktree.
+      expect(createCount).toBe(1);
+      expect(destroyCount).toBe(0);
     } finally {
       cleanup();
     }
   });
 
-  test("returns one destroy payload for each created workspace without a destroy event", () => {
+  test("returns one destroy payload for each created workspace without a destroy event (recovery helper)", () => {
     const created = workspaceCreatedPayload({
-      workspaceId: "task-1:planner",
+      workspaceId: "task-1:task",
       provider: "local",
       taskId: "task-1",
-      dispatchId: "planner",
+      dispatchId: "task",
       rootPath: "/tmp/worktree"
     });
 
     expect(pendingWorkspaceDestroyPayloads([
       { type: "workspace_created", payload: created }
     ], "terminal_task")).toEqual([{
-      workspace_id: "task-1:planner",
+      workspace_id: "task-1:task",
       provider: "local",
       task_id: "task-1",
-      dispatch_id: "planner",
+      dispatch_id: "task",
       reason: "terminal_task"
     }]);
   });
 
   test("does not return duplicate destroy payloads for already destroyed workspaces", () => {
     const created = workspaceCreatedPayload({
-      workspaceId: "task-1:planner",
+      workspaceId: "task-1:task",
       provider: "local",
       taskId: "task-1",
-      dispatchId: "planner"
+      dispatchId: "task"
     });
 
     expect(pendingWorkspaceDestroyPayloads([
@@ -68,17 +73,17 @@ describe("workspace cleanup helpers", () => {
       {
         type: "workspace_destroyed",
         payload: {
-          workspace_id: "task-1:planner",
+          workspace_id: "task-1:task",
           provider: "local",
           task_id: "task-1",
-          dispatch_id: "planner",
+          dispatch_id: "task",
           reason: "terminal_task"
         }
       }
     ], "terminal_task")).toEqual([]);
   });
 
-  test("sweepStaleTasks emits workspace_destroyed once for stale terminalized tasks", async () => {
+  test("sweepStaleTasks emits compensating workspace_destroyed for orphaned create event", async () => {
     const { service, db, cleanup } = createTestService();
     const taskId = "stale-workspace-task";
     const projectId = "autoforge";
@@ -119,10 +124,10 @@ describe("workspace cleanup helpers", () => {
         type: "workspace_created",
         status: "done",
         payload: workspaceCreatedPayload({
-          workspaceId: `${taskId}:coder`,
+          workspaceId: `${taskId}:task`,
           provider: "local",
           taskId,
-          dispatchId: "coder"
+          dispatchId: "task"
         }),
         budgetSeconds: 0
       });
@@ -133,10 +138,10 @@ describe("workspace cleanup helpers", () => {
       const destroyed = db.listEvents(taskId).filter((event) => event.type === "workspace_destroyed");
       expect(destroyed).toHaveLength(1);
       expect(destroyed[0].payload).toMatchObject({
-        workspace_id: `${taskId}:coder`,
+        workspace_id: `${taskId}:task`,
         provider: "local",
         task_id: taskId,
-        dispatch_id: "coder",
+        dispatch_id: "task",
         reason: "terminal_task"
       });
     } finally {
