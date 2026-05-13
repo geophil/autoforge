@@ -42,8 +42,8 @@ import { runDiagnostic } from "./diagnostic";
 import { checkpointStageOrder, parseCheckpointPayload, type TaskCheckpointPayload, type TaskCheckpointStage } from "./checkpoints";
 import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from "./steering";
 import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
-import { LocalWorkspace } from "../runtime/local-workspace";
 import type { Workspace } from "../runtime/workspace";
+import { WorkspaceFactory, type WorkspaceCreateInput } from "../runtime/workspace-provider";
 import { isPlannerFallbackOutput, parsePlannerStructuredOutput } from "./planner-output";
 import { buildPlannerPrompt as buildPlannerPromptText, retryPromptExceedsTokenCap } from "./planner-prompt";
 import { buildPlannerDispatchEnvelope } from "./planner-envelope";
@@ -81,6 +81,7 @@ interface ServiceDeps {
     workingDirectory: string;
     timeoutSeconds: number;
   }) => LifecycleHooksResult;
+  workspaceFactory?: Pick<WorkspaceFactory, "create">;
 }
 
 /**
@@ -106,6 +107,7 @@ export class OrchestratorService {
   private readonly personas: PersonaRegistry;
   private readonly dispatcher: ReturnType<typeof createDispatcher>;
   private readonly embeddingProvider: EmbeddingProvider;
+  private readonly workspaceFactory: Pick<WorkspaceFactory, "create">;
   private readonly autoTuner = new AutoTuner();
   private terminalTaskCount = 0;
 
@@ -116,10 +118,16 @@ export class OrchestratorService {
     this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db, {
       embeddingProvider: this.embeddingProvider
     });
+    this.workspaceFactory = deps.workspaceFactory ?? new WorkspaceFactory(deps.env);
   }
 
-  private localWorkspace(rootPath: string, taskId: string, dispatchId: string, projectId?: string): LocalWorkspace {
-    const workspace = new LocalWorkspace({ rootPath, taskId, dispatchId });
+  private async createWorkspace(
+    rootPath: string,
+    taskId: string,
+    dispatchId: string,
+    projectId?: string
+  ): Promise<Workspace> {
+    const workspace = await this.workspaceFactory.create({ rootPath, taskId, dispatchId } satisfies WorkspaceCreateInput);
     if (projectId) {
       const alreadyCreated = this.deps.db.listEvents(taskId).some((event) => {
         return event.type === "workspace_created" && event.payload.workspace_id === workspace.id;
@@ -136,13 +144,52 @@ export class OrchestratorService {
             provider: workspace.provider,
             taskId,
             dispatchId,
-            rootPath: workspace.rootPath
+            rootPath: "rootPath" in workspace && typeof workspace.rootPath === "string" ? workspace.rootPath : undefined
           }),
           budgetSeconds: 0
         });
       }
     }
     return workspace;
+  }
+
+  private async destroyWorkspace(
+    workspace: Workspace,
+    taskId: string,
+    projectId: string,
+    reason: string
+  ): Promise<void> {
+    await workspace.destroy();
+    this.recordEvent({
+      taskId,
+      projectId,
+      agent: "orchestrator",
+      type: "workspace_destroyed",
+      status: "done",
+      payload: {
+        workspace_id: workspace.id,
+        provider: workspace.provider,
+        task_id: taskId,
+        dispatch_id: workspace.id.includes(":") ? workspace.id.split(":").slice(1).join(":") : workspace.id,
+        reason
+      },
+      budgetSeconds: 0
+    });
+  }
+
+  private async destroyWorkspaceBestEffort(
+    workspace: Workspace,
+    taskId: string,
+    projectId: string,
+    reason: string
+  ): Promise<void> {
+    try {
+      await this.destroyWorkspace(workspace, taskId, projectId, reason);
+    } catch (error) {
+      console.warn(
+        `[workspace] destroy failed for ${taskId}/${workspace.id}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   async backfillSpecialtyEmbeddings(): Promise<number> {
@@ -180,7 +227,8 @@ export class OrchestratorService {
       recordEvent: (event) => this.recordEvent(event),
       agentType,
       trigger,
-      workingDirectory: process.cwd()
+      workingDirectory: process.cwd(),
+      workspaceFactory: this.workspaceFactory
     });
     return { clustersProposed };
   }
@@ -696,180 +744,185 @@ export class OrchestratorService {
       injectedLessonIds: plannerLessons.ids
     });
 
-    const plannerEnvelope = buildPlannerDispatchEnvelope({
-      taskId,
-      description,
-      tier,
-      attempt,
-      model: this.plannerModel(tier),
-      systemPrompt: plannerDispatch.content,
-      userPrompt,
-      steeringPrompt: plannerSteering.prompt,
-      lessons: plannerLessons.block || undefined,
-      workspace: this.localWorkspace(worktreePath, taskId, "planner", projectId),
-      budgetSeconds: this.budgetForTier(tier, "planner"),
-      environment: this.agentEnvironment(),
-      skillFiles: this.skills.skillsForAgent("planner")
-    });
-    const plannerTask = plannerEnvelope.task;
-    const plannerContextEnvelopeHash = plannerEnvelope.contextEnvelopeHash;
-    if (attempt > 0 && retryPromptExceedsTokenCap(plannerTask.prompt)) {
-      const currentTask = this.requireTask(taskId);
-      this.pauseForIntervention({
+    const plannerWorkspace = await this.createWorkspace(worktreePath, taskId, "planner", projectId);
+    try {
+      const plannerEnvelope = buildPlannerDispatchEnvelope({
+        taskId,
+        description,
+        tier,
+        attempt,
+        model: this.plannerModel(tier),
+        systemPrompt: plannerDispatch.content,
+        userPrompt,
+        steeringPrompt: plannerSteering.prompt,
+        lessons: plannerLessons.block || undefined,
+        workspace: plannerWorkspace,
+        budgetSeconds: this.budgetForTier(tier, "planner"),
+        environment: this.agentEnvironment(),
+        skillFiles: this.skills.skillsForAgent("planner")
+      });
+      const plannerTask = plannerEnvelope.task;
+      const plannerContextEnvelopeHash = plannerEnvelope.contextEnvelopeHash;
+      if (attempt > 0 && retryPromptExceedsTokenCap(plannerTask.prompt)) {
+        const currentTask = this.requireTask(taskId);
+        this.pauseForIntervention({
+          taskId,
+          projectId,
+          fromStage: currentTask.state,
+          failureCategory: "planner_prompt_budget_exceeded",
+          failureReason: "planner retry prompt exceeded token budget; request narrower critique/scope",
+          forensics: {
+            agent: "planner",
+            transcript_stage: transcriptStage,
+            attempt,
+            estimated_prompt_tokens: Math.ceil(plannerTask.prompt.length / 4)
+          }
+        });
+      }
+      const plannerResult = await plannerExecutor.execute(plannerTask);
+      this.recordSteeringConsumed({
         taskId,
         projectId,
-        fromStage: currentTask.state,
-        failureCategory: "planner_prompt_budget_exceeded",
-        failureReason: "planner retry prompt exceeded token budget; request narrower critique/scope",
-        forensics: {
-          agent: "planner",
-          transcript_stage: transcriptStage,
-          attempt,
-          estimated_prompt_tokens: Math.ceil(plannerTask.prompt.length / 4)
-        }
+        steeringEventIds: plannerSteering.eventIds,
+        agentType: "planner",
+        iteration: attempt,
+        personaVariantId: plannerPersonaId
       });
-    }
-    const plannerResult = await plannerExecutor.execute(plannerTask);
-    this.recordSteeringConsumed({
-      taskId,
-      projectId,
-      steeringEventIds: plannerSteering.eventIds,
-      agentType: "planner",
-      iteration: attempt,
-      personaVariantId: plannerPersonaId
-    });
 
-    await this.runShadowDispatchesSafely({
-      taskId,
-      projectId,
-      agentType: "planner",
-      selection: plannerDispatch.selection,
-      liveTask: plannerTask,
-      liveResult: plannerResult,
-      baselineExecutorUsed: plannerExecutor.name,
-      baselineLessonIds: plannerLessons.ids,
-      baselineVariantId: plannerDispatch.baselineVariantId,
-      loadCandidateLessons: (candidateVariantId) =>
-        this.loadLessonsForDispatch(candidateVariantId, "planner", description)
-    });
-
-    const transcript = plannerResult.transcript;
-    const turnsJsonl = transcript ? transcript.turns.map((t) => JSON.stringify(t)).join("\n") : "";
-
-    const transcriptId = this.deps.db.insertTranscript({
-      taskId,
-      stage: transcriptStage,
-      attempt,
-      personaVersionId: plannerPersonaId,
-      executorUsed: plannerExecutor.name,
-      model: this.plannerModel(tier),
-      systemPrompt: transcript?.systemPrompt ?? plannerDispatch.content,
-      userPrompt: transcript?.userPrompt ?? plannerTask.prompt,
-      transcript: turnsJsonl,
-      output: plannerResult.output ? JSON.stringify(plannerResult.output) : null,
-      critique,
-      tokenInput: plannerResult.metrics.tokenInput ?? null,
-      tokenOutput: plannerResult.metrics.tokenOutput ?? null,
-      elapsedSeconds: plannerResult.metrics.elapsedSeconds,
-      rollbackEventId: this.latestRollbackEventId(taskId)
-    });
-
-    if (plannerResult.status === "FAILED" || plannerResult.status === "TIMEOUT") {
-      const currentTask = this.requireTask(taskId);
-      const currentStage = currentTask.state;
-      this.pauseForIntervention({
+      await this.runShadowDispatchesSafely({
         taskId,
         projectId,
-        fromStage: currentStage,
-        failureCategory: plannerResult.status === "TIMEOUT" ? "planner_timeout" : "planner_failed",
-        failureReason: plannerResult.blockReason ?? `planner returned ${plannerResult.status}`,
-        forensics: {
-          agent: "planner",
-          executor_used: plannerExecutor.name,
-          model: this.plannerModel(tier),
-          ...this.failureDiagnosticsForResult({
-            taskId,
-            result: plannerResult,
-            workspace: plannerTask.workspace,
-            executorMode: plannerExecutor.name
-          }),
-          persona_version_id: plannerPersonaId,
-          skill_version_ids: plannerSkillIds,
-          tool_stats: plannerResult.metrics.toolStats ?? null,
-          planner_fallback: false,
-          transcript_id: transcriptId,
-          attempt,
-          iteration: currentTask.iteration,
-          budget_seconds: this.budgetForTier(tier, "planner"),
-          elapsed_seconds: plannerResult.metrics.elapsedSeconds,
-          token_input: plannerResult.metrics.tokenInput ?? 0,
-          token_output: plannerResult.metrics.tokenOutput ?? 0,
-          transcript_stage: transcriptStage
-        }
+        agentType: "planner",
+        selection: plannerDispatch.selection,
+        liveTask: plannerTask,
+        liveResult: plannerResult,
+        baselineExecutorUsed: plannerExecutor.name,
+        baselineLessonIds: plannerLessons.ids,
+        baselineVariantId: plannerDispatch.baselineVariantId,
+        loadCandidateLessons: (candidateVariantId) =>
+          this.loadLessonsForDispatch(candidateVariantId, "planner", description)
       });
+
+      const transcript = plannerResult.transcript;
+      const turnsJsonl = transcript ? transcript.turns.map((t) => JSON.stringify(t)).join("\n") : "";
+
+      const transcriptId = this.deps.db.insertTranscript({
+        taskId,
+        stage: transcriptStage,
+        attempt,
+        personaVersionId: plannerPersonaId,
+        executorUsed: plannerExecutor.name,
+        model: this.plannerModel(tier),
+        systemPrompt: transcript?.systemPrompt ?? plannerDispatch.content,
+        userPrompt: transcript?.userPrompt ?? plannerTask.prompt,
+        transcript: turnsJsonl,
+        output: plannerResult.output ? JSON.stringify(plannerResult.output) : null,
+        critique,
+        tokenInput: plannerResult.metrics.tokenInput ?? null,
+        tokenOutput: plannerResult.metrics.tokenOutput ?? null,
+        elapsedSeconds: plannerResult.metrics.elapsedSeconds,
+        rollbackEventId: this.latestRollbackEventId(taskId)
+      });
+
+      if (plannerResult.status === "FAILED" || plannerResult.status === "TIMEOUT") {
+        const currentTask = this.requireTask(taskId);
+        const currentStage = currentTask.state;
+        this.pauseForIntervention({
+          taskId,
+          projectId,
+          fromStage: currentStage,
+          failureCategory: plannerResult.status === "TIMEOUT" ? "planner_timeout" : "planner_failed",
+          failureReason: plannerResult.blockReason ?? `planner returned ${plannerResult.status}`,
+          forensics: {
+            agent: "planner",
+            executor_used: plannerExecutor.name,
+            model: this.plannerModel(tier),
+            ...this.failureDiagnosticsForResult({
+              taskId,
+              result: plannerResult,
+              workspace: plannerTask.workspace,
+              executorMode: plannerExecutor.name
+            }),
+            persona_version_id: plannerPersonaId,
+            skill_version_ids: plannerSkillIds,
+            tool_stats: plannerResult.metrics.toolStats ?? null,
+            planner_fallback: false,
+            transcript_id: transcriptId,
+            attempt,
+            iteration: currentTask.iteration,
+            budget_seconds: this.budgetForTier(tier, "planner"),
+            elapsed_seconds: plannerResult.metrics.elapsedSeconds,
+            token_input: plannerResult.metrics.tokenInput ?? 0,
+            token_output: plannerResult.metrics.tokenOutput ?? 0,
+            transcript_stage: transcriptStage
+          }
+        });
+      }
+
+      const observedQmdTools = this.observedQmdTools(plannerResult);
+      const parsed = parsePlannerStructuredOutput(taskId, plannerResult.output, requestedPhase, worktreePath);
+      this.requireQmdEvidenceForPlanner({
+        taskId,
+        projectId,
+        transcriptStage,
+        requestedPhase,
+        parsed,
+        transcriptId,
+        attempt,
+        plannerExecutorName: plannerExecutor.name,
+        plannerPersonaId,
+        plannerSkillIds,
+        plannerResult,
+        observedQmdTools
+      });
+      const plannerFallback =
+        (parsed.phase === "execution_plan" || parsed.phase === "legacy_subtasks") &&
+        parsed.planSubtasks.length > 0 &&
+        isPlannerFallbackOutput(parsed.planSubtasks);
+
+      const plannedPayload: Record<string, unknown> = {
+        parsed_phase: parsed.phase,
+        requested_phase: requestedPhase,
+        planSubtasks: parsed.planSubtasks,
+        planner_fallback: plannerFallback,
+        attempt,
+        transcript_id: transcriptId,
+        transcript_stage: transcriptStage,
+        planningContext: parsed.planningContext,
+        qmd_tools_observed: observedQmdTools
+      };
+      if (parsed.phase === "spec" || parsed.phase === "combined") {
+        plannedPayload.specArtifacts = parsed.specArtifacts;
+        plannedPayload.blockingQuestion = parsed.blockingQuestion;
+      }
+
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "planner",
+        type: "planned",
+        status: plannerFallback ? "done_with_concerns" : "done",
+        payload: plannedPayload,
+        budgetSeconds: this.budgetForTier(tier, "planner"),
+        elapsedSeconds: plannerResult.metrics.elapsedSeconds,
+        tokenUsage:
+          plannerResult.metrics.tokenInput !== undefined
+            ? {
+                input: plannerResult.metrics.tokenInput,
+                output: plannerResult.metrics.tokenOutput ?? 0,
+                estimatedCost: plannerResult.metrics.estimatedCost
+              }
+            : undefined,
+        executorUsed: plannerExecutor.name,
+        personaVersionId: plannerPersonaId,
+        skillVersionIds: plannerSkillIds,
+        contextEnvelopeHash: plannerContextEnvelopeHash
+      });
+
+      return parsed;
+    } finally {
+      await this.destroyWorkspaceBestEffort(plannerWorkspace, taskId, projectId, "planner_dispatch_complete");
     }
-
-    const observedQmdTools = this.observedQmdTools(plannerResult);
-    const parsed = parsePlannerStructuredOutput(taskId, plannerResult.output, requestedPhase, worktreePath);
-    this.requireQmdEvidenceForPlanner({
-      taskId,
-      projectId,
-      transcriptStage,
-      requestedPhase,
-      parsed,
-      transcriptId,
-      attempt,
-      plannerExecutorName: plannerExecutor.name,
-      plannerPersonaId,
-      plannerSkillIds,
-      plannerResult,
-      observedQmdTools
-    });
-    const plannerFallback =
-      (parsed.phase === "execution_plan" || parsed.phase === "legacy_subtasks") &&
-      parsed.planSubtasks.length > 0 &&
-      isPlannerFallbackOutput(parsed.planSubtasks);
-
-    const plannedPayload: Record<string, unknown> = {
-      parsed_phase: parsed.phase,
-      requested_phase: requestedPhase,
-      planSubtasks: parsed.planSubtasks,
-      planner_fallback: plannerFallback,
-      attempt,
-      transcript_id: transcriptId,
-      transcript_stage: transcriptStage,
-      planningContext: parsed.planningContext,
-      qmd_tools_observed: observedQmdTools
-    };
-    if (parsed.phase === "spec" || parsed.phase === "combined") {
-      plannedPayload.specArtifacts = parsed.specArtifacts;
-      plannedPayload.blockingQuestion = parsed.blockingQuestion;
-    }
-
-    this.recordEvent({
-      taskId,
-      projectId,
-      agent: "planner",
-      type: "planned",
-      status: plannerFallback ? "done_with_concerns" : "done",
-      payload: plannedPayload,
-      budgetSeconds: this.budgetForTier(tier, "planner"),
-      elapsedSeconds: plannerResult.metrics.elapsedSeconds,
-      tokenUsage:
-        plannerResult.metrics.tokenInput !== undefined
-          ? {
-              input: plannerResult.metrics.tokenInput,
-              output: plannerResult.metrics.tokenOutput ?? 0,
-              estimatedCost: plannerResult.metrics.estimatedCost
-            }
-          : undefined,
-      executorUsed: plannerExecutor.name,
-      personaVersionId: plannerPersonaId,
-      skillVersionIds: plannerSkillIds,
-      contextEnvelopeHash: plannerContextEnvelopeHash
-    });
-
-    return parsed;
   }
 
   async approveSpec(taskId: string): Promise<PipelineTask> {
@@ -1186,64 +1239,69 @@ export class OrchestratorService {
       });
       const docSteering = this.steeringForDispatch(taskId);
       const baseDocPrompt = buildDocPrompt(task.description, task.planSubtasks);
-      const docEnvelope = buildAgentDispatchEnvelope({
-        id: `${taskId}-doc`,
-        type: "doc",
-        systemPrompt: docDispatch.content,
-        basePrompt: baseDocPrompt,
-        steeringPrompt: docSteering.prompt,
-        workspace: this.localWorkspace(worktreePath, taskId, "doc", task.projectId),
-        budgetSeconds: this.budgetForTier(task.tier, "doc"),
-        environment: this.agentEnvironment(),
-        skillFiles: this.skills.skillsForAgent("doc"),
-        metadata: { taskId, description: task.description },
-        lessons: docLessons.block || undefined
-      });
-      const docTask = docEnvelope.task;
-      const docContextEnvelopeHash = docEnvelope.contextEnvelopeHash;
-      const docResult = await docExecutor.execute(docTask);
-      this.recordSteeringConsumed({
-        taskId,
-        projectId: task.projectId,
-        steeringEventIds: docSteering.eventIds,
-        agentType: "doc",
-        iteration: task.iteration,
-        personaVariantId: docPersonaId
-      });
+      const docWorkspace = await this.createWorkspace(worktreePath, taskId, "doc", task.projectId);
+      try {
+        const docEnvelope = buildAgentDispatchEnvelope({
+          id: `${taskId}-doc`,
+          type: "doc",
+          systemPrompt: docDispatch.content,
+          basePrompt: baseDocPrompt,
+          steeringPrompt: docSteering.prompt,
+          workspace: docWorkspace,
+          budgetSeconds: this.budgetForTier(task.tier, "doc"),
+          environment: this.agentEnvironment(),
+          skillFiles: this.skills.skillsForAgent("doc"),
+          metadata: { taskId, description: task.description },
+          lessons: docLessons.block || undefined
+        });
+        const docTask = docEnvelope.task;
+        const docContextEnvelopeHash = docEnvelope.contextEnvelopeHash;
+        const docResult = await docExecutor.execute(docTask);
+        this.recordSteeringConsumed({
+          taskId,
+          projectId: task.projectId,
+          steeringEventIds: docSteering.eventIds,
+          agentType: "doc",
+          iteration: task.iteration,
+          personaVariantId: docPersonaId
+        });
 
-      await this.runShadowDispatchesSafely({
-        taskId,
-        projectId: task.projectId,
-        agentType: "doc",
-        selection: docDispatch.selection,
-        liveTask: docTask,
-        liveResult: docResult,
-        baselineExecutorUsed: docExecutor.name,
-        baselineLessonIds: docLessons.ids,
-        baselineVariantId: docDispatch.baselineVariantId,
-        loadCandidateLessons: (candidateVariantId) =>
-          this.loadLessonsForDispatch(candidateVariantId, "doc", task.description)
-      });
+        await this.runShadowDispatchesSafely({
+          taskId,
+          projectId: task.projectId,
+          agentType: "doc",
+          selection: docDispatch.selection,
+          liveTask: docTask,
+          liveResult: docResult,
+          baselineExecutorUsed: docExecutor.name,
+          baselineLessonIds: docLessons.ids,
+          baselineVariantId: docDispatch.baselineVariantId,
+          loadCandidateLessons: (candidateVariantId) =>
+            this.loadLessonsForDispatch(candidateVariantId, "doc", task.description)
+        });
 
-      this.recordEvent({
-        taskId,
-        projectId: task.projectId,
-        agent: "doc",
-        type: "doc_done",
-        status: docResult.status === "DONE" ? "done" : "done_with_concerns",
-        payload: { artifacts: docResult.artifacts },
-        budgetSeconds: this.budgetForTier(task.tier, "doc"),
-        elapsedSeconds: docResult.metrics.elapsedSeconds,
-        tokenUsage: docResult.metrics.tokenInput !== undefined ? {
-          input: docResult.metrics.tokenInput,
-          output: docResult.metrics.tokenOutput ?? 0,
-          estimatedCost: docResult.metrics.estimatedCost
-        } : undefined,
-        executorUsed: docExecutor.name,
-        personaVersionId: docPersonaId,
-        skillVersionIds: docSkillIds,
-        contextEnvelopeHash: docContextEnvelopeHash
-      });
+        this.recordEvent({
+          taskId,
+          projectId: task.projectId,
+          agent: "doc",
+          type: "doc_done",
+          status: docResult.status === "DONE" ? "done" : "done_with_concerns",
+          payload: { artifacts: docResult.artifacts },
+          budgetSeconds: this.budgetForTier(task.tier, "doc"),
+          elapsedSeconds: docResult.metrics.elapsedSeconds,
+          tokenUsage: docResult.metrics.tokenInput !== undefined ? {
+            input: docResult.metrics.tokenInput,
+            output: docResult.metrics.tokenOutput ?? 0,
+            estimatedCost: docResult.metrics.estimatedCost
+          } : undefined,
+          executorUsed: docExecutor.name,
+          personaVersionId: docPersonaId,
+          skillVersionIds: docSkillIds,
+          contextEnvelopeHash: docContextEnvelopeHash
+        });
+      } finally {
+        await this.destroyWorkspaceBestEffort(docWorkspace, taskId, task.projectId, "doc_dispatch_complete");
+      }
 
       const worktreeBranch = `autoforge/${taskId}`;
       this.deps.worktrees.commit({ branch: worktreeBranch, path: worktreePath }, "autoforge: documentation");
@@ -1377,6 +1435,7 @@ export class OrchestratorService {
       personas: this.personas,
       skills: this.skills,
       workingDirectory: worktree?.path ?? process.cwd(),
+      workspaceFactory: this.workspaceFactory,
       recordEvent: (e) =>
         this.recordEvent({
           taskId: e.taskId,
@@ -2016,17 +2075,23 @@ export class OrchestratorService {
         budgetSeconds: 600
       });
 
-      const metaResult = await metaExecutor.execute({
-        id: metaTaskId,
-        type: "meta",
-        systemPrompt: metaDispatch.content,
-        prompt,
-        workspace: this.localWorkspace(worktree.path, metaTaskId, "meta", projectId),
-        budgetSeconds: 600,
-        environment: {},
-        skillFiles: this.skills.skillsForAgent("meta"),
-        metadata: { projectId, focus }
-      });
+      const metaWorkspace = await this.createWorkspace(worktree.path, metaTaskId, "meta", projectId);
+      let metaResult: AgentResult;
+      try {
+        metaResult = await metaExecutor.execute({
+          id: metaTaskId,
+          type: "meta",
+          systemPrompt: metaDispatch.content,
+          prompt,
+          workspace: metaWorkspace,
+          budgetSeconds: 600,
+          environment: {},
+          skillFiles: this.skills.skillsForAgent("meta"),
+          metadata: { projectId, focus }
+        });
+      } finally {
+        await this.destroyWorkspaceBestEffort(metaWorkspace, metaTaskId, projectId, "meta_dispatch_complete");
+      }
 
       this.recordEvent({
         taskId: metaTaskId,
@@ -2388,31 +2453,39 @@ export class OrchestratorService {
 
         const coderSteering = this.steeringForDispatch(taskId);
         const baseCoderPrompt = buildCoderPrompt(description, subtask, iteration);
-        const coderEnvelope = buildAgentDispatchEnvelope({
-          id: subtask.id,
-          type: subtaskAgentType,
-          systemPrompt: subtaskDispatch.content,
-          basePrompt: baseCoderPrompt,
-          steeringPrompt: coderSteering.prompt,
-          workspace: this.localWorkspace(worktreePath, taskId, subtask.id, projectId),
-          budgetSeconds: this.budgetForTier(tier, "coder"),
-          environment: this.agentEnvironment(),
-          skillFiles: this.skills.skillsForAgent(subtaskAgentType),
-          metadata: { taskId, subtask, description },
-          lessons: coderLessons.block || undefined
-        });
-        const liveTask = coderEnvelope.task;
-        const subtaskContextEnvelopeHash = coderEnvelope.contextEnvelopeHash;
-        this.recordEvent({
-          taskId,
-          projectId,
-          agent: subtaskAgentType,
-          type: "subtask_started",
-          status: "running",
-          payload: { subtaskId: subtask.id, iteration, sequence: subtask.sequence, agentType: subtaskAgentType },
-          budgetSeconds: this.budgetForTier(tier, "coder")
-        });
-        const coderResult = await coderExecutor.execute(liveTask);
+        const coderWorkspace = await this.createWorkspace(worktreePath, taskId, subtask.id, projectId);
+        let liveTask: AgentTask;
+        let subtaskContextEnvelopeHash = "";
+        let coderResult: AgentResult;
+        try {
+          const coderEnvelope = buildAgentDispatchEnvelope({
+            id: subtask.id,
+            type: subtaskAgentType,
+            systemPrompt: subtaskDispatch.content,
+            basePrompt: baseCoderPrompt,
+            steeringPrompt: coderSteering.prompt,
+            workspace: coderWorkspace,
+            budgetSeconds: this.budgetForTier(tier, "coder"),
+            environment: this.agentEnvironment(),
+            skillFiles: this.skills.skillsForAgent(subtaskAgentType),
+            metadata: { taskId, subtask, description },
+            lessons: coderLessons.block || undefined
+          });
+          liveTask = coderEnvelope.task;
+          subtaskContextEnvelopeHash = coderEnvelope.contextEnvelopeHash;
+          this.recordEvent({
+            taskId,
+            projectId,
+            agent: subtaskAgentType,
+            type: "subtask_started",
+            status: "running",
+            payload: { subtaskId: subtask.id, iteration, sequence: subtask.sequence, agentType: subtaskAgentType },
+            budgetSeconds: this.budgetForTier(tier, "coder")
+          });
+          coderResult = await coderExecutor.execute(liveTask);
+        } finally {
+          await this.destroyWorkspaceBestEffort(coderWorkspace, taskId, projectId, `${subtask.id}_dispatch_complete`);
+        }
         this.recordSteeringConsumed({
           taskId,
           projectId,
@@ -2556,22 +2629,30 @@ export class OrchestratorService {
 
       const reviewerSteering = this.steeringForDispatch(taskId);
       const baseReviewerPrompt = buildReviewerPrompt(description, planSubtasks);
-      const reviewerEnvelope = buildAgentDispatchEnvelope({
-        id: `${taskId}-review-${iteration}`,
-        type: "reviewer",
-        systemPrompt: reviewerDispatch.content,
-        basePrompt: baseReviewerPrompt,
-        steeringPrompt: reviewerSteering.prompt,
-        workspace: this.localWorkspace(worktreePath, taskId, `reviewer-${iteration}`, projectId),
-        budgetSeconds: this.budgetForTier(tier, "reviewer"),
-        environment: this.agentEnvironment(),
-        skillFiles: this.skills.skillsForAgent("reviewer"),
-        metadata: { taskId, iteration, description },
-        lessons: reviewerLessons.block || undefined
-      });
-      const reviewerTask = reviewerEnvelope.task;
-      const reviewerContextEnvelopeHash = reviewerEnvelope.contextEnvelopeHash;
-      const reviewResult = await reviewerExecutor.execute(reviewerTask);
+      const reviewerWorkspace = await this.createWorkspace(worktreePath, taskId, `reviewer-${iteration}`, projectId);
+      let reviewerTask: AgentTask;
+      let reviewerContextEnvelopeHash = "";
+      let reviewResult: AgentResult;
+      try {
+        const reviewerEnvelope = buildAgentDispatchEnvelope({
+          id: `${taskId}-review-${iteration}`,
+          type: "reviewer",
+          systemPrompt: reviewerDispatch.content,
+          basePrompt: baseReviewerPrompt,
+          steeringPrompt: reviewerSteering.prompt,
+          workspace: reviewerWorkspace,
+          budgetSeconds: this.budgetForTier(tier, "reviewer"),
+          environment: this.agentEnvironment(),
+          skillFiles: this.skills.skillsForAgent("reviewer"),
+          metadata: { taskId, iteration, description },
+          lessons: reviewerLessons.block || undefined
+        });
+        reviewerTask = reviewerEnvelope.task;
+        reviewerContextEnvelopeHash = reviewerEnvelope.contextEnvelopeHash;
+        reviewResult = await reviewerExecutor.execute(reviewerTask);
+      } finally {
+        await this.destroyWorkspaceBestEffort(reviewerWorkspace, taskId, projectId, `reviewer-${iteration}_dispatch_complete`);
+      }
       this.recordSteeringConsumed({
         taskId,
         projectId,

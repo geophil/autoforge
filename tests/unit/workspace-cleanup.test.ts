@@ -8,6 +8,33 @@ import {
 } from "../../src/runtime/workspace-cleanup";
 
 describe("workspace cleanup helpers", () => {
+  test("task dispatch destroys factory-created workspaces after execution", async () => {
+    let destroyCount = 0;
+    const { service, cleanup } = createTestService({}, {}, {
+      workspaceFactory: {
+        create: async ({ rootPath, taskId, dispatchId }) => {
+          const { LocalWorkspace } = await import("../../src/runtime/local-workspace");
+          const workspace = new LocalWorkspace({ rootPath, taskId, dispatchId });
+          const originalDestroy = workspace.destroy.bind(workspace);
+          workspace.destroy = async () => {
+            destroyCount += 1;
+            await originalDestroy();
+          };
+          return workspace;
+        }
+      }
+    });
+
+    try {
+      const task = await service.submitTask("autoforge", "no-op plan", { reviewPlan: false });
+
+      expect(task.state).toBe("awaiting_approval");
+      expect(destroyCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("returns one destroy payload for each created workspace without a destroy event", () => {
     const created = workspaceCreatedPayload({
       workspaceId: "task-1:planner",
@@ -112,6 +139,43 @@ describe("workspace cleanup helpers", () => {
         dispatch_id: "coder",
         reason: "terminal_task"
       });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("planner failure is preserved when workspace destroy throws", async () => {
+    const { service, db, cleanup } = createTestService(
+      {
+        planner: async () => ({
+          status: "FAILED",
+          artifacts: [],
+          blockReason: "planner_failed_primary",
+          metrics: { elapsedSeconds: 0.1 }
+        })
+      },
+      {},
+      {
+        workspaceFactory: {
+          create: async ({ rootPath, taskId, dispatchId }) => {
+            const { LocalWorkspace } = await import("../../src/runtime/local-workspace");
+            const workspace = new LocalWorkspace({ rootPath, taskId, dispatchId });
+            workspace.destroy = async () => {
+              throw new Error("workspace_destroy_failed_secondary");
+            };
+            return workspace;
+          }
+        }
+      }
+    );
+
+    try {
+      const task = await service.submitTask("autoforge", "no-op plan", { reviewPlan: false });
+      expect(task.state).toBe("awaiting_intervention");
+      const failureAnalysis = db.listEvents(task.id).find((event) => event.type === "failure_analysis");
+      expect(failureAnalysis).toBeDefined();
+      expect(JSON.stringify(failureAnalysis?.payload ?? {})).toContain("planner_failed_primary");
+      expect(JSON.stringify(failureAnalysis?.payload ?? {})).not.toContain("workspace_destroy_failed_secondary");
     } finally {
       cleanup();
     }

@@ -257,6 +257,66 @@ describe("diagnostic parsing and persistence helpers", () => {
     });
   });
 
+  test("runDiagnostic uses injected workspace factory for diagnostician dispatch", async () => {
+    const db = freshDb();
+    for (let i = 1; i <= 30; i++) {
+      seedTerminalSelectedTask(db, i);
+    }
+
+    let createInput: any = null;
+    let destroyCount = 0;
+    const fakeWorkspace = {
+      id: "diagnostic-coder-2026-04-28:diagnostician",
+      provider: "test",
+      readFile: async () => "{}",
+      writeFile: async () => {},
+      exec: async function* () {
+        yield { kind: "exit", exitCode: 0 } as const;
+      },
+      destroy: async () => {
+        destroyCount += 1;
+      }
+    };
+    const executor = {
+      name: "diagnostic-mock",
+      async execute(task: AgentTask): Promise<AgentResult> {
+        expect(task.workspace).toBe(fakeWorkspace);
+        return {
+          status: "DONE",
+          artifacts: [],
+          output: { clusters: [] },
+          metrics: { elapsedSeconds: 0.1 }
+        };
+      },
+      async healthCheck(): Promise<boolean> {
+        return true;
+      }
+    };
+
+    await runDiagnostic({
+      db,
+      executor,
+      recordEvent: createRecorder(db),
+      agentType: "coder",
+      trigger: "unit_test",
+      workingDirectory: process.cwd(),
+      now: new Date("2026-04-28T12:00:00Z"),
+      workspaceFactory: {
+        create: async (input) => {
+          createInput = input;
+          return fakeWorkspace;
+        }
+      }
+    });
+
+    expect(createInput).not.toBeNull();
+    if (!createInput) {
+      throw new Error("Expected workspace factory create input");
+    }
+    expect(createInput.dispatchId).toBe("diagnostician");
+    expect(destroyCount).toBe(1);
+  });
+
   test("diagnostic events remain analytics-only after projection rebuild", async () => {
     const db = freshDb();
     for (let i = 1; i <= 30; i++) {
@@ -329,6 +389,41 @@ describe("diagnostic parsing and persistence helpers", () => {
     expect(JSON.parse(events[0].payload)).toMatchObject({
       clusters_proposed: 0,
       error: null
+    });
+  });
+
+  test("runDiagnostic logs completion event when workspace creation fails", async () => {
+    const db = freshDb();
+    for (let i = 1; i <= 30; i++) {
+      seedTerminalSelectedTask(db, i);
+    }
+
+    const proposed = await runDiagnostic({
+      db,
+      executor: new DiagnosticMockExecutor(),
+      recordEvent: createRecorder(db),
+      agentType: "coder",
+      trigger: "unit_test",
+      workingDirectory: process.cwd(),
+      now: new Date("2026-04-28T12:00:00Z"),
+      workspaceFactory: {
+        create: async () => {
+          throw new Error("workspace_create_failed");
+        }
+      }
+    });
+
+    expect(proposed).toBe(0);
+    const completion = db.sqlite.query(`
+      SELECT payload
+      FROM events
+      WHERE event_type = 'diagnostic_run_completed'
+      ORDER BY timestamp DESC, rowid DESC
+      LIMIT 1
+    `).get() as { payload: string } | undefined;
+    expect(completion).toBeDefined();
+    expect(JSON.parse(completion!.payload)).toMatchObject({
+      error: "workspace_create_failed"
     });
   });
 

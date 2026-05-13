@@ -108,6 +108,43 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Default**: unset
 - **Affects**: `domain-agent-execution.md` — when set, `OrchestratorService.agentEnvironment()` forwards this non-secret URL to task-facing planner/coder/reviewer/doc/doc-review runs. The harness `exec` tool can use it to reach QMD MCP-backed flows where configured. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
 
+### `WORKSPACE_PROVIDER`
+
+- **Type**: `"local"` or `"docker"`
+- **Default**: `"local"`
+- **Affects**: Agent workspace isolation. `local` runs agent tools directly in the task worktree, matching legacy behavior. `docker` creates one local Docker container per agent dispatch and mounts the task worktree at `/workspace`.
+- **Rollback**: Set `WORKSPACE_PROVIDER=local` and restart Autoforge.
+
+### `WORKSPACE_DOCKER_IMAGE`
+
+- **Type**: string
+- **Default**: `"autoforge-agent:local"`
+- **Affects**: Docker image used when `WORKSPACE_PROVIDER=docker`.
+
+### `WORKSPACE_DOCKER_NETWORK`
+
+- **Type**: string
+- **Default**: `"none"`
+- **Affects**: Docker network mode for agent containers. Use `"none"` for maximum local isolation; use a named network only when agents must reach local services.
+
+### `WORKSPACE_DOCKER_CPUS`
+
+- **Type**: string
+- **Default**: `"2"`
+- **Affects**: Docker CPU limit passed to `docker create --cpus`.
+
+### `WORKSPACE_DOCKER_MEMORY`
+
+- **Type**: string
+- **Default**: `"2g"`
+- **Affects**: Docker memory limit passed to `docker create --memory`.
+
+### `WORKSPACE_DOCKER_PRECHECK`
+
+- **Type**: `"0"` or `"1"`
+- **Default**: `"1"`
+- **Affects**: Whether Autoforge verifies Docker daemon and image availability before creating the first Docker workspace.
+
 ### `AUTOFORGE_URL`
 
 - **Type**: string (CLI environment variable, not validated by `loadEnv()`)

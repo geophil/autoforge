@@ -39,6 +39,26 @@ If the status file is missing, the runtime returns `DONE_WITH_CONCERNS`.
 
 `AgentTask.workspace` is the only file/exec surface. `LocalWorkspace` enforces root-constrained paths and controlled child-process environment.
 
+### Local Docker Workspace Provider
+
+Autoforge can run agent tools in local Docker containers by setting `WORKSPACE_PROVIDER=docker`. The orchestrator still creates one git worktree per task. Each agent dispatch gets one container with that worktree mounted at `/workspace`; the container is destroyed after the dispatch completes.
+
+The runtime contract remains `Workspace`:
+
+- `readFile` and `writeFile` use host-side path checks against the mounted worktree.
+- `exec` runs through `docker exec` with `cwd` mapped under `/workspace`.
+- `destroy` removes the dispatch container.
+
+The rollback path is `WORKSPACE_PROVIDER=local`. This restores legacy local worktree execution without changing planner, coder, reviewer, or document agent behavior.
+
+Operational gates before making Docker the team default:
+
+- Docker preflight succeeds on developer machines.
+- Docker-gated integration test passes.
+- No persistent `autoforge.workspace=true` orphan containers after repeated failed runs.
+- p95 dispatch latency remains acceptable for EXPRESS tasks.
+- `WORKSPACE_PROVIDER=local` rollback is tested after a Docker failure.
+
 ### Provider Boundary
 
 `ModelProvider` abstracts model APIs. `AnthropicProvider` currently implements this boundary for production.

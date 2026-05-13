@@ -28,7 +28,13 @@ const EnvSchema = z.object({
   PLANNER_SPEC_MAX_ITERATIONS: z.coerce.number().int().min(0).max(10).default(3),
   AUTOFORGE_RESUME_SUBTASK_ENABLED: z.enum(["0", "1"]).default("0"),
   AUTOFORGE_HOOK_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
-  AUTOFORGE_ENABLE_TEST_HOOKS: z.enum(["0", "1"]).default("0")
+  AUTOFORGE_ENABLE_TEST_HOOKS: z.enum(["0", "1"]).default("0"),
+  WORKSPACE_PROVIDER: z.enum(["local", "docker"]).default("local"),
+  WORKSPACE_DOCKER_IMAGE: z.string().min(1).default("autoforge-agent:local"),
+  WORKSPACE_DOCKER_NETWORK: z.string().min(1).default("none"),
+  WORKSPACE_DOCKER_CPUS: z.string().min(1).default("2"),
+  WORKSPACE_DOCKER_MEMORY: z.string().min(1).default("2g"),
+  WORKSPACE_DOCKER_PRECHECK: z.enum(["0", "1"]).default("1")
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;

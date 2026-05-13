@@ -13,6 +13,10 @@ import type { AgentTask, AgentResult } from "../../src/executors/interface";
 type Handlers = Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult | Promise<AgentResult>>>;
 type EnvOverrides = Partial<Record<string, string>>;
 
+interface CreateTestServiceOptions {
+  workspaceFactory?: ConstructorParameters<typeof OrchestratorService>[0]["workspaceFactory"];
+}
+
 export interface TestService {
   service: OrchestratorService;
   db: DbClient;
@@ -22,7 +26,11 @@ export interface TestService {
 
 const pendingCleanups = new Set<() => void>();
 
-export function createTestService(handlers: Handlers = {}, envOverrides: EnvOverrides = {}): TestService {
+export function createTestService(
+  handlers: Handlers = {},
+  envOverrides: EnvOverrides = {},
+  options: CreateTestServiceOptions = {}
+): TestService {
   // realpathSync resolves macOS's /var -> /private/var symlink so that
   // prefix comparisons against paths reported by `git worktree list`
   // (which always report the resolved form) succeed.
@@ -52,7 +60,8 @@ export function createTestService(handlers: Handlers = {}, envOverrides: EnvOver
     executor,
     worktrees,
     testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
-    prCreator: async (payload) => `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`
+    prCreator: async (payload) => `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`,
+    workspaceFactory: options.workspaceFactory
   });
 
   let cleanedUp = false;

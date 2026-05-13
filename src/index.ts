@@ -8,6 +8,7 @@ import { WorktreeManager } from "./git/worktrees";
 import { NatsClient } from "./nats/client";
 import { RecoveryService } from "./orchestrator/recovery";
 import { OrchestratorService } from "./orchestrator/service";
+import { WorkspaceFactory } from "./runtime/workspace-provider";
 import { createWebServer } from "./web/server";
 
 const env = loadEnv();
@@ -31,12 +32,14 @@ await recovery.recover();
 
 const executors = createExecutors(env);
 const worktrees = new WorktreeManager(resolve(process.cwd(), ".runtime-worktrees"));
+const workspaceFactory = new WorkspaceFactory(env);
 const service = new OrchestratorService({
   env,
   db,
   executor: executors.primary,
   worktrees,
-  nats
+  nats,
+  workspaceFactory
 });
 await service.backfillSpecialtyEmbeddings();
 service.startDiagnosticScheduler();

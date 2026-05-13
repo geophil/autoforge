@@ -1,11 +1,11 @@
 import type { DbClient } from "../db/client";
-import type { AgentExecutor } from "../executors/interface";
+import type { AgentExecutor, AgentResult } from "../executors/interface";
 import type { PersonaRegistry } from "../personas/registry";
 import type { SkillRegistry } from "../skills/registry";
 import type { AgentType, PipelineTask } from "../types/core";
 import type { AgentTranscriptRow } from "../types/transcripts";
 import { REFLECTION_CONFIG } from "../config/reflection";
-import { LocalWorkspace } from "../runtime/local-workspace";
+import { WorkspaceFactory } from "../runtime/workspace-provider";
 
 /**
  * Whitelist of agent types the reflector is allowed to emit lessons for.
@@ -32,6 +32,7 @@ export interface ReflectionDeps {
   personas: PersonaRegistry;
   skills: SkillRegistry;
   workingDirectory: string;
+  workspaceFactory?: Pick<WorkspaceFactory, "create">;
   recordEvent: (e: {
     taskId: string;
     projectId: string;
@@ -136,21 +137,41 @@ export async function reflectOnTask(
   deps.personas.snapshotId("reflector");
 
   try {
-    const result = await deps.executor.execute({
-      id: `${taskId}-reflector`,
-      type: "reflector",
-      systemPrompt: deps.personas.resolve("reflector"),
-      prompt: userPrompt,
-      workspace: new LocalWorkspace({
-        rootPath: deps.workingDirectory,
-        taskId,
-        dispatchId: "reflector"
-      }),
-      budgetSeconds: REFLECTION_CONFIG.budgetSeconds,
-      environment: {},
-      skillFiles: deps.skills.skillsForAgent("reflector"),
-      metadata: { taskId }
+    const workspaceFactory = deps.workspaceFactory ?? new WorkspaceFactory({
+      WORKSPACE_PROVIDER: "local",
+      WORKSPACE_DOCKER_IMAGE: "autoforge-agent:local",
+      WORKSPACE_DOCKER_NETWORK: "none",
+      WORKSPACE_DOCKER_CPUS: "2",
+      WORKSPACE_DOCKER_MEMORY: "2g",
+      WORKSPACE_DOCKER_PRECHECK: "1"
     });
+    const workspace = await workspaceFactory.create({
+      rootPath: deps.workingDirectory,
+      taskId,
+      dispatchId: "reflector"
+    });
+    let result: AgentResult;
+    try {
+      result = await deps.executor.execute({
+        id: `${taskId}-reflector`,
+        type: "reflector",
+        systemPrompt: deps.personas.resolve("reflector"),
+        prompt: userPrompt,
+        workspace,
+        budgetSeconds: REFLECTION_CONFIG.budgetSeconds,
+        environment: {},
+        skillFiles: deps.skills.skillsForAgent("reflector"),
+        metadata: { taskId }
+      });
+    } finally {
+      try {
+        await workspace.destroy();
+      } catch (destroyError) {
+        console.warn(
+          `[reflector] workspace destroy failed for ${taskId}: ${destroyError instanceof Error ? destroyError.message : String(destroyError)}`
+        );
+      }
+    }
 
     if (result.status !== "DONE" || !result.output) {
       emitSkipped(deps, task, `reflector_returned_${result.status}`);

@@ -5,7 +5,8 @@ import type { DbClient } from "../db/client";
 import type { AgentExecutor } from "../executors/interface";
 import type { AgentType } from "../types/core";
 import type { AutoforgeMessage } from "../nats/messages";
-import { LocalWorkspace } from "../runtime/local-workspace";
+import type { Workspace } from "../runtime/workspace";
+import { WorkspaceFactory } from "../runtime/workspace-provider";
 
 export interface DiagnosticCluster {
   label: string;
@@ -41,6 +42,7 @@ export interface RunDiagnosticInput {
   workingDirectory?: string;
   now?: Date;
   systemPrompt?: string;
+  workspaceFactory?: Pick<WorkspaceFactory, "create">;
 }
 
 const DIAGNOSTIC_BUDGET_SECONDS = 90;
@@ -79,11 +81,21 @@ export function runDiagnosticStalenessSweep(db: DbClient, daysOld: number): numb
 export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> {
   const startedAt = input.now ?? new Date();
   const generatedAt = startedAt.toISOString();
+  const runTaskId = diagnosticTaskId(input.agentType, generatedAt);
+  const rootPath = input.workingDirectory ?? process.cwd();
+  const workspaceFactory = input.workspaceFactory ?? new WorkspaceFactory({
+    WORKSPACE_PROVIDER: "local",
+    WORKSPACE_DOCKER_IMAGE: "autoforge-agent:local",
+    WORKSPACE_DOCKER_NETWORK: "none",
+    WORKSPACE_DOCKER_CPUS: "2",
+    WORKSPACE_DOCKER_MEMORY: "2g",
+    WORKSPACE_DOCKER_PRECHECK: "1"
+  });
   const tasks = input.db.loadDiagnosticTaskHistory(input.agentType, DIAGNOSTIC_HISTORY_LIMIT);
 
   if (tasks.length < MIN_HISTORY_TASKS) {
     appendDiagnosticEvent(input.recordEvent, {
-      taskId: diagnosticTaskId(input.agentType, generatedAt),
+      taskId: runTaskId,
       type: "diagnostic_run_completed",
       status: "done",
       payload: completionPayload(input.trigger, tasks.length, 0, 0, "insufficient_history")
@@ -93,17 +105,19 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
 
   const baselineScoreMean = meanCompositeFromHistory(tasks);
   const prompt = JSON.stringify({ agent_type: input.agentType, baseline_score_mean: baselineScoreMean, tasks });
+  let workspace: Workspace | null = null;
   try {
+    workspace = await workspaceFactory.create({
+      rootPath,
+      taskId: runTaskId,
+      dispatchId: "diagnostician"
+    });
     const result = await input.executor.execute({
-      id: `${diagnosticTaskId(input.agentType, generatedAt)}-run`,
+      id: `${runTaskId}-run`,
       type: "diagnostician",
       systemPrompt: input.systemPrompt ?? resolveDiagnosticianPrompt(input.workingDirectory),
       prompt,
-      workspace: new LocalWorkspace({
-        rootPath: input.workingDirectory ?? process.cwd(),
-        taskId: diagnosticTaskId(input.agentType, generatedAt),
-        dispatchId: "diagnostician"
-      }),
+      workspace,
       budgetSeconds: DIAGNOSTIC_BUDGET_SECONDS,
       environment: {},
       skillFiles: [],
@@ -116,7 +130,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
 
     if (result.status !== "DONE") {
       appendDiagnosticEvent(input.recordEvent, {
-        taskId: diagnosticTaskId(input.agentType, generatedAt),
+        taskId: runTaskId,
         type: "diagnostic_run_completed",
         status: "done",
         payload: completionPayload(input.trigger, tasks.length, 0, elapsedSeconds(startedAt), `diagnostician_returned_${result.status}`)
@@ -145,7 +159,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
       }
       clustersProposed += 1;
       appendDiagnosticEvent(input.recordEvent, {
-        taskId: diagnosticTaskId(input.agentType, generatedAt),
+        taskId: runTaskId,
         type: "diagnostic_cluster_detected",
         status: "done",
         payload: {
@@ -160,7 +174,7 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
     runDiagnosticStalenessSweep(input.db, STALE_PROPOSAL_DAYS);
 
     appendDiagnosticEvent(input.recordEvent, {
-      taskId: diagnosticTaskId(input.agentType, generatedAt),
+      taskId: runTaskId,
       type: "diagnostic_run_completed",
       status: "done",
       payload: completionPayload(input.trigger, tasks.length, clustersProposed, result.metrics.elapsedSeconds ?? elapsedSeconds(startedAt), null)
@@ -168,12 +182,22 @@ export async function runDiagnostic(input: RunDiagnosticInput): Promise<number> 
     return clustersProposed;
   } catch (error) {
     appendDiagnosticEvent(input.recordEvent, {
-      taskId: diagnosticTaskId(input.agentType, generatedAt),
+      taskId: runTaskId,
       type: "diagnostic_run_completed",
       status: "done",
       payload: completionPayload(input.trigger, tasks.length, 0, elapsedSeconds(startedAt), error instanceof Error ? error.message : String(error))
     });
     return 0;
+  } finally {
+    if (workspace) {
+      try {
+        await workspace.destroy();
+      } catch (destroyError) {
+        console.warn(
+          `[diagnostic] workspace destroy failed for ${runTaskId}: ${destroyError instanceof Error ? destroyError.message : String(destroyError)}`
+        );
+      }
+    }
   }
 }
 
