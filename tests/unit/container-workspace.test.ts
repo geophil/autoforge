@@ -152,4 +152,32 @@ describe("ContainerWorkspace", () => {
     expect(runner.destroys).toEqual([workspace.containerId]);
     await rm(rootPath, { recursive: true, force: true });
   });
+
+  test("destroys the created container if start fails", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "autoforge-container-workspace-"));
+    const runner = new FakeRunner();
+    runner.start = async (containerId: string): Promise<void> => {
+      runner.starts.push(containerId);
+      throw new Error("start_boom");
+    };
+
+    await expect(
+      ContainerWorkspace.create({
+        rootPath,
+        taskId: "task-1",
+        dispatchId: "coder",
+        image: "autoforge-agent:local",
+        network: "none",
+        cpus: "2",
+        memory: "2g",
+        runner
+      })
+    ).rejects.toThrow("start_boom");
+
+    expect(runner.creates).toHaveLength(1);
+    expect(runner.starts).toHaveLength(1);
+    expect(runner.destroys).toEqual([runner.creates[0].name]);
+
+    await rm(rootPath, { recursive: true, force: true });
+  });
 });

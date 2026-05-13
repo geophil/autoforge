@@ -53,7 +53,20 @@ export class ContainerWorkspace implements Workspace {
       uid: process.getuid?.() ?? 1000,
       gid: process.getgid?.() ?? 1000
     });
-    await runner.start(containerId);
+    try {
+      await runner.start(containerId);
+    } catch (startError) {
+      try {
+        await runner.destroy(containerId);
+      } catch (destroyError) {
+        console.warn(
+          `[container-workspace] failed to clean up container ${containerId} after start failure: ${
+            destroyError instanceof Error ? destroyError.message : String(destroyError)
+          }`
+        );
+      }
+      throw startError;
+    }
     return new ContainerWorkspace({ ...options, rootPath }, runner, containerId);
   }
 

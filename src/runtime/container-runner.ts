@@ -29,6 +29,14 @@ export interface ContainerRunner {
 
 export type RunDocker = (args: string[], opts?: { timeoutSeconds?: number }) => AsyncIterable<ExecEvent>;
 
+// Wall-clock guards on the local Docker daemon. These are not budgets for the
+// agent's work — they only stop the orchestrator from hanging if the daemon
+// itself is sick. `exec` timeout is owned by the caller (it carries the agent
+// budget remaining), so it is intentionally not capped here.
+const DOCKER_CREATE_TIMEOUT_SECONDS = 30;
+const DOCKER_START_TIMEOUT_SECONDS = 30;
+const DOCKER_DESTROY_TIMEOUT_SECONDS = 60;
+
 export class ContainerRunnerError extends Error {
   constructor(
     readonly category: ContainerFailureCategory,
@@ -43,12 +51,18 @@ export class DockerCliContainerRunner implements ContainerRunner {
   constructor(private readonly options: { runDocker?: RunDocker } = {}) {}
 
   async create(input: DockerCreateArgsInput): Promise<string> {
-    const result = await collect(this.runDocker(buildDockerCreateArgs(input)), "create");
+    const result = await collect(
+      this.runDocker(buildDockerCreateArgs(input), { timeoutSeconds: DOCKER_CREATE_TIMEOUT_SECONDS }),
+      "create"
+    );
     return result.stdout.trim() || input.name;
   }
 
   async start(containerId: string): Promise<void> {
-    await collect(this.runDocker(["start", containerId]), "start");
+    await collect(
+      this.runDocker(["start", containerId], { timeoutSeconds: DOCKER_START_TIMEOUT_SECONDS }),
+      "start"
+    );
   }
 
   exec(containerId: string, cmd: string, args: string[], opts: DockerExecOptions = {}): AsyncIterable<ExecEvent> {
@@ -61,7 +75,9 @@ export class DockerCliContainerRunner implements ContainerRunner {
   }
 
   async destroy(containerId: string): Promise<void> {
-    const result = await collectAllowingMissing(this.runDocker(["rm", "-f", containerId]));
+    const result = await collectAllowingMissing(
+      this.runDocker(["rm", "-f", containerId], { timeoutSeconds: DOCKER_DESTROY_TIMEOUT_SECONDS })
+    );
     if (result.exitCode !== 0 && !result.stderr.toLowerCase().includes("no such container")) {
       const classification = classifyContainerFailure("cleanup", result.stderr);
       throw new ContainerRunnerError("cleanup", classification.reason, result.stderr);
@@ -103,7 +119,8 @@ export function buildDockerCreateArgs(input: DockerCreateArgsInput): string[] {
     "-v",
     `${input.rootPath}:/workspace`,
     input.image,
-    "sleep infinity"
+    "sleep",
+    "infinity"
   ];
 }
 

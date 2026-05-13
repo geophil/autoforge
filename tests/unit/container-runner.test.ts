@@ -34,8 +34,7 @@ describe("container runner", () => {
     expect(args).toContain("501:20");
     expect(args).toContain("-v");
     expect(args).toContain("/tmp/worktree:/workspace");
-    expect(args.at(-2)).toBe("autoforge-agent:local");
-    expect(args.at(-1)).toBe("sleep infinity");
+    expect(args.slice(-3)).toEqual(["autoforge-agent:local", "sleep", "infinity"]);
   });
 
   test("destroy emits no error when docker rm reports missing container", async () => {
