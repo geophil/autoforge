@@ -64,7 +64,7 @@ interface ServiceDeps {
   executor: AgentExecutor;
   worktrees: WorktreeManager;
   nats?: NatsClient;
-  testRunner?: (workingDirectory: string, projectId: string) => Promise<{ passRate: number; output: string }>;
+  testRunner?: (workingDirectory: string, projectId: string, workspace: Workspace) => Promise<{ passRate: number; output: string }>;
   prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
   dispatcher?: ReturnType<typeof createDispatcher>;
   embeddingProvider?: EmbeddingProvider;
@@ -79,8 +79,9 @@ interface ServiceDeps {
   lifecycleHookRunner?: (input: {
     phase: LifecycleHookPhase;
     workingDirectory: string;
+    workspace: Workspace;
     timeoutSeconds: number;
-  }) => LifecycleHooksResult;
+  }) => Promise<LifecycleHooksResult> | LifecycleHooksResult;
   workspaceFactory?: Pick<WorkspaceFactory, "create">;
 }
 
@@ -2843,7 +2844,7 @@ export class OrchestratorService {
     });
 
     const runTests = this.deps.testRunner ?? runAuthenticatedTests;
-    const testResult = await runTests(worktreePath, projectId);
+    const testResult = await runTests(worktreePath, projectId, this.requireTaskWorkspace(taskId));
 
     this.recordEvent({
       taskId,
@@ -3453,9 +3454,10 @@ export class OrchestratorService {
       return;
     }
     const runHooks = this.deps.lifecycleHookRunner ?? runLifecycleHooks;
-    const hookResults = runHooks({
+    const hookResults = await runHooks({
       phase: input.phase,
       workingDirectory: input.worktreePath,
+      workspace: this.requireTaskWorkspace(input.taskId),
       timeoutSeconds: this.deps.env.AUTOFORGE_HOOK_TIMEOUT_SECONDS
     });
     for (const run of hookResults.runs) {

@@ -8,6 +8,7 @@ import {
   runLifecycleHooks,
   type LifecycleHookPhase
 } from "../../src/orchestrator/lifecycle-hooks";
+import { LocalWorkspace } from "../../src/runtime/local-workspace";
 
 function runCommand(command: string, args: string[], cwd: string): string {
   const result = spawnSync(command, args, {
@@ -38,10 +39,14 @@ function createRepoWithScripts(scripts: Record<string, string>): string {
   return dir;
 }
 
-function runPhase(phase: LifecycleHookPhase, dir: string) {
+async function runPhase(phase: LifecycleHookPhase, dir: string) {
+  // Use a LocalWorkspace pointing at the test worktree — same shape as the
+  // per-task workspace the orchestrator passes in production.
+  const workspace = new LocalWorkspace({ rootPath: dir, taskId: "lifecycle-hook-test", dispatchId: "task" });
   return runLifecycleHooks({
     phase,
     workingDirectory: dir,
+    workspace,
     timeoutSeconds: 30
   });
 }
@@ -78,13 +83,13 @@ describe("lifecycle hooks", () => {
     }
   });
 
-  test("runs every discovered script in allowlist order until one fails", () => {
+  test("runs every discovered script in allowlist order until one fails", async () => {
     const dir = createRepoWithScripts({
       lint: "echo lint-ok",
       test: "node -e \"process.exit(2)\""
     });
     try {
-      const result = runPhase("pre_pr_gate", dir);
+      const result = await runPhase("pre_pr_gate", dir);
       expect(result.runs).toHaveLength(2);
       expect(result.runs[0].script).toBe("lint");
       expect(result.runs[0].result).toBe("completed");
@@ -96,12 +101,12 @@ describe("lifecycle hooks", () => {
     }
   });
 
-  test("post_coder_pre_review commits hook mutations with hook identity", () => {
+  test("post_coder_pre_review commits hook mutations with hook identity", async () => {
     const dir = createRepoWithScripts({
       format: "node -e \"require('node:fs').appendFileSync('README.md', '\\nformatted')\""
     });
     try {
-      const result = runPhase("post_coder_pre_review", dir);
+      const result = await runPhase("post_coder_pre_review", dir);
       expect(result.failedRun).toBeNull();
       expect(result.runs).toHaveLength(1);
       const run = result.runs[0];
@@ -121,12 +126,12 @@ describe("lifecycle hooks", () => {
     }
   });
 
-  test("pre_pr_gate fails when allowlisted script mutates files", () => {
+  test("pre_pr_gate fails when allowlisted script mutates files", async () => {
     const dir = createRepoWithScripts({
       lint: "node -e \"require('node:fs').appendFileSync('README.md', '\\nmutated')\""
     });
     try {
-      const result = runPhase("pre_pr_gate", dir);
+      const result = await runPhase("pre_pr_gate", dir);
       expect(result.failedRun).not.toBeNull();
       const failed = result.failedRun!;
       expect(failed.result).toBe("failed");
@@ -141,10 +146,10 @@ describe("lifecycle hooks", () => {
     }
   });
 
-  test("records skipped completion when package.json is missing", () => {
+  test("records skipped completion when package.json is missing", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lifecycle-hooks-skip-"));
     try {
-      const result = runPhase("post_coder_pre_review", dir);
+      const result = await runPhase("post_coder_pre_review", dir);
       expect(result.failedRun).toBeNull();
       expect(result.runs).toHaveLength(1);
       expect(result.runs[0].skipped).toBe(true);

@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { collectExecEvents } from "../runtime/exec-collect";
+import type { Workspace } from "../runtime/workspace";
 
 export type LifecycleHookPhase = "post_coder_pre_review" | "pre_pr_gate";
 
@@ -76,11 +78,12 @@ export function discoverLifecycleHookScripts(
   return { scripts: selected, skipReason: null };
 }
 
-export function runLifecycleHooks(input: {
+export async function runLifecycleHooks(input: {
   phase: LifecycleHookPhase;
   workingDirectory: string;
+  workspace: Workspace;
   timeoutSeconds?: number;
-}): LifecycleHooksResult {
+}): Promise<LifecycleHooksResult> {
   const timeoutSeconds = Math.max(1, input.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS);
   const discovery = discoverLifecycleHookScripts(input.phase, input.workingDirectory);
 
@@ -115,10 +118,11 @@ export function runLifecycleHooks(input: {
 
   const runs: LifecycleHookRun[] = [];
   for (const script of discovery.scripts) {
-    const run = runSingleHook({
+    const run = await runSingleHook({
       phase: input.phase,
       script,
       workingDirectory: input.workingDirectory,
+      workspace: input.workspace,
       timeoutSeconds
     });
     runs.push(run);
@@ -130,24 +134,28 @@ export function runLifecycleHooks(input: {
   return { phase: input.phase, runs, failedRun: null };
 }
 
-function runSingleHook(input: {
+async function runSingleHook(input: {
   phase: LifecycleHookPhase;
   script: string;
   workingDirectory: string;
+  workspace: Workspace;
   timeoutSeconds: number;
-}): LifecycleHookRun {
+}): Promise<LifecycleHookRun> {
   const command = `bun run ${input.script}`;
   const startMs = Date.now();
-  const result = spawnSync("bun", ["run", input.script], {
-    cwd: input.workingDirectory,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: input.timeoutSeconds * 1000
-  });
+  // The hook executes a script literally named in package.json — that
+  // package.json is in the agent-mutated worktree. Routing through
+  // workspace.exec means the script runs inside the per-task container
+  // (when WORKSPACE_PROVIDER=docker) instead of on the orchestrator host,
+  // which closes the obvious "agent rewrites lint script to do anything"
+  // attack vector. Local provider falls back to host spawn — same as before.
+  const result = await collectExecEvents(
+    input.workspace.exec("bun", ["run", input.script], { timeoutSeconds: input.timeoutSeconds })
+  );
   const elapsedSeconds = (Date.now() - startMs) / 1000;
 
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
+  const stdout = result.stdout;
+  const stderr = result.stderr;
   const logPath = writeHookLog({
     workingDirectory: input.workingDirectory,
     phase: input.phase,
@@ -156,10 +164,10 @@ function runSingleHook(input: {
     stdout,
     stderr,
     elapsedSeconds,
-    exitCode: result.status
+    exitCode: result.exitCode
   });
 
-  const timedOut = isTimeoutResult(result);
+  const timedOut = result.timedOut;
   const baseRun: LifecycleHookRun = {
     phase: input.phase,
     script: input.script,
@@ -168,7 +176,7 @@ function runSingleHook(input: {
     skipReason: null,
     result: "completed",
     failureReason: null,
-    exitCode: result.status ?? (timedOut ? 124 : 1),
+    exitCode: result.exitCode,
     timedOut,
     elapsedSeconds,
     stdoutExcerpt: truncateForEvent(stdout),
@@ -188,7 +196,7 @@ function runSingleHook(input: {
       failureReason: "timeout"
     };
   }
-  if (result.status !== 0) {
+  if (result.exitCode !== 0) {
     return {
       ...baseRun,
       result: "failed",
@@ -283,13 +291,6 @@ function truncateForEvent(value: string): string {
   }
   const clipped = bytes.subarray(0, MAX_STREAM_EXCERPT_BYTES).toString("utf8");
   return `${clipped}\n...[truncated ${bytes.length - MAX_STREAM_EXCERPT_BYTES} bytes]`;
-}
-
-function isTimeoutResult(result: ReturnType<typeof spawnSync>): boolean {
-  if (result.error && "code" in result.error && result.error.code === "ETIMEDOUT") {
-    return true;
-  }
-  return result.signal === "SIGTERM" && result.status === null;
 }
 
 function isGitRepo(workingDirectory: string): boolean {

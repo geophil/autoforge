@@ -1,37 +1,44 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { collectExecEvents } from "../runtime/exec-collect";
+import type { Workspace } from "../runtime/workspace";
 
 export interface TestRunResult {
   passRate: number;
   output: string;
 }
 
+const TEST_TIMEOUT_SECONDS = 120;
+
 /**
- * Detect the package manager and run the test suite in the given working directory.
+ * Detect the package manager and run the test suite inside the workspace.
  * Returns pass rate 1.0 if all tests pass, < 1.0 if some fail, 0 if the run errors.
  * Falls back to passRate: 1 if no test configuration is found.
+ *
+ * Tests run through `Workspace.exec`, so when WORKSPACE_PROVIDER=docker
+ * the suite runs inside the per-task container — agent-mutated test
+ * scripts can't reach the host filesystem or credentials.
  */
-export async function runAuthenticatedTests(workingDirectory: string, _projectId: string): Promise<TestRunResult> {
+export async function runAuthenticatedTests(
+  workingDirectory: string,
+  _projectId: string,
+  workspace: Workspace
+): Promise<TestRunResult> {
   const runner = detectTestRunner(workingDirectory);
   if (!runner) {
     return { passRate: 1, output: "(no test configuration detected — skipping)" };
   }
 
-  const result = spawnSync(runner.cmd, runner.args, {
-    cwd: workingDirectory,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: 120_000
-  });
+  const result = await collectExecEvents(
+    workspace.exec(runner.cmd, runner.args, { timeoutSeconds: TEST_TIMEOUT_SECONDS })
+  );
 
-  const combined = [result.stdout ?? "", result.stderr ?? ""].join("\n").trim();
-
-  if (result.signal === "SIGTERM" || result.error?.message?.includes("ETIMEDOUT")) {
-    return { passRate: 0, output: "test run timed out after 120s" };
+  if (result.timedOut) {
+    return { passRate: 0, output: `test run timed out after ${TEST_TIMEOUT_SECONDS}s` };
   }
 
-  const passRate = parsePassRate(combined, result.status ?? 1);
+  const combined = [result.stdout, result.stderr].join("\n").trim();
+  const passRate = parsePassRate(combined, result.exitCode);
   return { passRate, output: combined.slice(0, 4000) };
 }
 
