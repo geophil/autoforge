@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { createWebServer } from "../../src/web/server";
 import { createTestService } from "../helpers/create-service";
+import { testEnv } from "../helpers/test-env";
 import type { AutoforgeMessage } from "../../src/nats/messages";
 
 function appendTokenEvent(input: {
@@ -40,7 +41,7 @@ function appendTokenEvent(input: {
 describe("GET /api/metrics/:projectId/token-kpis", () => {
   test("returns planner KPI summary scoped to project", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       appendTokenEvent({
         db,
@@ -100,7 +101,7 @@ describe("GET /api/metrics/:projectId/token-kpis", () => {
 describe("GET /api/metrics/:projectId/envelope-reuse", () => {
   test("returns repeated envelope hashes ordered by occurrences", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       appendTokenEvent({
         db,

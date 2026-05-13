@@ -206,10 +206,10 @@ The Agent Execution domain uses a single production runtime path behind `AgentEx
 
 ### All Agents Must Write `.autoforge-status.json`
 
-The status file is the contract between an agent and the orchestrator. Both executor implementations enforce this requirement and fall back to `DONE_WITH_CONCERNS` if the file is absent.
+The status file is the contract between an agent and the orchestrator. The executor enforces this requirement and falls back to `DONE_WITH_CONCERNS` if the file is absent.
 
 ```typescript
-// src/executors/claude-code.ts (same pattern in anthropic-sdk.ts)
+// src/runtime/harness-executor.ts (via the runtime `done` tool / post-run check)
 if (!statusFile) {
   return {
     status: "DONE_WITH_CONCERNS",
@@ -231,26 +231,13 @@ if (!statusFile) {
 }
 ```
 
-**Implemented in**: `ClaudeCodeExecutor.execute()`, `AnthropicSdkExecutor.execute()`, and `HarnessExecutor.execute()`.
+**Implemented in**: `HarnessExecutor.execute()` (production) and `MockExecutor.execute()` (tests). The legacy `ClaudeCodeExecutor` and `AnthropicSdkExecutor` were removed in commit `645a376`.
 
 ### Budget Is Enforced by the Executor
 
-For ClaudeCodeExecutor, a `setTimeout` sends SIGTERM at `budgetSeconds`, then SIGKILL after a 10-second grace period.
+`HarnessExecutor` checks the deadline before each provider call and before starting each tool call, and passes the remaining timeout context into tools. Long-running non-`exec` tools are still expected to return promptly; `exec` receives a concrete timeout that the runtime forwards into the workspace child process.
 
-```typescript
-// src/executors/claude-code.ts
-const budgetTimer = setTimeout(() => {
-  onTimeout();
-  child.kill("SIGTERM");
-  sigkillTimer = setTimeout(() => {
-    if (!child.killed) child.kill("SIGKILL");
-  }, 10_000);
-}, timeoutSeconds * 1000);
-```
-
-For `AnthropicSdkExecutor`, a deadline timestamp is checked at the start of each tool iteration loop. `HarnessExecutor` checks the deadline before each provider call and before starting each tool call, and it passes remaining timeout context into tools. Long-running non-`exec` tools are still expected to return promptly; `exec` receives a concrete timeout.
-
-**Implemented in**: `ClaudeCodeExecutor.execute()`, `AnthropicSdkExecutor.execute()`, and `HarnessExecutor.execute()`.
+**Implemented in**: `HarnessExecutor.execute()` and `MockExecutor.execute()`.
 
 ### `Workspace` Is the File and Exec Boundary
 
@@ -258,9 +245,11 @@ For `AnthropicSdkExecutor`, a deadline timestamp is checked at the start of each
 
 ```typescript
 // src/runtime/workspace.ts
+export type WorkspaceProvider = "local" | "mock" | "docker";
+
 export interface Workspace {
   readonly id: string;
-  readonly provider: "local" | "mock" | "e2b" | "aws" | string;
+  readonly provider: WorkspaceProvider;
   readFile(path: string): Promise<string>;
   writeFile(path: string, content: string): Promise<void>;
   exec(cmd: string, args: string[], opts?: ExecOptions): AsyncIterable<ExecEvent>;
@@ -283,7 +272,7 @@ async *exec(cmd: string, args: string[], opts: ExecOptions = {}): AsyncIterable<
 }
 ```
 
-`ClaudeCodeExecutor` and the current `AnthropicSdkExecutor` are transitional local-only shims: they call `requireLocalWorkspaceRoot(task.workspace)` to get a subprocess `cwd`. A non-local workspace will fail fast for these executors instead of silently running in the wrong place.
+All current executors (production `HarnessExecutor`, test `MockExecutor`) interact with the worktree exclusively through `Workspace.readFile`, `Workspace.writeFile`, and `Workspace.exec`. The previous local-only shims (`ClaudeCodeExecutor`, `AnthropicSdkExecutor`) and their `requireLocalWorkspaceRoot` escape hatch have been removed; the Workspace interface is the only file/exec boundary.
 
 ### `ModelProvider` Is the Message API Boundary
 
@@ -422,63 +411,22 @@ If the planner output does not include usable QMD evidence (`status: "used"` wit
 
 ## Core Flows
 
-### ClaudeCodeExecutor.execute Flow
+### HarnessExecutor.execute Flow
 
-The Claude Code CLI is the legacy local runtime. It still runs in non-interactive mode and remains available for filesystem-heavy work while the harness reaches feature parity.
+`HarnessExecutor` is the single production runtime. It runs an agentic tool-use loop against `ModelProvider` (today `AnthropicProvider`) using the `RuntimeToolRegistry`.
 
-1. **Prompt assembly**: Persona (`systemPrompt`) + skills content + task prompt + status-reporting instructions are concatenated into a single stdin string.
-2. **MCP config** (optional): If `QMD_MCP_URL` is set in `task.environment`, a temporary `--mcp-config` JSON is written pointing at the QMD server so the agent can call `query`/`get`/`multi_get` tools.
-3. **Spawn**: `claude --print --dangerously-skip-permissions --output-format text --input-format text [--mcp-config <path>]` is spawned; the full prompt is piped to stdin.
-4. **Budget timer**: SIGTERM sent at deadline, SIGKILL after 10s grace.
-5. **Status read**: `.autoforge-status.json` is read from the worktree; if absent → `DONE_WITH_CONCERNS`.
-6. **Return**: `AgentResult` with status, artifacts, elapsed time, and the full status file as `output`.
-
-```typescript
-// claude invocation (src/executors/claude-code.ts)
-spawn(command, [
-  "--print",
-  "--dangerously-skip-permissions",
-  "--output-format", "text",
-  "--input-format", "text",
-  ...(mcpConfigPath ? ["--mcp-config", mcpConfigPath] : [])
-], { cwd, env, stdio: ["pipe", "pipe", "pipe"] })
-```
-
-### AnthropicSdkExecutor.execute Flow
-
-Used when `EXECUTOR_DEFAULT=anthropic-sdk`. Runs a tool-use agentic loop against the Anthropic Messages API.
-
-1. **System prompt**: Persona (`task.systemPrompt`) + skills + status-reporting instructions, sent as the API `system` field as a single text block with an ephemeral `cache_control` breakpoint. This caches the `tools + system` prefix on the first call and reads at 0.1× cost on every subsequent iteration within the 5-minute TTL — typically ~80% reduction in prefix input cost per planner run.
+1. **System prompt**: Persona (`task.systemPrompt`) + skills metadata + status-reporting instructions, sent via `ModelProvider.message`. The prefix is cached at the provider boundary so subsequent loop iterations hit the prompt cache.
 2. **User message**: `task.prompt` — the task-specific content.
-3. **MCP wiring** (optional): If `QMD_MCP_URL` is set in `task.environment`, opens a Streamable HTTP MCP client to the QMD server, lists its tools, and merges them into the API `tools` array alongside the local tools. The client lifetime is scoped to the `execute()` call: opened at the top, closed in `finally` (even on early return). Tool calls naming an MCP tool are dispatched to `mcpClient.callTool()`; their text content is returned as the `tool_result` payload.
-4. **Tool loop** (max 50 iterations): Calls `client.messages.create()` with the merged tools. Executes tool calls locally (or via MCP), appends results.
-5. **Deadline check**: If `Date.now() >= deadlineMs` at loop start → TIMEOUT.
-6. **Status read**: Same `.autoforge-status.json` convention as ClaudeCodeExecutor.
-7. **Token tracking**: `totalInputTokens` and `totalOutputTokens` accumulated across all loop iterations and returned in `AgentResult.metrics`.
-8. **SDK-only context compaction**: when projected input reaches a model-budget threshold, old tool-use/tool-result exchange groups are compacted into a structured memory block. Compaction preserves API pairing validity (drop/retain full exchange groups only), uses a pinned summarization model by default (`claude-haiku-4`), and falls back to bounded extractive memory when summarization fails.
+3. **MCP wiring** (optional): When `QMD_MCP_URL` is set in `task.environment`, the harness opens a Streamable HTTP MCP client to QMD, lists its tools, and merges them with the local tool registry. The MCP client lifetime is scoped to the `execute()` call: opened up front, closed in `finally` (even on early return).
+4. **Tool loop**: `ModelProvider.message` is called repeatedly. Tool calls are dispatched against the registry (`read_file`, `write_file`, `exec`, `done`, `lookup_skill`, `load_skill`) or routed to MCP by name.
+5. **Deadline check**: The deadline is enforced before each provider call and before each tool call. Long-running `exec` tools receive a concrete timeout.
+6. **Status read**: `.autoforge-status.json` is read from the workspace; if absent → `DONE_WITH_CONCERNS`.
+7. **Token tracking**: input + output tokens are accumulated across iterations and returned on `AgentResult.metrics`. Context-envelope hashes flow through the orchestrator's prompt-hash telemetry.
+8. **Context compaction**: when projected input approaches the model's budget threshold, older tool-use/tool-result exchange groups are compacted into a structured memory block. Compaction preserves API pairing validity (drop/retain full exchange groups only), uses a pinned summarization model by default, and falls back to bounded extractive memory when summarization fails.
 
-Both executors now use **client-side MCP**: `ClaudeCodeExecutor` writes a `--mcp-config` file the Claude CLI consumes; `AnthropicSdkExecutor` runs the MCP client in-process via `@modelcontextprotocol/sdk`. Anthropic's remote MCP connector (`mcp_servers` API param) is intentionally not used — it would require the QMD server to be publicly reachable, which it isn't (QMD lives on the docker / k8s service network).
+The harness uses **client-side MCP** (in-process `@modelcontextprotocol/sdk`) rather than Anthropic's remote MCP connector — the QMD server is not publicly reachable (it lives on the docker / k8s service network).
 
-### ClaudeCodeExecutor Deprecation Timeline
-
-`ClaudeCodeExecutor` is marked `@deprecated`, but it is not removed in this plan. The deprecation is a direction-of-travel marker: new execution features should target `HarnessExecutor`, `Workspace`, `ModelProvider`, and `ToolRegistry`.
-
-| Phase | Routing behavior | Action |
-|---|---|---|
-| Now | Claude Code remains available and is still returned for meta plus STANDARD/THOROUGH filesystem-heavy work. | Keep behavior unchanged. Use the `LocalWorkspace` adapter shim. |
-| Next plan | Harness reaches feature parity for planner/coder/reviewer/doc flows that currently need Claude Code. | Run a bake-off period with both runtimes available. |
-| Following plan | `routeExecutor()` stops returning Claude Code by default. | Keep module as an emergency fallback. |
-| Later | Harness is stable for all supported agent types. | Delete `src/executors/claude-code.ts` and related tests. |
-
-The main compatibility rule is that Claude Code only accepts `LocalWorkspace`. If a future cloud workspace is routed to this executor, `requireLocalWorkspaceRoot()` fails fast instead of silently running tools in the orchestrator working directory.
-
-Available local tools for `AnthropicSdkExecutor` (same set regardless of MCP):
-- `read_file` — read a file relative to working directory
-- `write_file` — write a file, creating parent directories
-- `list_directory` — list directory contents
-- `search_files` — grep over working directory
-- `read_multiple_files` — batch read
-- `bash` — run a shell command (60s timeout)
+Available local tools (same set regardless of MCP) live in the **Harness Runtime Tools and Skill Loading** section below.
 
 Compaction telemetry is stored in transcript turns (`kind: "compaction"`) with:
 - `droppedTurns`
@@ -489,7 +437,7 @@ Compaction telemetry is stored in transcript turns (`kind: "compaction"`) with:
 - `summaryModel` (or `null` on fallback)
 - `usedFallback`
 
-When `QMD_MCP_URL` is set in `AgentTask.environment`, that agent sees QMD's MCP tools (`query`, `get`, `multi_get`, `status`) — names that don't collide with the local set.
+When `QMD_MCP_URL` is set in `AgentTask.environment`, that agent sees QMD's MCP tools (`query`, `get`, `multi_get`, `status`) alongside the local set; their names are reserved so they don't collide.
 
 ### Harness Runtime Tools and Skill Loading
 

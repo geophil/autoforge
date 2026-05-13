@@ -1,5 +1,4 @@
 import type { AgentTask } from "../executors/interface";
-import type { Workspace } from "../runtime/workspace";
 import { buildContextEnvelopeFromTask, hashContextEnvelope } from "./context-envelope";
 
 export interface BuildAgentDispatchEnvelopeInput {
@@ -8,7 +7,6 @@ export interface BuildAgentDispatchEnvelopeInput {
   systemPrompt: string;
   basePrompt: string;
   steeringPrompt?: string;
-  workspace: Workspace;
   budgetSeconds: number;
   environment: Record<string, string>;
   skillFiles: string[];
@@ -17,8 +15,19 @@ export interface BuildAgentDispatchEnvelopeInput {
   lessons?: string;
 }
 
+/**
+ * Partial `AgentTask` without `workspace`. The envelope builder is
+ * workspace-agnostic — every dispatch site already owns the per-task
+ * workspace (`taskWorkspaces` map) and attaches it when constructing
+ * the final `AgentTask` for `executor.execute`. Keeping workspace out
+ * of the envelope keeps the builder pure and avoids the previous pattern
+ * where the same task workspace was threaded through both the envelope
+ * input and the call site separately.
+ */
+export type DispatchEnvelopeTask = Omit<AgentTask, "workspace">;
+
 export interface AgentDispatchEnvelope {
-  task: AgentTask;
+  task: DispatchEnvelopeTask;
   contextEnvelopeHash: string;
 }
 
@@ -27,12 +36,11 @@ export function buildAgentDispatchEnvelope(input: BuildAgentDispatchEnvelopeInpu
     input.steeringPrompt && input.steeringPrompt.trim().length > 0
       ? `${input.steeringPrompt}\n\n${input.basePrompt}`
       : input.basePrompt;
-  const task: AgentTask = {
+  const task: DispatchEnvelopeTask = {
     id: input.id,
     type: input.type,
     systemPrompt: input.systemPrompt,
     prompt,
-    workspace: input.workspace,
     budgetSeconds: input.budgetSeconds,
     environment: input.environment,
     skillFiles: input.skillFiles,

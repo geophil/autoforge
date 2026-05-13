@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createTestService } from "../helpers/create-service";
+import { testEnv } from "../helpers/test-env";
 import { createWebServer } from "../../src/web/server";
 
 function seedParent(db: ReturnType<typeof createTestService>["db"], id = "vParent"): void {
@@ -26,7 +27,7 @@ function seedProposedFork(
 describe("POST /api/experiments/:id/approve-fork", () => {
   test("creates a candidate skill_versions row, applies pending retires, flips experiment to active", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       db.sqlite.query(
         "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share) VALUES ('vParent','persona:coder','1','seed','baseline',1.0)"
@@ -137,7 +138,7 @@ describe("POST /api/experiments/:id/approve-fork", () => {
 
   test("returns 404 for unknown experiment", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       const resp = await app.request("/api/experiments/missing/approve-fork", { method: "POST" });
       expect(resp.status).toBe(404);
@@ -148,7 +149,7 @@ describe("POST /api/experiments/:id/approve-fork", () => {
 
   test("returns 409 when experiment is not a proposed fork (e.g., already-active edit)", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       db.sqlite.query(
         "INSERT INTO tasks (id, project_id, description, state, tier, assessment, plan, iteration, created_at, updated_at) VALUES ('metaT2','p','meta','completed','STANDARD','{}','[]',0,datetime('now'),datetime('now'))"
@@ -166,7 +167,7 @@ describe("POST /api/experiments/:id/approve-fork", () => {
 
   test("returns 409 when proposed fork has no proposed_content", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       db.sqlite.query(
         "INSERT INTO skill_versions (id, skill_name, version, content, status, traffic_share) VALUES ('vParent2','persona:coder','1','seed','baseline',1.0)"
@@ -189,7 +190,7 @@ describe("POST /api/experiments/:id/approve-fork", () => {
 
   test("concurrent approval only creates one candidate", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     let calls = 0;
     let releaseEmbeddings!: () => void;
     const embeddingGate = new Promise<void>((resolve) => {
@@ -227,7 +228,7 @@ describe("POST /api/experiments/:id/approve-fork", () => {
 
   test("returns 409 when cited fork proposal is no longer open", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       seedParent(db);
       db.insertForkProposal({
@@ -259,7 +260,7 @@ describe("POST /api/experiments/:id/approve-fork", () => {
 
   test("approves when embedding provider fails and leaves specialty embedding null", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     (service as unknown as { embeddingProvider: { embed: () => Promise<number[]> } }).embeddingProvider = {
       async embed(): Promise<number[]> {
         throw new Error("embedding unavailable");

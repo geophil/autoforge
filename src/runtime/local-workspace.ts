@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { spawnAsExecEvents } from "./spawn-streaming";
 import type { ExecEvent, ExecOptions, Workspace } from "./workspace";
 import {
   assertRealPathInsideRoot,
@@ -13,6 +13,16 @@ export interface LocalWorkspaceOptions {
   taskId: string;
   dispatchId: string;
   id?: string;
+  /**
+   * Optional teardown callback invoked from `destroy()`. When set, the
+   * workspace removes its underlying host resource — typically the git
+   * worktree + branch via `WorktreeManager.remove`. This mirrors
+   * `ContainerWorkspace.destroy`'s container-removal semantics, so both
+   * providers honor the same "destroy removes the resource I own" rule.
+   * Wiring lives in `WorkspaceFactory.create`; orchestrator-level callers
+   * should not construct LocalWorkspace by hand.
+   */
+  onDestroy?: () => void | Promise<void>;
 }
 
 export class LocalWorkspace implements Workspace {
@@ -21,12 +31,15 @@ export class LocalWorkspace implements Workspace {
   readonly rootPath: string;
   readonly taskId: string;
   readonly dispatchId: string;
+  private readonly onDestroy?: () => void | Promise<void>;
+  private destroyed = false;
 
   constructor(options: LocalWorkspaceOptions) {
     this.rootPath = resolve(options.rootPath);
     this.taskId = options.taskId;
     this.dispatchId = options.dispatchId;
     this.id = options.id ?? `${options.taskId}:${options.dispatchId}`;
+    this.onDestroy = options.onDestroy;
   }
 
   async readFile(path: string): Promise<string> {
@@ -46,7 +59,7 @@ export class LocalWorkspace implements Workspace {
     const cwd = opts.cwd ? resolveInsideRoot(this.rootPath, opts.cwd) : this.rootPath;
     await assertRealPathInsideRoot(this.rootPath, cwd, opts.cwd ?? ".");
 
-    yield* spawnStreaming(cmd, args, {
+    yield* spawnAsExecEvents(cmd, args, {
       cwd,
       env: childProcessEnv(opts.env),
       timeoutSeconds: opts.timeoutSeconds
@@ -54,15 +67,12 @@ export class LocalWorkspace implements Workspace {
   }
 
   async destroy(): Promise<void> {
-    // Local worktrees are owned by WorktreeManager; destroy is lifecycle-only.
+    // Idempotent: a second call is a no-op even if the host worktree
+    // teardown succeeded the first time.
+    if (this.destroyed) return;
+    this.destroyed = true;
+    await this.onDestroy?.();
   }
-}
-
-export function requireLocalWorkspaceRoot(workspace: Workspace): string {
-  if (workspace instanceof LocalWorkspace) {
-    return workspace.rootPath;
-  }
-  throw new Error(`Executor requires a local workspace, got provider: ${workspace.provider}`);
 }
 
 function childProcessEnv(env: Record<string, string> | undefined): NodeJS.ProcessEnv {
@@ -74,74 +84,4 @@ function childProcessEnv(env: Record<string, string> | undefined): NodeJS.Proces
     }
   }
   return { ...childEnv, ...(env ?? {}) };
-}
-
-async function* spawnStreaming(
-  cmd: string,
-  args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutSeconds?: number }
-): AsyncIterable<ExecEvent> {
-  let child: ReturnType<typeof spawn>;
-  try {
-    child = spawn(cmd, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-  } catch (error) {
-    yield { kind: "stderr", chunk: error instanceof Error ? error.message : String(error) };
-    yield { kind: "exit", exitCode: 127 };
-    return;
-  }
-
-  const events: ExecEvent[] = [];
-  let closed = false;
-  let timedOut = false;
-  let terminalEmitted = false;
-  let notify: (() => void) | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  const push = (event: ExecEvent) => {
-    events.push(event);
-    notify?.();
-    notify = undefined;
-  };
-
-  child.stdout?.on("data", (chunk: Buffer) => push({ kind: "stdout", chunk: chunk.toString() }));
-  child.stderr?.on("data", (chunk: Buffer) => push({ kind: "stderr", chunk: chunk.toString() }));
-  child.on("error", (error) => {
-    if (terminalEmitted) return;
-    terminalEmitted = true;
-    push({ kind: "stderr", chunk: error.message });
-    push({ kind: "exit", exitCode: 127 });
-    closed = true;
-    notify?.();
-  });
-  child.on("close", (code, signal) => {
-    if (timer) clearTimeout(timer);
-    if (!terminalEmitted) {
-      terminalEmitted = true;
-      push({ kind: "exit", exitCode: code ?? (timedOut ? 124 : 1), ...(signal ? { signal } : {}) });
-    }
-    closed = true;
-    notify?.();
-  });
-
-  if (options.timeoutSeconds && options.timeoutSeconds > 0) {
-    timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-    }, options.timeoutSeconds * 1000);
-  }
-
-  while (!closed || events.length > 0) {
-    const next = events.shift();
-    if (next) {
-      yield next;
-      continue;
-    }
-    await new Promise<void>((resolve) => {
-      notify = resolve;
-    });
-  }
 }

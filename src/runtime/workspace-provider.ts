@@ -1,4 +1,5 @@
 import type { AppEnv } from "../config/env";
+import type { WorktreeManager } from "../git/worktrees";
 import { buildDockerPreflightChecks } from "./container-diagnostics";
 import type { ContainerRunner } from "./container-runner";
 import { DockerCliContainerRunner } from "./container-runner";
@@ -15,6 +16,14 @@ export interface WorkspaceCreateInput {
 export interface WorkspaceFactoryOptions {
   runner?: ContainerRunner;
   runPreflight?: (cmd: string, args: string[]) => Promise<void>;
+  /**
+   * Optional WorktreeManager used to wire `LocalWorkspace.onDestroy` so a
+   * local workspace's `destroy()` actually removes its host worktree +
+   * branch (mirroring ContainerWorkspace's container removal). Omit in
+   * tests that want destroy() to remain a no-op; production wires this
+   * in `src/index.ts` and `OrchestratorService` so cleanup is symmetric.
+   */
+  worktreeManager?: WorktreeManager;
 }
 
 export class WorkspaceFactory {
@@ -36,7 +45,16 @@ export class WorkspaceFactory {
 
   async create(input: WorkspaceCreateInput): Promise<Workspace> {
     if (this.env.WORKSPACE_PROVIDER === "local") {
-      return new LocalWorkspace(input);
+      const worktreeManager = this.options.worktreeManager;
+      return new LocalWorkspace({
+        ...input,
+        onDestroy: worktreeManager
+          ? () => worktreeManager.remove({
+              branch: `autoforge/${input.taskId}`,
+              path: input.rootPath
+            })
+          : undefined
+      });
     }
 
     if (this.env.WORKSPACE_DOCKER_PRECHECK === "1") {

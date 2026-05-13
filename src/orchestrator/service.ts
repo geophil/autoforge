@@ -44,6 +44,7 @@ import { collectPendingSteering, renderSteeringPrompt, type SteeringScope } from
 import { runLifecycleHooks, type LifecycleHookPhase, type LifecycleHookRun, type LifecycleHooksResult } from "./lifecycle-hooks";
 import type { Workspace } from "../runtime/workspace";
 import { WorkspaceFactory, type WorkspaceCreateInput } from "../runtime/workspace-provider";
+import { prepareTaskWorkspace } from "../runtime/workspace-prepare";
 import { isPlannerFallbackOutput, parsePlannerStructuredOutput } from "./planner-output";
 import { buildPlannerPrompt as buildPlannerPromptText, retryPromptExceedsTokenCap } from "./planner-prompt";
 import { buildPlannerDispatchEnvelope } from "./planner-envelope";
@@ -141,7 +142,13 @@ export class OrchestratorService {
     this.dispatcher = deps.dispatcher ?? createDispatcher(deps.db, {
       embeddingProvider: this.embeddingProvider
     });
-    this.workspaceFactory = deps.workspaceFactory ?? new WorkspaceFactory(deps.env);
+    // Default factory wires the WorktreeManager so LocalWorkspace.destroy()
+    // owns the host worktree + branch removal (mirroring
+    // ContainerWorkspace.destroy()'s container removal). Tests that inject
+    // a custom workspaceFactory may choose to omit this wiring.
+    this.workspaceFactory = deps.workspaceFactory ?? new WorkspaceFactory(deps.env, {
+      worktreeManager: deps.worktrees
+    });
   }
 
   /**
@@ -442,6 +449,11 @@ export class OrchestratorService {
     const assessment = assessComplexity(description);
     const tier = opts.forceTier ?? routeTier(assessment);
     const worktree = this.deps.worktrees.create(taskId);
+    // Install dependencies on the host — the documented trust boundary,
+    // see docs/qmd/domain-agent-execution.md. Run this before the per-task
+    // workspace exists so the agent's container (when WORKSPACE_PROVIDER=
+    // docker) starts with node_modules already populated.
+    prepareTaskWorkspace(worktree.path);
     // Spin up the per-task workspace immediately so all subsequent
     // dispatches (planner / coder.subtask / reviewer-N / doc) share one
     // container instead of paying create+destroy cost per dispatch.
@@ -844,12 +856,11 @@ export class OrchestratorService {
         userPrompt,
         steeringPrompt: plannerSteering.prompt,
         lessons: plannerLessons.block || undefined,
-        workspace: plannerWorkspace,
         budgetSeconds: this.budgetForTier(tier, "planner"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("planner")
       });
-      const plannerTask = plannerEnvelope.task;
+      const plannerTask: AgentTask = { ...plannerEnvelope.task, workspace: plannerWorkspace };
       const plannerContextEnvelopeHash = plannerEnvelope.contextEnvelopeHash;
       if (attempt > 0 && retryPromptExceedsTokenCap(plannerTask.prompt)) {
         const currentTask = this.requireTask(taskId);
@@ -1348,14 +1359,13 @@ export class OrchestratorService {
           systemPrompt: docDispatch.content,
           basePrompt: baseDocPrompt,
           steeringPrompt: docSteering.prompt,
-          workspace: docWorkspace,
           budgetSeconds: this.budgetForTier(task.tier, "doc"),
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent("doc"),
           metadata: { taskId, description: task.description },
           lessons: docLessons.block || undefined
         });
-        const docTask = docEnvelope.task;
+        const docTask: AgentTask = { ...docEnvelope.task, workspace: docWorkspace };
         const docContextEnvelopeHash = docEnvelope.contextEnvelopeHash;
         const docResult = await docExecutor.execute(docTask);
         this.recordSteeringConsumed({
@@ -2136,6 +2146,7 @@ export class OrchestratorService {
   ): Promise<{ experimentId: string | null; status: string; reason?: string }> {
     const metaTaskId = randomUUID();
     const worktree = this.deps.worktrees.create(metaTaskId);
+    prepareTaskWorkspace(worktree.path);
     await this.ensureTaskWorkspace(worktree.path, metaTaskId, projectId);
 
     try {
@@ -2559,14 +2570,13 @@ export class OrchestratorService {
           systemPrompt: subtaskDispatch.content,
           basePrompt: baseCoderPrompt,
           steeringPrompt: coderSteering.prompt,
-          workspace: coderWorkspace,
           budgetSeconds: this.budgetForTier(tier, "coder"),
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
           metadata: { taskId, subtask, description },
           lessons: coderLessons.block || undefined
         });
-        const liveTask = coderEnvelope.task;
+        const liveTask: AgentTask = { ...coderEnvelope.task, workspace: coderWorkspace };
         const subtaskContextEnvelopeHash = coderEnvelope.contextEnvelopeHash;
         this.recordEvent({
           taskId,
@@ -2728,14 +2738,13 @@ export class OrchestratorService {
         systemPrompt: reviewerDispatch.content,
         basePrompt: baseReviewerPrompt,
         steeringPrompt: reviewerSteering.prompt,
-        workspace: reviewerWorkspace,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description },
         lessons: reviewerLessons.block || undefined
       });
-      const reviewerTask = reviewerEnvelope.task;
+      const reviewerTask: AgentTask = { ...reviewerEnvelope.task, workspace: reviewerWorkspace };
       const reviewerContextEnvelopeHash = reviewerEnvelope.contextEnvelopeHash;
       const reviewResult = await reviewerExecutor.execute(reviewerTask);
       this.recordSteeringConsumed({

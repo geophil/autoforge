@@ -1,17 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Workspace } from "../../src/runtime/workspace";
 import { buildAgentDispatchEnvelope } from "../../src/orchestrator/dispatch-envelope";
-
-function mockWorkspace(): Workspace {
-  return {
-    id: "ws-1",
-    provider: "mock",
-    readFile: async () => "",
-    writeFile: async () => {},
-    exec: async function* () {},
-    destroy: async () => {}
-  };
-}
 
 describe("buildAgentDispatchEnvelope", () => {
   test("builds task prompt with steering prefix and stable hash", () => {
@@ -21,7 +9,6 @@ describe("buildAgentDispatchEnvelope", () => {
       systemPrompt: "doc persona",
       basePrompt: "Document the API changes.",
       steeringPrompt: "Focus on migration notes first.",
-      workspace: mockWorkspace(),
       budgetSeconds: 120,
       environment: {},
       skillFiles: [],
@@ -33,7 +20,6 @@ describe("buildAgentDispatchEnvelope", () => {
       systemPrompt: "doc persona",
       basePrompt: "Document the API changes.",
       steeringPrompt: "Focus on migration notes first.",
-      workspace: mockWorkspace(),
       budgetSeconds: 120,
       environment: {},
       skillFiles: [],
@@ -43,5 +29,18 @@ describe("buildAgentDispatchEnvelope", () => {
     expect(one.task.prompt).toContain("Focus on migration notes first.");
     expect(one.task.prompt).toContain("Document the API changes.");
     expect(one.contextEnvelopeHash).toBe(two.contextEnvelopeHash);
+  });
+
+  test("envelope task is workspace-agnostic", () => {
+    const envelope = buildAgentDispatchEnvelope({
+      id: "task-1-doc",
+      type: "doc",
+      systemPrompt: "doc persona",
+      basePrompt: "Document the API changes.",
+      budgetSeconds: 120,
+      environment: {},
+      skillFiles: []
+    });
+    expect("workspace" in envelope.task).toBe(false);
   });
 });

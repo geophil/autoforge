@@ -1,7 +1,5 @@
-import type { AgentTask } from "../executors/interface";
 import type { Tier } from "../types/core";
-import type { Workspace } from "../runtime/workspace";
-import { buildAgentDispatchEnvelope } from "./dispatch-envelope";
+import { buildAgentDispatchEnvelope, type AgentDispatchEnvelope } from "./dispatch-envelope";
 
 export interface BuildPlannerDispatchEnvelopeInput {
   taskId: string;
@@ -13,16 +11,12 @@ export interface BuildPlannerDispatchEnvelopeInput {
   userPrompt: string;
   steeringPrompt?: string;
   lessons?: string;
-  workspace: Workspace;
   budgetSeconds: number;
   environment: Record<string, string>;
   skillFiles: string[];
 }
 
-export interface PlannerDispatchEnvelope {
-  task: AgentTask;
-  contextEnvelopeHash: string;
-}
+export type PlannerDispatchEnvelope = AgentDispatchEnvelope;
 
 export function buildPlannerDispatchEnvelope(input: BuildPlannerDispatchEnvelopeInput): PlannerDispatchEnvelope {
   return buildAgentDispatchEnvelope({
@@ -31,7 +25,6 @@ export function buildPlannerDispatchEnvelope(input: BuildPlannerDispatchEnvelope
     systemPrompt: input.systemPrompt,
     basePrompt: input.userPrompt,
     steeringPrompt: input.steeringPrompt,
-    workspace: input.workspace,
     budgetSeconds: input.budgetSeconds,
     environment: input.environment,
     skillFiles: input.skillFiles,

@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { createTestService } from "../helpers/create-service";
+import { testEnv } from "../helpers/test-env";
 import { createWebServer } from "../../src/web/server";
 
 describe("GET /api/experiments", () => {
   test("lists proposed fork experiments when filtered by status and operation", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       db.sqlite.query(`
         INSERT INTO experiments (id, hypothesis, change_description, metric_name, metric_before,
@@ -42,7 +43,7 @@ describe("GET /api/experiments", () => {
 describe("POST /api/experiments/:id/reject-fork", () => {
   test("discards a proposed fork and emits fork_rejected", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       db.sqlite.query(`
         INSERT INTO experiments (id, hypothesis, change_description, metric_name, metric_before,

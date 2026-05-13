@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { createTestService } from "../helpers/create-service";
+import { testEnv } from "../helpers/test-env";
 import { createWebServer } from "../../src/web/server";
 
 describe("POST /api/diagnostic/run", () => {
   test("returns a diagnostic result for manual trigger", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       const resp = await app.request("/api/diagnostic/run", {
         method: "POST",
@@ -21,7 +22,7 @@ describe("POST /api/diagnostic/run", () => {
 
   test("defaults missing body to coder and includes cluster count", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       const resp = await app.request("/api/diagnostic/run", { method: "POST" });
       const body = await resp.json();
@@ -36,7 +37,7 @@ describe("POST /api/diagnostic/run", () => {
 
   test("defaults missing agentType to coder and includes cluster count", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       const resp = await app.request("/api/diagnostic/run", {
         method: "POST",
@@ -55,7 +56,7 @@ describe("POST /api/diagnostic/run", () => {
 
   test("rejects invalid agentType values", async () => {
     const { service, db, cleanup } = createTestService();
-    const app = createWebServer(service, db);
+    const app = createWebServer(service, db, testEnv());
     try {
       for (const agentType of ["meta", "bogus"]) {
         const resp = await app.request("/api/diagnostic/run", {

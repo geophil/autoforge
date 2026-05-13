@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createWebServer } from "../../src/web/server";
 import { DbClient } from "../../src/db/client";
+import { testEnv } from "../helpers/test-env";
 
 describe("GET /api/tasks/:id/events", () => {
   let db: DbClient;
@@ -23,7 +24,7 @@ describe("GET /api/tasks/:id/events", () => {
   });
 
   test("returns 200 with empty array when no events exist for task", async () => {
-    const app = createWebServer({} as any, db);
+    const app = createWebServer({} as any, db, testEnv());
     const res = await app.request("/api/tasks/nonexistent/events");
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -39,7 +40,7 @@ describe("GET /api/tasks/:id/events", () => {
         ('evt-1', 'task-1', '2024-01-01T00:00:01.000Z', 'proj-1', 'orchestrator', 'created', 'done', '{}', 60, 1)
     `).run();
 
-    const app = createWebServer({} as any, db);
+    const app = createWebServer({} as any, db, testEnv());
     const res = await app.request("/api/tasks/task-1/events");
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -54,7 +55,7 @@ describe("GET /api/tasks/:id/events", () => {
       VALUES ('evt-3', 'task-2', '2024-01-01T00:01:00.000Z', 'proj-1', 'coder', 'executed', 'done', '{}', 120, 30.5, 1000, 2000, 1)
     `).run();
 
-    const app = createWebServer({} as any, db);
+    const app = createWebServer({} as any, db, testEnv());
     const res = await app.request("/api/tasks/task-2/events");
     const body = await res.json();
     expect(body).toHaveLength(1);
@@ -76,7 +77,7 @@ describe("GET /api/tasks/:id/events", () => {
         ('evt-b1', 'task-b', '2024-01-01T00:00:01.000Z', 'proj-1', 'orchestrator', 'created', 'done', '{}', 60, 1)
     `).run();
 
-    const app = createWebServer({} as any, db);
+    const app = createWebServer({} as any, db, testEnv());
     const res = await app.request("/api/tasks/task-a/events");
     const body = await res.json();
     expect(body).toHaveLength(1);
@@ -89,7 +90,7 @@ describe("GET /api/tasks/:id/events", () => {
       VALUES ('evt-4', 'task-3', '2024-01-01T00:00:01.000Z', 'proj-1', 'orchestrator', 'created', 'done', '{}', 60, 1)
     `).run();
 
-    const app = createWebServer({} as any, db);
+    const app = createWebServer({} as any, db, testEnv());
     const res = await app.request("/api/tasks/task-3/events");
     const body = await res.json();
     const event = body[0];

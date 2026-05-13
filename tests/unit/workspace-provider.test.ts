@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadEnv } from "../../src/config/env";
+import type { WorktreeManager } from "../../src/git/worktrees";
 import { ContainerWorkspace } from "../../src/runtime/container-workspace";
 import type { ContainerRunner, DockerCreateArgsInput, DockerExecOptions } from "../../src/runtime/container-runner";
 import { LocalWorkspace } from "../../src/runtime/local-workspace";
@@ -29,6 +30,37 @@ describe("WorkspaceFactory", () => {
 
     expect(workspace).toBeInstanceOf(LocalWorkspace);
     expect(workspace.provider).toBe("local");
+    await rm(rootPath, { recursive: true, force: true });
+  });
+
+  test("wires WorktreeManager.remove into LocalWorkspace.destroy when worktreeManager is provided", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "autoforge-workspace-provider-"));
+    const calls: Array<{ branch: string; path: string }> = [];
+    const fakeWorktreeManager = {
+      remove: (ref: { branch: string; path: string }) => {
+        calls.push(ref);
+      }
+    } as unknown as WorktreeManager;
+
+    const factory = new WorkspaceFactory(
+      loadEnv({ NODE_ENV: "test", WORKSPACE_PROVIDER: "local" }),
+      { worktreeManager: fakeWorktreeManager }
+    );
+
+    const workspace = await factory.create({ rootPath, taskId: "task-symmetric-destroy", dispatchId: "task" });
+    await workspace.destroy();
+
+    expect(calls).toEqual([{ branch: "autoforge/task-symmetric-destroy", path: rootPath }]);
+    await rm(rootPath, { recursive: true, force: true });
+  });
+
+  test("LocalWorkspace.destroy is a no-op when worktreeManager is omitted", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "autoforge-workspace-provider-"));
+    const factory = new WorkspaceFactory(loadEnv({ NODE_ENV: "test", WORKSPACE_PROVIDER: "local" }));
+
+    const workspace = await factory.create({ rootPath, taskId: "task-no-teardown", dispatchId: "task" });
+    await workspace.destroy();
+    // Worktree directory should still exist (caller is responsible for teardown).
     await rm(rootPath, { recursive: true, force: true });
   });
 

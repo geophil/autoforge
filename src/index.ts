@@ -44,7 +44,10 @@ if (env.WORKSPACE_PROVIDER === "docker" && env.WORKSPACE_DOCKER_REAP_ON_START ==
 
 const executors = createExecutors(env);
 const worktrees = new WorktreeManager(resolve(process.cwd(), ".runtime-worktrees"));
-const workspaceFactory = new WorkspaceFactory(env);
+// Wire `worktrees` so `LocalWorkspace.destroy()` removes its host worktree +
+// branch on terminal cleanup (symmetric with `ContainerWorkspace.destroy()`
+// removing its container).
+const workspaceFactory = new WorkspaceFactory(env, { worktreeManager: worktrees });
 const service = new OrchestratorService({
   env,
   db,

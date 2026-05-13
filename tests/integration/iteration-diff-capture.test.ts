@@ -1,21 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import type { AgentTask, AgentResult } from "../../src/executors/interface";
-import { requireLocalWorkspaceRoot } from "../../src/runtime/local-workspace";
 import { createTestService } from "../helpers/create-service";
 
 describe("iteration diff capture wiring", () => {
   test("rework capture is upsert-idempotent and cleanup removes iteration tags", async () => {
     let reviewerCalls = 0;
     let coderCalls = 0;
-    const handlers: Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult>> = {
-      coder: (task) => {
+    const handlers: Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult | Promise<AgentResult>>> = {
+      coder: async (task) => {
         coderCalls += 1;
-        const srcDir = join(requireLocalWorkspaceRoot(task.workspace), "src");
-        mkdirSync(srcDir, { recursive: true });
-        writeFileSync(join(srcDir, "feature.ts"), `export const version = ${coderCalls};\n`);
+        await task.workspace.writeFile("src/feature.ts", `export const version = ${coderCalls};\n`);
         return {
           status: "DONE",
           artifacts: [],

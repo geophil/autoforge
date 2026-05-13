@@ -5,7 +5,7 @@
 - **Bun** ≥ 1.0 (runtime, package manager, test runner)
 - **TypeScript** (installed via devDependencies, no global install needed)
 - **Docker + Docker Compose** (optional, for NATS + QMD knowledge base)
-- **Claude CLI** (`claude`) on PATH — required for `EXECUTOR_DEFAULT=claude-code` (default)
+- **`ANTHROPIC_API_KEY`** — required for the default `EXECUTOR_DEFAULT=harness` so the harness runtime can call Anthropic models. Use `EXECUTOR_DEFAULT=mock` instead for offline / no-API-key local dev.
 - **`gh` CLI** + `GITHUB_TOKEN` — required for real GitHub PR creation (optional for local dev)
 
 ## Setup
@@ -71,15 +71,17 @@ Output is a single bundled JS file in `dist/`. Not required for development or D
 
 ### Changing the Executor
 
-Set `EXECUTOR_DEFAULT` in your shell or a local `.env`:
+There are exactly two executors: `harness` (production) and `mock` (test / no-API). Set `EXECUTOR_DEFAULT` in your shell or a local `.env`:
 
 ```bash
-# Use Anthropic API instead of Claude CLI
-EXECUTOR_DEFAULT=anthropic-sdk ANTHROPIC_API_KEY=sk-ant-... bun run dev
+# Production: harness runtime calling Anthropic models via the SDK
+EXECUTOR_DEFAULT=harness ANTHROPIC_API_KEY=sk-ant-... bun run dev
 
-# Use mock executor (no AI calls)
+# Mock executor (no AI calls — local dev without an API key, or scripted tests)
 EXECUTOR_DEFAULT=mock bun run dev
 ```
+
+The legacy `claude-code` and `anthropic-sdk` executors were removed in commit `645a376`; `loadEnv()` now rejects those values at startup.
 
 ### Adding a Skill File
 

@@ -27,7 +27,7 @@ src/
 
 | Element | Convention | Example |
 |---------|-----------|---------|
-| Files | kebab-case | `state-machine.ts`, `claude-code.ts` |
+| Files | kebab-case | `state-machine.ts`, `harness-executor.ts` |
 | Classes | PascalCase | `OrchestratorService`, `WorktreeManager` |
 | Functions | camelCase | `assessComplexity()`, `routeTier()` |
 | Interfaces | PascalCase | `AgentExecutor`, `PipelineTask` |

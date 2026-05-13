@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import type { ContainerFailureCategory } from "./container-diagnostics";
 import { classifyContainerFailure } from "./container-diagnostics";
+import { spawnAsExecEvents } from "./spawn-streaming";
 import type { ExecEvent } from "./workspace";
 
 export interface DockerCreateArgsInput {
@@ -192,56 +192,6 @@ async function collectAllowingMissing(events: AsyncIterable<ExecEvent>): Promise
   return { stdout, stderr, exitCode };
 }
 
-async function* spawnDocker(args: string[], opts: { timeoutSeconds?: number } = {}): AsyncIterable<ExecEvent> {
-  const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
-  const events: ExecEvent[] = [];
-  let closed = false;
-  let terminalEmitted = false;
-  let timedOut = false;
-  let notify: (() => void) | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  const push = (event: ExecEvent) => {
-    events.push(event);
-    notify?.();
-    notify = undefined;
-  };
-
-  child.stdout?.on("data", (chunk: Buffer) => push({ kind: "stdout", chunk: chunk.toString() }));
-  child.stderr?.on("data", (chunk: Buffer) => push({ kind: "stderr", chunk: chunk.toString() }));
-  child.on("error", (error) => {
-    if (terminalEmitted) return;
-    terminalEmitted = true;
-    push({ kind: "stderr", chunk: error.message });
-    push({ kind: "exit", exitCode: 127 });
-    closed = true;
-    notify?.();
-  });
-  child.on("close", (code, signal) => {
-    if (timer) clearTimeout(timer);
-    if (!terminalEmitted) {
-      terminalEmitted = true;
-      push({ kind: "exit", exitCode: code ?? (timedOut ? 124 : 1), ...(signal ? { signal } : {}) });
-    }
-    closed = true;
-    notify?.();
-  });
-
-  if (opts.timeoutSeconds && opts.timeoutSeconds > 0) {
-    timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-    }, opts.timeoutSeconds * 1000);
-  }
-
-  while (!closed || events.length > 0) {
-    const next = events.shift();
-    if (next) {
-      yield next;
-      continue;
-    }
-    await new Promise<void>((resolve) => {
-      notify = resolve;
-    });
-  }
+function spawnDocker(args: string[], opts: { timeoutSeconds?: number } = {}): AsyncIterable<ExecEvent> {
+  return spawnAsExecEvents("docker", args, { timeoutSeconds: opts.timeoutSeconds });
 }

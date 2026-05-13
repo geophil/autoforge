@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DbClient } from "../../src/db/client";
@@ -14,7 +14,6 @@ import { AutoTuner } from "../../src/orchestrator/auto-tuner";
 import { PersonaRegistry } from "../../src/personas/registry";
 import type { AgentResult, AgentTask } from "../../src/executors/interface";
 import type { LifecycleHookPhase, LifecycleHooksResult } from "../../src/orchestrator/lifecycle-hooks";
-import { requireLocalWorkspaceRoot } from "../../src/runtime/local-workspace";
 
 type Handlers = Partial<Record<AgentTask["type"], (task: AgentTask) => AgentResult | Promise<AgentResult>>>;
 type HookRunner = (input: { phase: LifecycleHookPhase; workingDirectory: string; timeoutSeconds: number }) => LifecycleHooksResult;
@@ -204,15 +203,14 @@ describe("Spec C lifecycle auto-tuner hook", () => {
       lifecycleHookRunner: null,
       handlers: {
         coder: async (agentTask) => {
-          const packageJsonPath = join(requireLocalWorkspaceRoot(agentTask.workspace), "package.json");
-          const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+          const pkg = JSON.parse(await agentTask.workspace.readFile("package.json")) as {
             scripts?: Record<string, string>;
           };
           pkg.scripts = {
             ...(pkg.scripts ?? {}),
             lint: "node -e \"process.stderr.write('hook-failed'); process.exit(1)\""
           };
-          writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2));
+          await agentTask.workspace.writeFile("package.json", JSON.stringify(pkg, null, 2));
           return {
             status: "DONE",
             artifacts: [],
