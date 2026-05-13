@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   buildDockerCreateArgs,
   dockerContainerName,
-  DockerCliContainerRunner
+  DockerCliContainerRunner,
+  reapOrphanWorkspaceContainers
 } from "../../src/runtime/container-runner";
 import type { ExecEvent } from "../../src/runtime/workspace";
 
@@ -46,5 +47,46 @@ describe("container runner", () => {
     });
 
     await expect(runner.destroy("missing-container")).resolves.toBeUndefined();
+  });
+
+  test("reapOrphanWorkspaceContainers removes every labeled container and counts successes", async () => {
+    const calls: string[][] = [];
+    const runDocker = async function* (args: string[]): AsyncIterable<ExecEvent> {
+      calls.push(args);
+      if (args[0] === "ps") {
+        yield { kind: "stdout", chunk: "abc123\ndef456\nghi789\n" };
+        yield { kind: "exit", exitCode: 0 };
+        return;
+      }
+      // docker rm -f <id>
+      yield { kind: "exit", exitCode: 0 };
+    };
+
+    const reaped = await reapOrphanWorkspaceContainers({ runDocker });
+
+    expect(reaped).toBe(3);
+    expect(calls[0]).toEqual(["ps", "-a", "--filter", "label=autoforge.workspace=true", "-q"]);
+    expect(calls.slice(1)).toEqual([
+      ["rm", "-f", "abc123"],
+      ["rm", "-f", "def456"],
+      ["rm", "-f", "ghi789"]
+    ]);
+  });
+
+  test("reapOrphanWorkspaceContainers returns 0 when docker is unavailable", async () => {
+    const runDocker = async function* (_args: string[]): AsyncIterable<ExecEvent> {
+      yield { kind: "stderr", chunk: "Cannot connect to the Docker daemon" };
+      yield { kind: "exit", exitCode: 1 };
+    };
+
+    expect(await reapOrphanWorkspaceContainers({ runDocker })).toBe(0);
+  });
+
+  test("reapOrphanWorkspaceContainers returns 0 cleanly when nothing matches the label", async () => {
+    const runDocker = async function* (_args: string[]): AsyncIterable<ExecEvent> {
+      yield { kind: "exit", exitCode: 0 };
+    };
+
+    expect(await reapOrphanWorkspaceContainers({ runDocker })).toBe(0);
   });
 });

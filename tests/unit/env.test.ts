@@ -41,6 +41,7 @@ describe("env defaults for planner config", () => {
     expect(env.WORKSPACE_DOCKER_PRECHECK).toBe("1");
     expect(env.WORKSPACE_DOCKER_UID).toBe(1000);
     expect(env.WORKSPACE_DOCKER_GID).toBe(1000);
+    expect(env.WORKSPACE_DOCKER_REAP_ON_START).toBe("0");
   });
 
   test("docker workspace env values can be overridden", () => {
@@ -52,7 +53,8 @@ describe("env defaults for planner config", () => {
       WORKSPACE_DOCKER_MEMORY: "1g",
       WORKSPACE_DOCKER_PRECHECK: "0",
       WORKSPACE_DOCKER_UID: "501",
-      WORKSPACE_DOCKER_GID: "20"
+      WORKSPACE_DOCKER_GID: "20",
+      WORKSPACE_DOCKER_REAP_ON_START: "1"
     });
 
     expect(env.WORKSPACE_DOCKER_IMAGE).toBe("node:22-bookworm");
@@ -62,5 +64,6 @@ describe("env defaults for planner config", () => {
     expect(env.WORKSPACE_DOCKER_PRECHECK).toBe("0");
     expect(env.WORKSPACE_DOCKER_UID).toBe(501);
     expect(env.WORKSPACE_DOCKER_GID).toBe(20);
+    expect(env.WORKSPACE_DOCKER_REAP_ON_START).toBe("1");
   });
 });

@@ -39,7 +39,12 @@ const EnvSchema = z.object({
   // `agent` user baked into docker/autoforge-agent/Dockerfile; override only
   // when running a custom image whose user has different numeric ids.
   WORKSPACE_DOCKER_UID: z.coerce.number().int().min(0).default(1000),
-  WORKSPACE_DOCKER_GID: z.coerce.number().int().min(0).default(1000)
+  WORKSPACE_DOCKER_GID: z.coerce.number().int().min(0).default(1000),
+  // When set to "1", the orchestrator runs `docker rm -f` against every
+  // container labeled autoforge.workspace=true at startup. Off by default
+  // because it would clobber workspaces owned by another orchestrator
+  // running on the same host. Safe to enable in single-instance setups.
+  WORKSPACE_DOCKER_REAP_ON_START: z.enum(["0", "1"]).default("0")
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;

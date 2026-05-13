@@ -41,23 +41,86 @@ If the status file is missing, the runtime returns `DONE_WITH_CONCERNS`.
 
 ### Local Docker Workspace Provider
 
-Autoforge can run agent tools in local Docker containers by setting `WORKSPACE_PROVIDER=docker`. The orchestrator still creates one git worktree per task. Each agent dispatch gets one container with that worktree mounted at `/workspace`; the container is destroyed after the dispatch completes.
+Autoforge can route agent execution through local Docker containers by
+setting `WORKSPACE_PROVIDER=docker`. The orchestrator creates one git
+worktree per task and **one container per task**; that container is shared
+by every agent dispatch in the task (planner, coder subtasks, reviewer
+iterations, doc, meta) and torn down when the worktree is cleaned up.
 
 The runtime contract remains `Workspace`:
 
-- `readFile` and `writeFile` use host-side path checks against the mounted worktree.
+- `readFile` and `writeFile` use host-side path checks against the mounted
+  worktree (the worktree is bind-mounted at `/workspace` inside the
+  container, so writes from either side are visible immediately on the
+  other).
 - `exec` runs through `docker exec` with `cwd` mapped under `/workspace`.
-- `destroy` removes the dispatch container.
+  The cwd must exist on the host before exec is invoked (strict realpath
+  check, matching `LocalWorkspace`).
+- `destroy` removes the per-task container; idempotent across restarts
+  via the in-memory workspace map plus a recovery-time event-log walker.
 
-The rollback path is `WORKSPACE_PROVIDER=local`. This restores legacy local worktree execution without changing planner, coder, reviewer, or document agent behavior.
+The rollback path is `WORKSPACE_PROVIDER=local`. This restores legacy
+local worktree execution without changing planner, coder, reviewer, doc,
+or meta agent behavior.
 
-Operational gates before making Docker the team default:
+#### Trust boundary (what runs where)
 
-- Docker preflight succeeds on developer machines.
-- Docker-gated integration test passes.
-- No persistent `autoforge.workspace=true` orphan containers after repeated failed runs.
-- p95 dispatch latency remains acceptable for EXPRESS tasks.
-- `WORKSPACE_PROVIDER=local` rollback is tested after a Docker failure.
+When `WORKSPACE_PROVIDER=docker`:
+
+- **Inside the container** (cannot reach host fs / network / credentials):
+  - All agent tool calls (`read_file`, `write_file`, `exec`, `done`, …).
+  - Lifecycle hooks: `bun run lint`, `bun run test`, `bun run format`,
+    `bun run lint:fix` from the agent-mutated `package.json`.
+  - PR-gate test runners: `bun test`, `npm test`, `npx vitest run`,
+    `npx jest`.
+- **On the host** (trusted operations only):
+  - `git worktree add/remove` and orchestrator-driven `git status`/`add`/
+    `commit` (git itself is trusted; agent files it operates on are not
+    executed by git).
+  - `bun install --frozen-lockfile` (or `npm ci` / `yarn install` / `pnpm
+    install`). Lockfile is human-committed; `--frozen-lockfile` blocks
+    drift; `--network=none` inside the container blocks mid-task
+    `bun add`. **This is the documented trust boundary** — postinstall
+    scripts in third-party deps still run as the orchestrator user.
+  - Diagnostic and reflection runs always use a per-run local tmpdir
+    workspace (regardless of `WORKSPACE_PROVIDER`) so neither agent can
+    bind-mount the autoforge source tree.
+
+#### Image contract
+
+The default `WORKSPACE_DOCKER_IMAGE=autoforge-agent:local` is built by
+`bun run image:agent` from `docker/autoforge-agent/Dockerfile`. Custom
+images must:
+
+- Have `bun` and `git` on `PATH`.
+- Contain a user with the numeric uid/gid matching
+  `WORKSPACE_DOCKER_UID` / `WORKSPACE_DOCKER_GID` (defaults: 1000/1000).
+- Use `/workspace` as the conventional working directory.
+
+#### Recovery and orphan cleanup
+
+If the orchestrator crashes mid-task, the in-memory workspace handle is
+lost but the event log still records `workspace_created`. The next
+`cleanupWorktree` call walks events and emits compensating
+`workspace_destroyed` events so analytics consumers see a well-paired
+lifecycle. The actual container (still running) is reaped by
+`reapOrphanWorkspaceContainers` if `WORKSPACE_DOCKER_REAP_ON_START=1`;
+otherwise the operator runs the manual sweep:
+
+```
+docker ps -a --filter label=autoforge.workspace=true -q | xargs -r docker rm -f
+```
+
+#### Operational gates before making Docker the team default
+
+- Docker preflight succeeds on developer machines (`docker info` and
+  `docker image inspect autoforge-agent:local`).
+- The Docker-gated integration test passes (`AUTOFORGE_DOCKER_TESTS=1
+  bun test tests/integration/container-workspace-docker.test.ts`).
+- No persistent `autoforge.workspace=true` orphan containers after
+  repeated failed runs (verify with the manual sweep above).
+- `WORKSPACE_PROVIDER=local` rollback succeeds after an induced Docker
+  failure.
 
 ### Provider Boundary
 

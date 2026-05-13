@@ -89,6 +89,46 @@ export class DockerCliContainerRunner implements ContainerRunner {
   }
 }
 
+/**
+ * Best-effort startup sweep: remove every container labeled
+ * `autoforge.workspace=true`. Intended for single-instance deployments
+ * where any container with that label is guaranteed to belong to a
+ * previous orchestrator process that crashed or was killed before its
+ * destroyTaskWorkspaceIfPresent ran. Returns the number of containers
+ * removed (0 if Docker is unavailable). Never throws — orphan cleanup
+ * must not block startup.
+ */
+export async function reapOrphanWorkspaceContainers(
+  options: { runDocker?: RunDocker } = {}
+): Promise<number> {
+  const run = options.runDocker ?? spawnDocker;
+  let listed: { stdout: string; exitCode: number };
+  try {
+    listed = await collectAllowingMissing(
+      run(["ps", "-a", "--filter", "label=autoforge.workspace=true", "-q"], { timeoutSeconds: 30 })
+    );
+  } catch {
+    return 0;
+  }
+  if (listed.exitCode !== 0) return 0;
+
+  const containerIds = listed.stdout
+    .split("\n")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+
+  let removed = 0;
+  for (const id of containerIds) {
+    try {
+      const result = await collectAllowingMissing(run(["rm", "-f", id], { timeoutSeconds: 60 }));
+      if (result.exitCode === 0) removed += 1;
+    } catch {
+      // Best-effort; one failure must not stop the sweep.
+    }
+  }
+  return removed;
+}
+
 export function dockerContainerName(taskId: string, dispatchId: string): string {
   const suffix = `${taskId}-${dispatchId}`
     .toLowerCase()

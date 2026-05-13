@@ -157,6 +157,12 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Default**: `1000`
 - **Affects**: The numeric gid passed alongside `WORKSPACE_DOCKER_UID`. Must exist as a group inside `WORKSPACE_DOCKER_IMAGE`.
 
+### `WORKSPACE_DOCKER_REAP_ON_START`
+
+- **Type**: `"0"` or `"1"`
+- **Default**: `"0"`
+- **Affects**: Whether the orchestrator runs `docker rm -f` against every container labeled `autoforge.workspace=true` at startup. Useful in single-instance dev/local setups where any leftover container is guaranteed to be from a previous orchestrator process that crashed or was killed mid-task. **Do not enable on shared hosts running multiple orchestrators**: it will clobber the other instance's live workspaces. Only consulted when `WORKSPACE_PROVIDER=docker`.
+
 ### `AUTOFORGE_URL`
 
 - **Type**: string (CLI environment variable, not validated by `loadEnv()`)

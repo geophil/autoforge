@@ -8,6 +8,7 @@ import { WorktreeManager } from "./git/worktrees";
 import { NatsClient } from "./nats/client";
 import { RecoveryService } from "./orchestrator/recovery";
 import { OrchestratorService } from "./orchestrator/service";
+import { reapOrphanWorkspaceContainers } from "./runtime/container-runner";
 import { WorkspaceFactory } from "./runtime/workspace-provider";
 import { createWebServer } from "./web/server";
 
@@ -29,6 +30,17 @@ const recovery = new RecoveryService(db, nats, (message) => {
   });
 });
 await recovery.recover();
+
+if (env.WORKSPACE_PROVIDER === "docker" && env.WORKSPACE_DOCKER_REAP_ON_START === "1") {
+  // Sweep containers left behind by a previous orchestrator that crashed
+  // or was killed before destroyTaskWorkspaceIfPresent ran. Off by default
+  // to keep multi-instance deployments safe; flip on for single-instance
+  // local dev where orphan accumulation is the only failure mode.
+  const reaped = await reapOrphanWorkspaceContainers();
+  if (reaped > 0) {
+    console.log(`[workspace] Reaped ${reaped} orphan container(s) on startup.`);
+  }
+}
 
 const executors = createExecutors(env);
 const worktrees = new WorktreeManager(resolve(process.cwd(), ".runtime-worktrees"));
