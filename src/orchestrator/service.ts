@@ -120,6 +120,16 @@ export class OrchestratorService {
   // and torn down in cleanupWorktree. Every dispatch (planner, coder
   // subtasks, reviewer iterations, doc, meta) reads the same handle from
   // this map — one container per task instead of one per dispatch.
+  //
+  // The map is purely in-memory state. After a process restart it is empty
+  // even for tasks that survive in the event log (notably tasks paused at
+  // human gates `awaiting_spec_approval`, `awaiting_plan_approval`, and
+  // `awaiting_approval`, which `sweepStaleTasks` intentionally skips).
+  // Operator-driven entry points that resume work (approveSpec /
+  // critiqueSpec / approvePlan / critiquePlan / approveTask /
+  // retryFromIntervention) call `ensureTaskWorkspace` themselves so the
+  // first dispatch after a restart re-creates the per-task workspace
+  // instead of throwing in `requireTaskWorkspace`.
   private readonly taskWorkspaces = new Map<string, Workspace>();
   private readonly autoTuner = new AutoTuner();
   private terminalTaskCount = 0;
@@ -179,9 +189,10 @@ export class OrchestratorService {
   }
 
   /**
-   * Look up the per-task workspace handle. Throws if missing — every
-   * dispatch site assumes the task workspace was created up front by
-   * submitTask/submitMetaTask.
+   * Look up the per-task workspace handle. Throws if missing — dispatch
+   * sites assume the workspace was already created either by submitTask /
+   * submitMetaTask (fresh dispatch) or by an operator entry point (resume
+   * after restart, see `taskWorkspaces` field comment).
    */
   private requireTaskWorkspace(taskId: string): Workspace {
     const workspace = this.taskWorkspaces.get(taskId);
@@ -203,6 +214,15 @@ export class OrchestratorService {
    * + restart), walk the event log and emit compensating destroyed events
    * for any orphaned creates. The actual container is reaped separately
    * by the startup orphan reaper.
+   *
+   * Note on the post-restart resume path (operator-driven entry points
+   * like approveSpec/critiqueSpec/...): `workspace.id` is logically
+   * `${taskId}:task`, deterministic across incarnations. When the lazy
+   * resume re-creates a workspace, `ensureTaskWorkspace`'s `alreadyRecorded`
+   * check finds the prior `workspace_created` event with a matching id
+   * and suppresses the duplicate, so no orphan accumulates in the event
+   * log. The physical container/handle from the prior incarnation is the
+   * orphan reaper's concern.
    */
   private async destroyTaskWorkspaceIfPresent(
     taskId: string,
@@ -1026,6 +1046,11 @@ export class OrchestratorService {
 
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (!worktreePath) throw new Error(`Worktree missing for task ${taskId}`);
+    // `awaiting_spec_approval` is a human gate that survives orchestrator
+    // restarts; the in-memory taskWorkspaces map may be empty by the time
+    // the operator approves. Lazily re-create the per-task workspace so
+    // the planner dispatch that follows finds a registered handle.
+    await this.ensureTaskWorkspace(worktreePath, taskId, task.projectId);
 
     let parsed: ParsedPlannerOutput;
     try {
@@ -1109,6 +1134,8 @@ export class OrchestratorService {
       await this.finalizeTerminalTask(taskId);
       throw new Error(`Worktree missing for task ${taskId}`);
     }
+    // Lazy resume of the per-task workspace post-restart (see approveSpec).
+    await this.ensureTaskWorkspace(worktreePath, taskId, task.projectId);
 
     let parsed: ParsedPlannerOutput;
     try {
@@ -1180,6 +1207,8 @@ export class OrchestratorService {
 
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (!worktreePath) throw new Error(`Worktree missing for task ${taskId}`);
+    // Lazy resume of the per-task workspace post-restart (see approveSpec).
+    await this.ensureTaskWorkspace(worktreePath, taskId, task.projectId);
     const branch = `autoforge/${taskId}`;
 
     try {
@@ -1234,6 +1263,8 @@ export class OrchestratorService {
       await this.finalizeTerminalTask(taskId);
       throw new Error(`Worktree missing for task ${taskId}`);
     }
+    // Lazy resume of the per-task workspace post-restart (see approveSpec).
+    await this.ensureTaskWorkspace(worktreePath, taskId, task.projectId);
 
     let parsed: ParsedPlannerOutput;
     try {
@@ -1284,6 +1315,10 @@ export class OrchestratorService {
     // Run doc agent in the task's worktree (if it still exists).
     const worktreePath = this.deps.worktrees.findWorktreePath(taskId);
     if (worktreePath) {
+      // Lazy resume of the per-task workspace post-restart (see
+      // approveSpec). `awaiting_approval` is a human gate that survives
+      // restarts; the doc dispatch below requires a registered handle.
+      await this.ensureTaskWorkspace(worktreePath, taskId, task.projectId);
       const docDispatch = await this.selectPersonaForDispatch("doc", {
         description: task.description,
         tier: task.tier,
@@ -1666,6 +1701,11 @@ export class OrchestratorService {
     if (!worktreePath) {
       throw new Error(`Worktree missing for task ${taskId}; cannot retry`);
     }
+    // Lazy resume of the per-task workspace post-restart. `awaiting_intervention`
+    // is also a human gate that survives orchestrator restarts (see the
+    // taskWorkspaces field comment); subsequent runPlannerAttempt /
+    // executeAndReview dispatches need a registered handle.
+    await this.ensureTaskWorkspace(worktreePath, taskId, task.projectId);
     const branch = `autoforge/${taskId}`;
     const checkpoints = events
       .filter((event) => event.type === "checkpoint_created")

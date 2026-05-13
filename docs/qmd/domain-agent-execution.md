@@ -111,6 +111,21 @@ otherwise the operator runs the manual sweep:
 docker ps -a --filter label=autoforge.workspace=true -q | xargs -r docker rm -f
 ```
 
+Tasks paused at human gates (`awaiting_spec_approval`,
+`awaiting_plan_approval`, `awaiting_approval`, `awaiting_intervention`)
+are intentionally exempt from the staleness sweeper, so they
+legitimately survive an orchestrator restart. When the operator
+subsequently calls `approveSpec`, `critiqueSpec`, `approvePlan`,
+`critiquePlan`, `approveTask`, or `retryFromIntervention`, the
+orchestrator lazily re-creates the per-task workspace via
+`ensureTaskWorkspace` before any agent dispatch. The workspace
+`id` is logically deterministic (`${taskId}:task`), so the existing
+`workspace_created` event is reused and no duplicate is appended; the
+single paired `workspace_destroyed` is emitted when `cleanupWorktree`
+runs at task termination. The physical container left behind by the
+previous incarnation is the orphan reaper's responsibility (see
+above).
+
 #### Operational gates before making Docker the team default
 
 - Docker preflight succeeds on developer machines (`docker info` and
