@@ -74,6 +74,7 @@ export interface AgentResult {
     tokenOutput?: number;
     estimatedCost?: number;
     toolStats?: ToolStats;
+    telemetry?: import("./telemetry").TelemetrySummary & { events: { models: import("./telemetry").ModelCallEvent[]; tools: import("./telemetry").ToolCallEvent[] } };
   };
   /** Captured by SDK executor. Claude Code returns undefined. */
   transcript?: AgentTranscript;
