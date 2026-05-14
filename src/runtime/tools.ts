@@ -48,6 +48,51 @@ export function createRuntimeToolRegistry(options: RuntimeToolRegistryOptions = 
       }
     })
     .register({
+      name: "str_replace",
+      description:
+        "Replace exactly one occurrence of old_string with new_string in a workspace file. old_string must match verbatim (including whitespace) and occur exactly once.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative path to the file to edit." },
+          old_string: { type: "string", description: "Exact snippet to replace (must occur exactly once)." },
+          new_string: { type: "string", description: "Replacement text." }
+        },
+        required: ["path", "old_string", "new_string"]
+      },
+      statsBucket: "write",
+      execute: async (input, workspace) => {
+        const path = requireString(input.path, "path");
+        const oldString = requireString(input.old_string, "old_string");
+        const newString = requireString(input.new_string, "new_string");
+        if (oldString.length === 0) {
+          throw new Error("old_string must not be empty (ambiguous match)");
+        }
+        if (oldString === newString) {
+          throw new Error("old_string and new_string are identical; nothing to do");
+        }
+        const content = await workspace.readFile(path);
+        let count = 0;
+        let idx = 0;
+        while (idx <= content.length - oldString.length) {
+          const at = content.indexOf(oldString, idx);
+          if (at === -1) break;
+          count += 1;
+          idx = at + oldString.length;
+        }
+        if (count === 0) {
+          throw new Error("old_string was not found in the file");
+        }
+        if (count > 1) {
+          throw new Error(`old_string is ambiguous: found ${count} occurrences; include more context so the match is unique`);
+        }
+        const at = content.indexOf(oldString);
+        const updated = content.slice(0, at) + newString + content.slice(at + oldString.length);
+        await workspace.writeFile(path, updated);
+        return { path, ok: true, replacements: 1 };
+      }
+    })
+    .register({
       name: "exec",
       description: "Run a command in the workspace and collect stdout, stderr, and exit status.",
       inputSchema: {

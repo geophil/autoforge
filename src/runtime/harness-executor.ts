@@ -15,6 +15,30 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_TOOL_ITERATIONS = 50;
 
+/** Max serialized characters per tool result sent to the model; tunable per deployment/model. */
+export const MAX_TOOL_RESULT_CHARS = 12_000;
+
+/**
+ * If `serialized` exceeds {@link MAX_TOOL_RESULT_CHARS}, keeps head and tail with a deterministic
+ * marker. Below the cap, returns `serialized` unchanged (byte-for-byte as a JS string).
+ */
+export function boundSerializedToolResult(serialized: string): string {
+  if (serialized.length <= MAX_TOOL_RESULT_CHARS) return serialized;
+  for (let inner = MAX_TOOL_RESULT_CHARS; inner >= 0; inner--) {
+    const omitted = serialized.length - inner;
+    if (omitted <= 0) continue;
+    const marker = `\n...<truncated ${omitted} chars>...\n`;
+    if (inner + marker.length <= MAX_TOOL_RESULT_CHARS) {
+      const headLen = Math.floor(inner / 2);
+      const tailLen = inner - headLen;
+      return serialized.slice(0, headLen) + marker + serialized.slice(serialized.length - tailLen);
+    }
+  }
+  const omitted = serialized.length - 1;
+  const marker = `\n...<truncated ${omitted} chars>...\n`;
+  return serialized.slice(0, 1) + marker;
+}
+
 interface HarnessExecutorOptions {
   provider: ModelProvider;
   tools: ToolRegistry;
@@ -236,17 +260,21 @@ function snapshotHistory(history: ModelMessage[]): ModelMessage[] {
   }));
 }
 
-function serializeToolResult(result: unknown): string {
-  if (result === undefined || result === null) return "(empty result)";
-  if (typeof result === "string") return result;
-  if (result instanceof Error) return `Error: ${result.message}`;
-  try {
-    const json = JSON.stringify(result);
-    return typeof json === "string" ? json : "[unserializable tool result]";
-  } catch (error) {
-    void error;
-    return "[unserializable tool result]";
+export function serializeToolResult(result: unknown): string {
+  let raw: string;
+  if (result === undefined || result === null) raw = "(empty result)";
+  else if (typeof result === "string") raw = result;
+  else if (result instanceof Error) raw = `Error: ${result.message}`;
+  else {
+    try {
+      const json = JSON.stringify(result);
+      raw = typeof json === "string" ? json : "[unserializable tool result]";
+    } catch (error) {
+      void error;
+      raw = "[unserializable tool result]";
+    }
   }
+  return boundSerializedToolResult(raw);
 }
 
 function snapshotContent(content: ModelContentBlock[]): ModelContentBlock[] {

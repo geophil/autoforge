@@ -90,6 +90,73 @@ describe("runtime tools", () => {
     });
   });
 
+  test("str_replace updates file when old_string occurs exactly once", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-str",
+      files: { "a.txt": "alpha BETA gamma\n" }
+    });
+    const registry = createRuntimeToolRegistry();
+
+    const result = await registry.get("str_replace").execute({
+      path: "a.txt",
+      old_string: "BETA",
+      new_string: "delta"
+    }, workspace, context);
+
+    expect(result).toEqual({ path: "a.txt", ok: true, replacements: 1 });
+    expect(await workspace.readFile("a.txt")).toBe("alpha delta gamma\n");
+  });
+
+  test("str_replace rejects zero occurrences", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-str-0",
+      files: { "a.txt": "unchanged\n" }
+    });
+    const registry = createRuntimeToolRegistry();
+
+    await expect(registry.get("str_replace").execute({
+      path: "a.txt",
+      old_string: "missing",
+      new_string: "x"
+    }, workspace, context)).rejects.toThrow("old_string was not found");
+  });
+
+  test("str_replace rejects ambiguous multiple occurrences", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-str-n",
+      files: { "a.txt": "foo foo foo\n" }
+    });
+    const registry = createRuntimeToolRegistry();
+
+    await expect(registry.get("str_replace").execute({
+      path: "a.txt",
+      old_string: "foo",
+      new_string: "bar"
+    }, workspace, context)).rejects.toThrow("found 3 occurrences");
+  });
+
+  test("str_replace rejects empty old_string", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-str-empty", files: { "a.txt": "x" } });
+    const registry = createRuntimeToolRegistry();
+
+    await expect(registry.get("str_replace").execute({
+      path: "a.txt",
+      old_string: "",
+      new_string: "y"
+    }, workspace, context)).rejects.toThrow("old_string must not be empty");
+  });
+
+  test("str_replace rejects identical old_string and new_string", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-str-same", files: { "a.txt": "x" } });
+    const registry = createRuntimeToolRegistry();
+
+    await expect(registry.get("str_replace").execute({
+      path: "a.txt",
+      old_string: "x",
+      new_string: "x"
+    }, workspace, context)).rejects.toThrow("identical");
+  });
+
   test("done rejects invalid status values", async () => {
     const workspace = new MockWorkspace({ id: "workspace-1" });
     const registry = createRuntimeToolRegistry();

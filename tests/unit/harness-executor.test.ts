@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HarnessExecutor } from "../../src/runtime/harness-executor";
+import { HarnessExecutor, MAX_TOOL_RESULT_CHARS, serializeToolResult } from "../../src/runtime/harness-executor";
 import { SkillRegistry } from "../../src/skills/registry";
 import { ToolRegistry } from "../../src/runtime/tool-registry";
 import type { ModelMessage, ModelProvider, ModelResponse } from "../../src/runtime/model-provider";
@@ -530,5 +530,90 @@ describe("HarnessExecutor", () => {
     expect(result.status).toBe("TIMEOUT");
     expect(toolRan).toBe(false);
     expect(result.metrics.toolStats?.readCount).toBe(0);
+  });
+});
+
+describe("serializeToolResult bounds", () => {
+  test.each([
+    { kind: "string", value: "hello", expected: "hello" },
+    { kind: "json", value: { ok: true }, expected: '{"ok":true}' },
+    { kind: "error", value: new Error("boom"), expected: "Error: boom" }
+  ] as const)("below cap leaves $kind results unchanged", ({ value, expected }) => {
+    expect(serializeToolResult(value)).toBe(expected);
+  });
+
+  test.each([
+    { kind: "string", make: () => "y".repeat(MAX_TOOL_RESULT_CHARS + 500) },
+    {
+      kind: "json",
+      make: () => ({ pad: "z".repeat(MAX_TOOL_RESULT_CHARS + 500) })
+    },
+    {
+      kind: "error",
+      make: () => new Error("e".repeat(MAX_TOOL_RESULT_CHARS + 500))
+    }
+  ] as const)("above cap truncates $kind with head, tail, and marker", ({ kind, make }) => {
+    const full = serializeToolResult(make());
+    expect(full.length).toBeLessThanOrEqual(MAX_TOOL_RESULT_CHARS);
+    expect(full).toMatch(/<truncated \d+ chars>/);
+    if (kind === "string") {
+      expect(full.startsWith("y")).toBe(true);
+      expect(full.endsWith("y")).toBe(true);
+    }
+    if (kind === "json") {
+      expect(full.startsWith('{"pad":"')).toBe(true);
+      expect(full.endsWith("}")).toBe(true);
+    }
+    if (kind === "error") {
+      expect(full.startsWith("Error: ")).toBe(true);
+      expect(full.endsWith("e")).toBe(true);
+    }
+  });
+
+  test("str_replace outside workspace is a recoverable tool_result error", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-str-replace-escape" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{
+          type: "tool_use",
+          id: "sr-1",
+          name: "str_replace",
+          input: { path: "../outside", old_string: "a", new_string: "b" }
+        }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-1", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-str-replace-outside",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    expect(provider.calls[1].history.at(-1)).toEqual({
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "sr-1", content: "Error: Path is outside workspace root: ../outside" }]
+    });
   });
 });

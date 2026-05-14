@@ -81,7 +81,10 @@ When `WORKSPACE_PROVIDER=docker`:
     install`). Lockfile is human-committed; `--frozen-lockfile` blocks
     drift; `--network=none` inside the container blocks mid-task
     `bun add`. **This is the documented trust boundary** — postinstall
-    scripts in third-party deps still run as the orchestrator user.
+    scripts in third-party deps still run as the orchestrator user unless
+    you set `WORKSPACE_INSTALL_IGNORE_SCRIPTS=1`, which adds
+    `--ignore-scripts` to the host install (fewer moving parts on the host,
+    but some packages may need their install hooks — default remains off).
   - Diagnostic and reflection runs always use a per-run local tmpdir
     workspace (regardless of `WORKSPACE_PROVIDER`) so neither agent can
     bind-mount the autoforge source tree.

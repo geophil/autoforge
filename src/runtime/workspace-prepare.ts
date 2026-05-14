@@ -11,10 +11,16 @@ import { join } from "node:path";
  * calls do go through the container, which is what closes the realistic
  * threat (the agent rewriting `package.json` scripts at runtime).
  *
+ * Set `WORKSPACE_INSTALL_IGNORE_SCRIPTS=1` to append `--ignore-scripts` to
+ * the install command (skips dependency postinstall scripts on the host).
+ * Default is off so installs behave like a normal local clone; see
+ * docs/qmd/domain-agent-execution.md.
+ *
  * No-op when no recognised lock file is present.
  */
 export function prepareTaskWorkspace(workspaceRoot: string, options: { timeoutMs?: number } = {}): void {
   const timeout = options.timeoutMs ?? 120_000;
+  const ignoreScripts = process.env.WORKSPACE_INSTALL_IGNORE_SCRIPTS === "1";
   const strategies: Array<{ lockFile: string; cmd: string; args: string[] }> = [
     { lockFile: "bun.lockb", cmd: "bun", args: ["install", "--frozen-lockfile"] },
     { lockFile: "bun.lock", cmd: "bun", args: ["install", "--frozen-lockfile"] },
@@ -25,7 +31,8 @@ export function prepareTaskWorkspace(workspaceRoot: string, options: { timeoutMs
 
   for (const strategy of strategies) {
     if (existsSync(join(workspaceRoot, strategy.lockFile))) {
-      const result = spawnSync(strategy.cmd, strategy.args, {
+      const args = ignoreScripts ? [...strategy.args, "--ignore-scripts"] : strategy.args;
+      const result = spawnSync(strategy.cmd, args, {
         cwd: workspaceRoot,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
