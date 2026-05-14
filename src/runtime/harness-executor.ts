@@ -11,6 +11,8 @@ import type { ModelContentBlock, ModelMessage, ModelProvider } from "./model-pro
 import { statsBucketForTool, ToolRegistry } from "./tool-registry";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { TelemetryLedger } from "../executors/telemetry";
+import { getModelCost } from "./pricing";
 
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_TOOL_ITERATIONS = 50;
@@ -61,6 +63,7 @@ export class HarnessExecutor implements AgentExecutor {
     let tokenInput = 0;
     let tokenOutput = 0;
 
+    const ledger = new TelemetryLedger();
     let mcpClient: Client | null = null;
     let availableTools = this.options.tools.definitions();
     const mcpToolNames = new Set<string>();
@@ -101,6 +104,7 @@ export class HarnessExecutor implements AgentExecutor {
           return timeoutResult(start, tokenInput, tokenOutput, toolStats, transcript());
         }
 
+        const modelStart = Date.now();
         const response = await this.options.provider.message({
           model: task.model ?? this.options.defaultModel,
           systemPrompt,
@@ -108,6 +112,22 @@ export class HarnessExecutor implements AgentExecutor {
           tools: availableTools,
           maxTokens: DEFAULT_MAX_TOKENS,
           timeoutSeconds: remainingMs / 1000
+        });
+        const modelEnd = Date.now();
+
+        const cost = getModelCost(this.options.provider.name, task.model ?? this.options.defaultModel);
+        ledger.recordModelCall({
+          provider: this.options.provider.name,
+          model: task.model ?? this.options.defaultModel,
+          agentType: task.type,
+          tokens: {
+            input: response.usage.input,
+            output: response.usage.output
+          },
+          latencyMs: modelEnd - modelStart,
+          timestamp: modelStart,
+          retryAttempt: 0,
+          estimatedCost: ((response.usage.input * cost.input) + (response.usage.output * cost.output)) / 1_000_000
         });
 
         tokenInput += response.usage.input;
@@ -133,11 +153,13 @@ export class HarnessExecutor implements AgentExecutor {
 
               if (mcpClient && mcpToolNames.has(toolUse.name)) {
                 toolStarted = true;
+                const toolStart = Date.now();
                 const mcpResult = await mcpClient.callTool(
                   { name: toolUse.name, arguments: toolUse.input as Record<string, unknown> },
                   undefined,
                   { timeout: toolRemainingMs }
                 );
+                const toolEnd = Date.now();
                 const contentArray = (mcpResult.content || []) as any[];
                 const extractText = (c: any) => {
                   if (c.type === "text") return c.text ?? "";
@@ -149,9 +171,22 @@ export class HarnessExecutor implements AgentExecutor {
                 } else {
                   result = contentArray.map(extractText).join("\n");
                 }
+                
+                const rawOutputBytes = Buffer.byteLength(String(result), 'utf8');
+                const serialized = serializeToolResult(result);
+                const truncatedOutputBytes = Buffer.byteLength(serialized, 'utf8');
+                
+                ledger.recordToolCall({
+                  toolName: toolUse.name,
+                  status: mcpResult.isError ? "error" : "success",
+                  latencyMs: toolEnd - toolStart,
+                  rawOutputBytes,
+                  truncatedOutputBytes
+                });
               } else {
                 tool = this.options.tools.get(toolUse.name);
                 toolStarted = true;
+                const toolStart = Date.now();
                 result = await tool.execute(toolUse.input, task.workspace, {
                   environment: task.environment,
                   deadlineMs,
@@ -160,10 +195,35 @@ export class HarnessExecutor implements AgentExecutor {
                     if (!loadedSkills.includes(name)) loadedSkills.push(name);
                   }
                 });
+                const toolEnd = Date.now();
+                
+                const rawOutputBytes = Buffer.byteLength(String(result), 'utf8');
+                const serialized = serializeToolResult(result);
+                const truncatedOutputBytes = Buffer.byteLength(serialized, 'utf8');
+                
+                ledger.recordToolCall({
+                  toolName: toolUse.name,
+                  status: result instanceof Error ? "error" : "success",
+                  latencyMs: toolEnd - toolStart,
+                  rawOutputBytes,
+                  truncatedOutputBytes
+                });
               }
             } catch (error) {
               if (isTimeoutError(error)) throw error;
               result = error instanceof Error ? error : new Error(String(error));
+              
+              if (toolStarted && !mcpToolNames.has(toolUse.name)) {
+                  // We hit a throw during the tool execution, record failure
+                  const serialized = serializeToolResult(result);
+                  ledger.recordToolCall({
+                    toolName: toolUse.name,
+                    status: "error",
+                    latencyMs: Date.now(), // Approximate as we don't know exact start outside block
+                    rawOutputBytes: Buffer.byteLength(String(result), 'utf8'),
+                    truncatedOutputBytes: Buffer.byteLength(serialized, 'utf8')
+                  });
+              }
             } finally {
               if (tool && toolStarted) recordToolStat(toolStats, statsBucketForTool(tool));
             }
@@ -188,20 +248,24 @@ export class HarnessExecutor implements AgentExecutor {
         }
 
         if (isTerminalStop(response.stopReason)) {
-          return await finalize(task, start, tokenInput, tokenOutput, toolStats, transcript());
+          return await finalize(task, start, tokenInput, tokenOutput, toolStats, transcript(), ledger);
         }
       }
 
+      await flushTelemetry(task.workspace, ledger).catch(() => {});
       return {
         status: "FAILED",
         artifacts: [],
         blockReason: `Exceeded maximum harness iterations (${MAX_TOOL_ITERATIONS})`,
-        metrics: elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+        metrics: {
+          ...elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+          telemetry: { ...ledger.getSummary(), events: ledger.getEvents() }
+        },
         transcript: transcript()
       };
     } catch (error) {
       if (isTimeoutError(error)) {
-        return timeoutResult(start, tokenInput, tokenOutput, toolStats, transcript());
+        return timeoutResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger);
       }
       const message = error instanceof Error ? error.message : String(error);
       turns.push({
@@ -210,11 +274,15 @@ export class HarnessExecutor implements AgentExecutor {
         message,
         stack: error instanceof Error ? error.stack : undefined
       });
+      await flushTelemetry(task.workspace, ledger).catch(() => {});
       return {
         status: "FAILED",
         artifacts: [],
         blockReason: message,
-        metrics: elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+        metrics: {
+          ...elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+          telemetry: { ...ledger.getSummary(), events: ledger.getEvents() }
+        },
         transcript: transcript()
       };
     } finally {
@@ -309,15 +377,25 @@ async function finalize(
   tokenInput: number,
   tokenOutput: number,
   toolStats: ToolStats,
-  transcript: AgentTranscript
+  transcript: AgentTranscript,
+  ledger: TelemetryLedger
 ): Promise<AgentResult> {
   const statusFile = await readStatusFileFromWorkspace(task.workspace);
+  await flushTelemetry(task.workspace, ledger).catch(() => {});
+  const telemetry = {
+    ...ledger.getSummary(),
+    events: ledger.getEvents()
+  };
+
   if (!statusFile) {
     return {
       status: "DONE_WITH_CONCERNS",
       artifacts: [],
       concerns: "Agent did not write .autoforge-status.json",
-      metrics: elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+      metrics: {
+        ...elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+        telemetry
+      },
       transcript
     };
   }
@@ -327,18 +405,24 @@ async function finalize(
     concerns: statusFile.concerns,
     blockReason: statusFile.blockReason,
     output: statusFile,
-    metrics: elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+    metrics: {
+      ...elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
+      telemetry
+    },
     transcript
   };
 }
 
 function timeoutResult(
+  workspace: import("./workspace").Workspace,
   start: number,
   tokenInput: number,
   tokenOutput: number,
   toolStats: ToolStats,
-  transcript: AgentTranscript
+  transcript: AgentTranscript,
+  ledger: TelemetryLedger
 ): AgentResult {
+  flushTelemetry(workspace, ledger).catch(() => {});
   return {
     status: "TIMEOUT",
     artifacts: [],
@@ -346,7 +430,8 @@ function timeoutResult(
       elapsedSeconds: (Date.now() - start) / 1000,
       tokenInput,
       tokenOutput,
-      toolStats
+      toolStats,
+      telemetry: { ...ledger.getSummary(), events: ledger.getEvents() }
     },
     transcript
   };
@@ -382,4 +467,14 @@ function isTimeoutError(error: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function flushTelemetry(workspace: import("./workspace").Workspace, ledger: TelemetryLedger): Promise<void> {
+  const summary = ledger.getSummary();
+  const events = ledger.getEvents();
+  const payload = {
+    ...summary,
+    events
+  };
+  await workspace.writeFile(".autoforge-telemetry.json", JSON.stringify(payload, null, 2));
 }

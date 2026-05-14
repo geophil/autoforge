@@ -531,6 +531,60 @@ describe("HarnessExecutor", () => {
     expect(toolRan).toBe(false);
     expect(result.metrics.toolStats?.readCount).toBe(0);
   });
+
+  test("generates and persists telemetry data to workspace and metrics", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-telemetry" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "tool-telemetry", name: "write_status", input: { status: "DONE" } }],
+        usage: { input: 10, output: 20 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 30, output: 40 }
+      }
+    ]);
+
+    const tools = new ToolRegistry().register({
+      name: "write_status",
+      description: "Write the Autoforge status file.",
+      inputSchema: { type: "object", properties: { status: { type: "string" } }, required: ["status"] },
+      execute: async (input, toolWorkspace: Workspace) => {
+        await toolWorkspace.writeFile(".autoforge-status.json", JSON.stringify({ status: input.status, artifacts: [] }));
+        return { ok: true };
+      }
+    });
+
+    const executor = new HarnessExecutor({ provider, tools, defaultModel: "claude-3-5-sonnet-20241022" });
+
+    const result = await executor.execute({
+      id: "task-telemetry",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    
+    // Telemetry metric check
+    expect(result.metrics.telemetry).toBeDefined();
+    expect(result.metrics.telemetry?.totalTokens.input).toBe(40); // 10 + 30
+    expect(result.metrics.telemetry?.totalTokens.output).toBe(60); // 20 + 40
+    expect(result.metrics.telemetry?.events.models.length).toBe(2);
+    expect(result.metrics.telemetry?.events.tools.length).toBe(1);
+
+    // Workspace file check
+    const telemetryFileContent = await workspace.readFile(".autoforge-telemetry.json").catch(() => null);
+    expect(telemetryFileContent).not.toBeNull();
+    const parsed = JSON.parse(telemetryFileContent!);
+    expect(parsed.totalTokens.input).toBe(40);
+  });
 });
 
 describe("serializeToolResult bounds", () => {
