@@ -9,6 +9,8 @@ import type {
 import { buildStatusReportingPrompt, loadSkillFiles, readStatusFileFromWorkspace } from "../executors/status-convention";
 import type { ModelContentBlock, ModelMessage, ModelProvider } from "./model-provider";
 import { statsBucketForTool, ToolRegistry } from "./tool-registry";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_TOOL_ITERATIONS = 50;
@@ -35,6 +37,30 @@ export class HarnessExecutor implements AgentExecutor {
     let tokenInput = 0;
     let tokenOutput = 0;
 
+    let mcpClient: Client | null = null;
+    let availableTools = this.options.tools.definitions();
+    const mcpToolNames = new Set<string>();
+
+    if (task.environment.QMD_MCP_URL) {
+      mcpClient = new Client({ name: "autoforge-agent", version: "0.1.0" }, { capabilities: {} });
+      try {
+        const transport = new StreamableHTTPClientTransport(new URL(task.environment.QMD_MCP_URL));
+        await mcpClient.connect(transport);
+        const { tools: mcpTools } = await mcpClient.listTools();
+        const mcpDefs = mcpTools.map(t => ({
+          name: t.name,
+          description: t.description ?? "",
+          inputSchema: t.inputSchema
+        }));
+        for (const t of mcpDefs) mcpToolNames.add(t.name);
+        availableTools = [...availableTools, ...mcpDefs];
+      } catch (err) {
+        console.warn(`[harness] Failed to connect to QMD_MCP_URL: ${err}`);
+        try { await mcpClient.close(); } catch {}
+        mcpClient = null;
+      }
+    }
+
     const transcript = (): AgentTranscript => ({
       systemPrompt,
       userPrompt: task.prompt,
@@ -55,7 +81,7 @@ export class HarnessExecutor implements AgentExecutor {
           model: task.model ?? this.options.defaultModel,
           systemPrompt,
           history: snapshotHistory(history),
-          tools: this.options.tools.definitions(),
+          tools: availableTools,
           maxTokens: DEFAULT_MAX_TOKENS,
           timeoutSeconds: remainingMs / 1000
         });
@@ -74,22 +100,43 @@ export class HarnessExecutor implements AgentExecutor {
             let toolStarted = false;
             let result: unknown;
             try {
-              tool = this.options.tools.get(toolUse.name);
               const toolRemainingMs = deadlineMs - Date.now();
               if (toolRemainingMs <= 0) {
                 const error = new Error("Task budget exhausted before tool execution");
                 error.name = "AbortError";
                 throw error;
               }
-              toolStarted = true;
-              result = await tool.execute(toolUse.input, task.workspace, {
-                environment: task.environment,
-                deadlineMs,
-                timeoutSeconds: toolRemainingMs / 1000,
-                recordLoadedSkill: (name) => {
-                  if (!loadedSkills.includes(name)) loadedSkills.push(name);
+
+              if (mcpClient && mcpToolNames.has(toolUse.name)) {
+                toolStarted = true;
+                const mcpResult = await mcpClient.callTool(
+                  { name: toolUse.name, arguments: toolUse.input as Record<string, unknown> },
+                  undefined,
+                  { timeout: toolRemainingMs }
+                );
+                const contentArray = (mcpResult.content || []) as any[];
+                const extractText = (c: any) => {
+                  if (c.type === "text") return c.text ?? "";
+                  if (c.type === "resource" && c.resource) return c.resource.text ?? "";
+                  return JSON.stringify(c);
+                };
+                if (mcpResult.isError) {
+                  result = new Error(contentArray.map(extractText).join("\n"));
+                } else {
+                  result = contentArray.map(extractText).join("\n");
                 }
-              });
+              } else {
+                tool = this.options.tools.get(toolUse.name);
+                toolStarted = true;
+                result = await tool.execute(toolUse.input, task.workspace, {
+                  environment: task.environment,
+                  deadlineMs,
+                  timeoutSeconds: toolRemainingMs / 1000,
+                  recordLoadedSkill: (name) => {
+                    if (!loadedSkills.includes(name)) loadedSkills.push(name);
+                  }
+                });
+              }
             } catch (error) {
               if (isTimeoutError(error)) throw error;
               result = error instanceof Error ? error : new Error(String(error));
@@ -146,6 +193,10 @@ export class HarnessExecutor implements AgentExecutor {
         metrics: elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
         transcript: transcript()
       };
+    } finally {
+      if (mcpClient) {
+        try { await mcpClient.close(); } catch {}
+      }
     }
   }
 
@@ -292,6 +343,7 @@ function recordToolStat(stats: ToolStats, bucket: ReturnType<typeof statsBucketF
 function isTimeoutError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
+  if (message.includes("must be an integer")) return false;
   return (
     error.name === "AbortError" ||
     message.includes("timeout") ||

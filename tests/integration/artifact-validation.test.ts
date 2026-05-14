@@ -38,10 +38,11 @@ describe("artifact-to-diff validation", () => {
     const subtaskDone = events.find((e) => e.type === "subtask_done");
     expect(subtaskDone).toBeDefined();
     expect(subtaskDone!.status).toBe("done_with_concerns");
-    expect(subtaskDone!.payload.artifact_validation).toBeDefined();
-    expect(subtaskDone!.payload.artifact_validation.status).toBe("mismatch");
-    expect(subtaskDone!.payload.artifact_validation.missing_reported).toContain("src/expected.ts");
-    expect(subtaskDone!.payload.artifact_validation.unexpected_changed).toContain("src/actual.ts");
+    const subtaskDonePayload = subtaskDone!.payload as any;
+    expect(subtaskDonePayload.artifact_validation).toBeDefined();
+    expect(subtaskDonePayload.artifact_validation.status).toBe("mismatch");
+    expect(subtaskDonePayload.artifact_validation.missing_reported).toContain("src/expected.ts");
+    expect(subtaskDonePayload.artifact_validation.unexpected_changed).toContain("src/actual.ts");
   });
 
   test("keeps subtask_done as done when artifacts match changed files", async () => {
@@ -80,8 +81,9 @@ describe("artifact-to-diff validation", () => {
     const subtaskDone = events.find((e) => e.type === "subtask_done");
     expect(subtaskDone).toBeDefined();
     expect(subtaskDone!.status).toBe("done");
-    expect(subtaskDone!.payload.artifact_validation).toBeDefined();
-    expect(subtaskDone!.payload.artifact_validation.status).toBe("ok");
-    expect(subtaskDone!.payload.artifact_validation.mismatch_ratio).toBe(0);
+    const subtaskDonePayload2 = subtaskDone!.payload as any;
+    expect(subtaskDonePayload2.artifact_validation).toBeDefined();
+    expect(subtaskDonePayload2.artifact_validation.status).toBe("ok");
+    expect(subtaskDonePayload2.artifact_validation.mismatch_ratio).toBe(0);
   });
 });
