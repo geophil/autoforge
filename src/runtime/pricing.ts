@@ -1,31 +1,19 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import pricing from "./pricing.json";
 
 export interface ModelCost {
-  input: number; // cost per 1M tokens
-  output: number; // cost per 1M tokens
-  cached: number; // cost per 1M tokens
+  /** USD per 1M uncached input tokens. */
+  input: number;
+  /** USD per 1M output tokens. */
+  output: number;
+  /** USD per 1M cache-read input tokens. */
+  cached: number;
 }
 
-let pricingCache: Record<string, Record<string, ModelCost>> | null = null;
+type PricingConfig = Record<string, Record<string, ModelCost>>;
 
-export function loadPricingConfig(): void {
-  try {
-    const filePath = join(__dirname, "pricing.json");
-    const content = readFileSync(filePath, "utf-8");
-    pricingCache = JSON.parse(content);
-  } catch (error) {
-    console.warn("[pricing] Failed to load pricing.json. Falling back to zero-costs.", error);
-    pricingCache = {};
-  }
-}
+const pricingConfig = pricing as PricingConfig;
+const ZERO_COST: ModelCost = { input: 0, output: 0, cached: 0 };
 
 export function getModelCost(provider: string, model: string): ModelCost {
-  if (!pricingCache) loadPricingConfig();
-  
-  const providerData = pricingCache?.[provider];
-  if (providerData && providerData[model]) {
-    return providerData[model];
-  }
-  return { input: 0, output: 0, cached: 0 };
+  return pricingConfig[provider]?.[model] ?? ZERO_COST;
 }

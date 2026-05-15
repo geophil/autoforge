@@ -1,5 +1,6 @@
 import type { AgentType, SubtaskReportStatus } from "../types/core";
 import type { Workspace } from "../runtime/workspace";
+import type { ModelCallEvent, TelemetrySummary, ToolCallEvent } from "./telemetry";
 
 export interface AgentTask {
   id: string;
@@ -55,6 +56,13 @@ export interface AgentTranscript {
   loadedSkills?: string[];
 }
 
+export interface TelemetryMetrics extends TelemetrySummary {
+  events: {
+    models: ModelCallEvent[];
+    tools: ToolCallEvent[];
+  };
+}
+
 export interface AgentResult {
   status: SubtaskReportStatus | "FAILED" | "TIMEOUT";
   artifacts: string[];
@@ -74,7 +82,7 @@ export interface AgentResult {
     tokenOutput?: number;
     estimatedCost?: number;
     toolStats?: ToolStats;
-    telemetry?: import("./telemetry").TelemetrySummary & { events: { models: import("./telemetry").ModelCallEvent[]; tools: import("./telemetry").ToolCallEvent[] } };
+    telemetry?: TelemetryMetrics;
   };
   /** Captured by SDK executor. Claude Code returns undefined. */
   transcript?: AgentTranscript;

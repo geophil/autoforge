@@ -49,7 +49,7 @@ describe("AnthropicProvider", () => {
     expect(response).toEqual({
       stopReason: "tool_use",
       content: [{ type: "tool_use", id: "tu_1", name: "read_file", input: { path: "a.txt" } }],
-      usage: { input: 3, output: 5 }
+      usage: { input: 3, output: 5, cached: 0, cacheCreation: 0 }
     });
   });
 
@@ -100,5 +100,35 @@ describe("AnthropicProvider", () => {
 
     expect(captured.params.messages[0].content[0].cache_control).toEqual({ type: "ephemeral" });
     expect(captured.params.messages[2].content[0].cache_control).toBeUndefined();
+  });
+
+  test("maps Anthropic cache usage into provider usage", async () => {
+    const provider = new AnthropicProvider({
+      apiKey: "test-key",
+      createMessage: async () => ({
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: {
+          input_tokens: 100,
+          output_tokens: 25,
+          cache_read_input_tokens: 80,
+          cache_creation_input_tokens: 20
+        }
+      } as any)
+    });
+
+    const response = await provider.message({
+      model: "claude-3-5-sonnet-20241022",
+      systemPrompt: "system",
+      history: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      tools: []
+    });
+
+    expect(response.usage).toEqual({
+      input: 100,
+      output: 25,
+      cached: 80,
+      cacheCreation: 20
+    });
   });
 });

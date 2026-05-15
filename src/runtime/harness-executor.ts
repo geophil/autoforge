@@ -101,7 +101,7 @@ export class HarnessExecutor implements AgentExecutor {
       for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
         const remainingMs = deadlineMs - Date.now();
         if (remainingMs <= 0) {
-          return timeoutResult(start, tokenInput, tokenOutput, toolStats, transcript());
+          return timeoutResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger);
         }
 
         const modelStart = Date.now();
@@ -116,18 +116,25 @@ export class HarnessExecutor implements AgentExecutor {
         const modelEnd = Date.now();
 
         const cost = getModelCost(this.options.provider.name, task.model ?? this.options.defaultModel);
+        const cachedTokens = response.usage.cached ?? 0;
+        const billableInputTokens = Math.max(response.usage.input - cachedTokens, 0);
         ledger.recordModelCall({
           provider: this.options.provider.name,
           model: task.model ?? this.options.defaultModel,
           agentType: task.type,
           tokens: {
             input: response.usage.input,
-            output: response.usage.output
+            output: response.usage.output,
+            cached: cachedTokens
           },
           latencyMs: modelEnd - modelStart,
           timestamp: modelStart,
           retryAttempt: 0,
-          estimatedCost: ((response.usage.input * cost.input) + (response.usage.output * cost.output)) / 1_000_000
+          estimatedCost: (
+            (billableInputTokens * cost.input) +
+            (cachedTokens * cost.cached) +
+            (response.usage.output * cost.output)
+          ) / 1_000_000
         });
 
         tokenInput += response.usage.input;
@@ -141,8 +148,9 @@ export class HarnessExecutor implements AgentExecutor {
           const toolResults: ModelContentBlock[] = [];
           for (const toolUse of toolUsesIn(responseContent)) {
             let tool: ReturnType<ToolRegistry["get"]> | null = null;
-            let toolStarted = false;
             let result: unknown;
+            const toolStart = Date.now();
+            let toolStatus: "success" | "error" = "success";
             try {
               const toolRemainingMs = deadlineMs - Date.now();
               if (toolRemainingMs <= 0) {
@@ -152,14 +160,11 @@ export class HarnessExecutor implements AgentExecutor {
               }
 
               if (mcpClient && mcpToolNames.has(toolUse.name)) {
-                toolStarted = true;
-                const toolStart = Date.now();
                 const mcpResult = await mcpClient.callTool(
                   { name: toolUse.name, arguments: toolUse.input as Record<string, unknown> },
                   undefined,
                   { timeout: toolRemainingMs }
                 );
-                const toolEnd = Date.now();
                 const contentArray = (mcpResult.content || []) as any[];
                 const extractText = (c: any) => {
                   if (c.type === "text") return c.text ?? "";
@@ -167,26 +172,13 @@ export class HarnessExecutor implements AgentExecutor {
                   return JSON.stringify(c);
                 };
                 if (mcpResult.isError) {
+                  toolStatus = "error";
                   result = new Error(contentArray.map(extractText).join("\n"));
                 } else {
                   result = contentArray.map(extractText).join("\n");
                 }
-                
-                const rawOutputBytes = Buffer.byteLength(String(result), 'utf8');
-                const serialized = serializeToolResult(result);
-                const truncatedOutputBytes = Buffer.byteLength(serialized, 'utf8');
-                
-                ledger.recordToolCall({
-                  toolName: toolUse.name,
-                  status: mcpResult.isError ? "error" : "success",
-                  latencyMs: toolEnd - toolStart,
-                  rawOutputBytes,
-                  truncatedOutputBytes
-                });
               } else {
                 tool = this.options.tools.get(toolUse.name);
-                toolStarted = true;
-                const toolStart = Date.now();
                 result = await tool.execute(toolUse.input, task.workspace, {
                   environment: task.environment,
                   deadlineMs,
@@ -195,48 +187,32 @@ export class HarnessExecutor implements AgentExecutor {
                     if (!loadedSkills.includes(name)) loadedSkills.push(name);
                   }
                 });
-                const toolEnd = Date.now();
-                
-                const rawOutputBytes = Buffer.byteLength(String(result), 'utf8');
-                const serialized = serializeToolResult(result);
-                const truncatedOutputBytes = Buffer.byteLength(serialized, 'utf8');
-                
-                ledger.recordToolCall({
-                  toolName: toolUse.name,
-                  status: result instanceof Error ? "error" : "success",
-                  latencyMs: toolEnd - toolStart,
-                  rawOutputBytes,
-                  truncatedOutputBytes
-                });
+                if (result instanceof Error) toolStatus = "error";
               }
             } catch (error) {
               if (isTimeoutError(error)) throw error;
+              toolStatus = "error";
               result = error instanceof Error ? error : new Error(String(error));
-              
-              if (toolStarted && !mcpToolNames.has(toolUse.name)) {
-                  // We hit a throw during the tool execution, record failure
-                  const serialized = serializeToolResult(result);
-                  ledger.recordToolCall({
-                    toolName: toolUse.name,
-                    status: "error",
-                    latencyMs: Date.now(), // Approximate as we don't know exact start outside block
-                    rawOutputBytes: Buffer.byteLength(String(result), 'utf8'),
-                    truncatedOutputBytes: Buffer.byteLength(serialized, 'utf8')
-                  });
-              }
             } finally {
-              if (tool && toolStarted) recordToolStat(toolStats, statsBucketForTool(tool));
+              if (tool) recordToolStat(toolStats, statsBucketForTool(tool));
             }
-            const serialized = serializeToolResult(result);
+            const serialized = serializeToolResultDetailed(result);
+            ledger.recordToolCall({
+              toolName: toolUse.name,
+              status: toolStatus,
+              latencyMs: Date.now() - toolStart,
+              rawOutputBytes: Buffer.byteLength(serialized.raw, "utf8"),
+              truncatedOutputBytes: Buffer.byteLength(serialized.bounded, "utf8")
+            });
             toolResults.push({
               type: "tool_result",
               tool_use_id: toolUse.id,
-              content: serialized
+              content: serialized.bounded
             });
             turns.push({
               kind: "tool_result",
               toolUseId: toolUse.id,
-              content: serialized
+              content: serialized.bounded
             });
           }
           history.push({ role: "user", content: toolResults });
@@ -259,7 +235,7 @@ export class HarnessExecutor implements AgentExecutor {
         blockReason: `Exceeded maximum harness iterations (${MAX_TOOL_ITERATIONS})`,
         metrics: {
           ...elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
-          telemetry: { ...ledger.getSummary(), events: ledger.getEvents() }
+          telemetry: telemetryMetrics(ledger)
         },
         transcript: transcript()
       };
@@ -281,7 +257,7 @@ export class HarnessExecutor implements AgentExecutor {
         blockReason: message,
         metrics: {
           ...elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
-          telemetry: { ...ledger.getSummary(), events: ledger.getEvents() }
+          telemetry: telemetryMetrics(ledger)
         },
         transcript: transcript()
       };
@@ -328,7 +304,12 @@ function snapshotHistory(history: ModelMessage[]): ModelMessage[] {
   }));
 }
 
-export function serializeToolResult(result: unknown): string {
+interface SerializedToolResult {
+  raw: string;
+  bounded: string;
+}
+
+export function serializeToolResultDetailed(result: unknown): SerializedToolResult {
   let raw: string;
   if (result === undefined || result === null) raw = "(empty result)";
   else if (typeof result === "string") raw = result;
@@ -342,7 +323,11 @@ export function serializeToolResult(result: unknown): string {
       raw = "[unserializable tool result]";
     }
   }
-  return boundSerializedToolResult(raw);
+  return { raw, bounded: boundSerializedToolResult(raw) };
+}
+
+export function serializeToolResult(result: unknown): string {
+  return serializeToolResultDetailed(result).bounded;
 }
 
 function snapshotContent(content: ModelContentBlock[]): ModelContentBlock[] {
@@ -382,10 +367,7 @@ async function finalize(
 ): Promise<AgentResult> {
   const statusFile = await readStatusFileFromWorkspace(task.workspace);
   await flushTelemetry(task.workspace, ledger).catch(() => {});
-  const telemetry = {
-    ...ledger.getSummary(),
-    events: ledger.getEvents()
-  };
+  const telemetry = telemetryMetrics(ledger);
 
   if (!statusFile) {
     return {
@@ -431,9 +413,16 @@ function timeoutResult(
       tokenInput,
       tokenOutput,
       toolStats,
-      telemetry: { ...ledger.getSummary(), events: ledger.getEvents() }
+      telemetry: telemetryMetrics(ledger)
     },
     transcript
+  };
+}
+
+function telemetryMetrics(ledger: TelemetryLedger): NonNullable<AgentResult["metrics"]["telemetry"]> {
+  return {
+    ...ledger.getSummary(),
+    events: ledger.getEvents()
   };
 }
 

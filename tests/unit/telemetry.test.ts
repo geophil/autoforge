@@ -33,4 +33,25 @@ describe("TelemetryLedger", () => {
     expect(summary.toolOutputContributionBytes).toBe(1500);
     expect(summary.retryCount).toBe(0);
   });
+
+  test("aggregates cached tokens separately in the summary", () => {
+    const ledger = new TelemetryLedger();
+
+    ledger.recordModelCall({
+      provider: "anthropic",
+      model: "claude-3-5-sonnet-20241022",
+      agentType: "coder",
+      tokens: { input: 1000, output: 200, cached: 750 },
+      latencyMs: 10,
+      timestamp: 1,
+      retryAttempt: 0,
+      estimatedCost: 0.006225
+    });
+
+    expect(ledger.getSummary().totalTokens).toEqual({
+      input: 1000,
+      output: 200,
+      cached: 750
+    });
+  });
 });

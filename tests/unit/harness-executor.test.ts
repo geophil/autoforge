@@ -12,7 +12,7 @@ import type { ToolExecutionContext } from "../../src/runtime/tool-registry";
 import { createRuntimeToolRegistry } from "../../src/runtime/tools";
 
 class ScriptedProvider implements ModelProvider {
-  readonly name = "scripted";
+  readonly name: string = "scripted";
   readonly supportedModels = ["test-model"];
   readonly calls: Array<{ history: ModelMessage[]; tools: string[]; timeoutSeconds?: number }> = [];
 
@@ -88,6 +88,42 @@ describe("HarnessExecutor", () => {
     });
   });
 
+  test("uses cached token pricing when provider reports cached input tokens", async () => {
+    class AnthropicScriptedProvider extends ScriptedProvider {
+      readonly name = "anthropic";
+    }
+
+    const workspace = new MockWorkspace({
+      id: "workspace-cached-telemetry",
+      files: { ".autoforge-status.json": JSON.stringify({ status: "DONE", artifacts: [] }) }
+    });
+    const provider = new AnthropicScriptedProvider([
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1000, output: 100, cached: 750 }
+      }
+    ] as any);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: new ToolRegistry(),
+      defaultModel: "claude-3-5-sonnet-20241022"
+    }).execute({
+      id: "task-cached-telemetry",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.metrics.telemetry?.totalTokens.cached).toBe(750);
+    expect(result.metrics.telemetry?.events.models[0].estimatedCost).toBeCloseTo(0.002475);
+  });
+
   test("returns DONE_WITH_CONCERNS when the model ends without a status file", async () => {
     const provider = new ScriptedProvider([
       {
@@ -151,6 +187,8 @@ describe("HarnessExecutor", () => {
     expect(result.status).toBe("TIMEOUT");
     expect(result.metrics.elapsedSeconds).toBeGreaterThanOrEqual(0);
     expect(result.metrics.elapsedSeconds).toBeLessThan(5);
+    expect(result.metrics.telemetry).toBeDefined();
+    expect(result.metrics.telemetry?.events.models.length).toBe(0);
   });
 
   test("treats pause_turn as a terminal model stop", async () => {
@@ -491,6 +529,92 @@ describe("HarnessExecutor", () => {
     });
   });
 
+  test("records raw and bounded byte counts from serialized tool output", async () => {
+    const largePayload = { text: "x".repeat(MAX_TOOL_RESULT_CHARS + 1000) };
+    const workspace = new MockWorkspace({ id: "workspace-tool-bytes" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "large-tool", name: "large_result", input: {} }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-tool", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+    const tools = createRuntimeToolRegistry().register({
+      name: "large_result",
+      description: "Return a large JSON payload.",
+      inputSchema: { type: "object", properties: {} },
+      execute: async () => largePayload
+    });
+
+    const result = await new HarnessExecutor({ provider, tools, defaultModel: "test-model" }).execute({
+      id: "task-tool-bytes",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    const event = result.metrics.telemetry?.events.tools.find((tool) => tool.toolName === "large_result");
+    expect(event?.rawOutputBytes).toBe(Buffer.byteLength(JSON.stringify(largePayload), "utf8"));
+    expect(event?.truncatedOutputBytes).toBeLessThanOrEqual(MAX_TOOL_RESULT_CHARS);
+  });
+
+  test("records recoverable unknown tool errors as tool telemetry errors", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-unknown-tool-telemetry" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "missing-tool", name: "missing_tool", input: {} }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-after-error", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-unknown-tool-telemetry",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.metrics.telemetry?.events.tools).toContainEqual(expect.objectContaining({
+      toolName: "missing_tool",
+      status: "error",
+      rawOutputBytes: Buffer.byteLength("Error: Unknown tool: missing_tool", "utf8"),
+      truncatedOutputBytes: Buffer.byteLength("Error: Unknown tool: missing_tool", "utf8")
+    }));
+  });
+
   test("does not start tool execution after the task deadline expires", async () => {
     let toolRan = false;
     const provider: ModelProvider = {
@@ -530,6 +654,39 @@ describe("HarnessExecutor", () => {
     expect(result.status).toBe("TIMEOUT");
     expect(toolRan).toBe(false);
     expect(result.metrics.toolStats?.readCount).toBe(0);
+  });
+
+  test("includes telemetry when maximum harness iterations are exceeded", async () => {
+    const provider: ModelProvider = {
+      name: "loop-provider",
+      supportedModels: ["test-model"],
+      async message() {
+        return {
+          stopReason: "tool_use",
+          content: [],
+          usage: { input: 1, output: 1 }
+        };
+      }
+    };
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: new ToolRegistry(),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-max-iterations",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace: new MockWorkspace({ id: "workspace-max-iterations" }),
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("FAILED");
+    expect(result.blockReason).toContain("Exceeded maximum harness iterations");
+    expect(result.metrics.telemetry?.events.models.length).toBe(50);
   });
 
   test("generates and persists telemetry data to workspace and metrics", async () => {
