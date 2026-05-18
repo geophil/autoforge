@@ -5,7 +5,12 @@ type MessageCreate = (
   params: Anthropic.MessageCreateParamsNonStreaming,
   options: { timeout: number; signal: AbortSignal }
 ) => Promise<{
-  usage: { input_tokens: number; output_tokens: number };
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
   stop_reason: string | null;
   content: unknown[];
 }>;
@@ -63,7 +68,9 @@ export class AnthropicProvider implements ModelProvider {
       content: response.content as ModelContentBlock[],
       usage: {
         input: response.usage.input_tokens,
-        output: response.usage.output_tokens
+        output: response.usage.output_tokens,
+        cached: response.usage.cache_read_input_tokens ?? 0,
+        cacheCreation: response.usage.cache_creation_input_tokens ?? 0
       }
     };
   }

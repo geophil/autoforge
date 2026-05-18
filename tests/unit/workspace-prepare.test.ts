@@ -5,13 +5,28 @@ import { join } from "node:path";
 import * as cp from "node:child_process";
 import { prepareTaskWorkspace } from "../../src/runtime/workspace-prepare";
 
+/** Matches spawnSync(..., { encoding: "utf8" }) shape used by prepareTaskWorkspace. */
+function mockSpawnSuccessUtf8(): cp.SpawnSyncReturns<string> {
+  return {
+    pid: 1,
+    output: [],
+    stdout: "",
+    stderr: "",
+    status: 0,
+    signal: null,
+    error: undefined
+  };
+}
+
 describe("prepareTaskWorkspace", () => {
   test("default install omits --ignore-scripts", () => {
     const prev = process.env.WORKSPACE_INSTALL_IGNORE_SCRIPTS;
     delete process.env.WORKSPACE_INSTALL_IGNORE_SCRIPTS;
     const dir = mkdtempSync(join(tmpdir(), "ws-prepare-"));
     writeFileSync(join(dir, "bun.lock"), "");
-    const spy = spyOn(cp, "spawnSync").mockImplementation(() => ({ status: 0, stderr: "", stdout: "" }) as ReturnType<typeof cp.spawnSync>);
+    const spy = spyOn(cp, "spawnSync").mockImplementation(
+      (() => mockSpawnSuccessUtf8()) as unknown as typeof cp.spawnSync
+    );
     try {
       prepareTaskWorkspace(dir);
       expect(spy).toHaveBeenCalled();
@@ -30,7 +45,9 @@ describe("prepareTaskWorkspace", () => {
     process.env.WORKSPACE_INSTALL_IGNORE_SCRIPTS = "1";
     const dir = mkdtempSync(join(tmpdir(), "ws-prepare-"));
     writeFileSync(join(dir, "package-lock.json"), "");
-    const spy = spyOn(cp, "spawnSync").mockImplementation(() => ({ status: 0, stderr: "", stdout: "" }) as ReturnType<typeof cp.spawnSync>);
+    const spy = spyOn(cp, "spawnSync").mockImplementation(
+      (() => mockSpawnSuccessUtf8()) as unknown as typeof cp.spawnSync
+    );
     try {
       prepareTaskWorkspace(dir);
       expect(spy.mock.calls[0][0]).toBe("npm");
