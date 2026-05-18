@@ -87,10 +87,20 @@ export class MockExecutor implements AgentExecutor {
         {
           id: `${task.id}-sub-1`,
           sequence: 1,
+          behavior: "The requested change behaves as described by the task.",
           description: "Implement requested change using TDD.",
           filesInScope: ["src/"],
           dependencies: [],
-          testCriteria: ["All related tests pass."]
+          verificationCommands: ["Run project test suite"],
+          completionEvidence: ["Project test suite output is passing"],
+          testCriteria: ["All related tests pass."],
+          contractProvided: {
+            behavior: true,
+            filesInScope: true,
+            verificationCommands: true,
+            testCriteria: true,
+            completionEvidence: true
+          }
         }
       ];
 

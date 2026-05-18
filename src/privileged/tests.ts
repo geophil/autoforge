@@ -6,6 +6,8 @@ import type { Workspace } from "../runtime/workspace";
 export interface TestRunResult {
   passRate: number;
   output: string;
+  verificationStatus: "passed" | "failed" | "unavailable";
+  runner?: string;
 }
 
 const TEST_TIMEOUT_SECONDS = 120;
@@ -13,7 +15,8 @@ const TEST_TIMEOUT_SECONDS = 120;
 /**
  * Detect the package manager and run the test suite inside the workspace.
  * Returns pass rate 1.0 if all tests pass, < 1.0 if some fail, 0 if the run errors.
- * Falls back to passRate: 1 if no test configuration is found.
+ * Reports verificationStatus: "unavailable" if no test configuration is found,
+ * so higher-risk tasks cannot silently treat missing verification as success.
  *
  * Tests run through `Workspace.exec`, so when WORKSPACE_PROVIDER=docker
  * the suite runs inside the per-task container — agent-mutated test
@@ -26,7 +29,11 @@ export async function runAuthenticatedTests(
 ): Promise<TestRunResult> {
   const runner = detectTestRunner(workingDirectory);
   if (!runner) {
-    return { passRate: 1, output: "(no test configuration detected — skipping)" };
+    return {
+      passRate: 1,
+      output: "(no test configuration detected — verification unavailable)",
+      verificationStatus: "unavailable"
+    };
   }
 
   const result = await collectExecEvents(
@@ -34,12 +41,22 @@ export async function runAuthenticatedTests(
   );
 
   if (result.timedOut) {
-    return { passRate: 0, output: `test run timed out after ${TEST_TIMEOUT_SECONDS}s` };
+    return {
+      passRate: 0,
+      output: `test run timed out after ${TEST_TIMEOUT_SECONDS}s`,
+      verificationStatus: "failed",
+      runner: [runner.cmd, ...runner.args].join(" ")
+    };
   }
 
   const combined = [result.stdout, result.stderr].join("\n").trim();
   const passRate = parsePassRate(combined, result.exitCode);
-  return { passRate, output: combined.slice(0, 4000) };
+  return {
+    passRate,
+    output: combined.slice(0, 4000),
+    verificationStatus: passRate >= 1 ? "passed" : "failed",
+    runner: [runner.cmd, ...runner.args].join(" ")
+  };
 }
 
 function detectTestRunner(cwd: string): { cmd: string; args: string[] } | null {

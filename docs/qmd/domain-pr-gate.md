@@ -18,6 +18,12 @@ if (params.passRate < 1) {
 **Enforced in**: `src/privileged/pr.ts:24`
 **Related config**: `TEST_PASS_THRESHOLD` in `configuration.md` (default 1.0; currently used for test detection fallback, not gate threshold)
 
+### Missing Verification Blocks STANDARD and THOROUGH
+
+If no test configuration is detected, the test runner reports `verificationStatus: "unavailable"` instead of treating the task as verified. EXPRESS tasks may still proceed with unavailable verification, but STANDARD and THOROUGH tasks are rejected by the PR gate with `verification_unavailable`.
+
+This keeps the fast path pragmatic while preventing medium/high-risk work from silently converting "no tests found" into "tests passed."
+
 ### Review Score Below Threshold Blocks PR
 
 ```typescript
@@ -100,11 +106,13 @@ create(taskId: string): WorktreeRef {
 
 Called at the end of `executeAndReview()` in the orchestrator.
 
-1. **Test run**: `runAuthenticatedTests(worktreePath, projectId)` detects the package manager and runs tests.
-2. **Review score**: `reviewScore = unresolvedFindings.length === 0 ? 1 : 0.5`
-3. **Gate check**: `evaluatePrGate({ passRate, reviewScore, thresholdScore, findings })`
-4. **Rejection**: If `!gate.accepted`, task transitions to `failed`.
-5. **Acceptance**: `createPullRequest(payload)` pushes branch and opens PR.
+1. **Test run**: `runAuthenticatedTests(worktreePath, projectId, workspace)` detects the package manager and runs tests inside the task workspace.
+2. **Verification status**: the runner returns `{ passRate, verificationStatus, runner, output }`, where `verificationStatus` is `"passed"`, `"failed"`, or `"unavailable"`.
+3. **Review score**: `reviewScore = unresolvedFindings.length === 0 ? 1 : 0.5`
+4. **Gate check**: `evaluatePrGate({ passRate, verificationStatus, tier, reviewScore, thresholdScore, findings })`
+5. **Rejection**: If `!gate.accepted`, the task pauses in `awaiting_intervention` with `failure_category=pr_gate`.
+6. **Exit check**: if accepted, the orchestrator emits `task_exit_check` before PR creation.
+7. **Acceptance**: `createPullRequest(payload)` pushes branch and opens PR.
 
 ### Test Runner Detection Logic
 
@@ -118,11 +126,11 @@ function detectTestRunner(cwd): { cmd, args } | null {
   // Node: package.json with non-placeholder test script
   // Prefers vitest, then jest, then npm test
   ...
-  return null; // no test config → passRate: 1 (skip)
+  return null; // no test config → verificationStatus: "unavailable"
 }
 ```
 
-If no test configuration is found, `passRate` is returned as `1.0` (skip). This prevents false failures when working on non-JS projects.
+If no test configuration is found, `verificationStatus` is returned as `"unavailable"` with `passRate: 1.0`. The PR gate decides whether that is acceptable based on tier.
 
 **Enforced in**: `src/privileged/tests.ts:38`
 

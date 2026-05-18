@@ -30,6 +30,13 @@ export function buildPlannerPrompt(params: {
   lines.push(
     "If QMD is configured (QMD_MCP_URL present), use it first and emit planningContext.qmdContext evidence in .autoforge-status.json."
   );
+  lines.push(
+    "For every execution-plan subtask, emit: behavior, filesInScope, verificationCommands, testCriteria, and completionEvidence."
+  );
+  lines.push("Keep work-in-progress to one active subtask; do not bundle opportunistic refactors into a feature subtask.");
+  if (params.tier === "THOROUGH") {
+    lines.push("THOROUGH tasks must include at least one runtime, integration, or end-to-end verification command when cross-component behavior is involved.");
+  }
 
   if (params.phase === "execution_plan" && params.approvedSpec) {
     lines.push("");

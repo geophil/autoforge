@@ -5,6 +5,8 @@ describe("pr threshold gate", () => {
   test("accepts fully passing and clean results", () => {
     const result = evaluatePrGate({
       passRate: 1,
+      verificationStatus: "passed",
+      tier: "STANDARD",
       reviewScore: 0.9,
       thresholdScore: 0.7,
       findings: []
@@ -15,6 +17,8 @@ describe("pr threshold gate", () => {
   test("rejects unresolved critical findings", () => {
     const result = evaluatePrGate({
       passRate: 1,
+      verificationStatus: "passed",
+      tier: "STANDARD",
       reviewScore: 0.9,
       thresholdScore: 0.7,
       findings: [
@@ -30,5 +34,30 @@ describe("pr threshold gate", () => {
     });
     expect(result.accepted).toBeFalse();
     expect(result.reason).toBe("critical_findings_unresolved");
+  });
+
+  test("rejects unavailable verification for non-express work", () => {
+    const result = evaluatePrGate({
+      passRate: 1,
+      verificationStatus: "unavailable",
+      tier: "STANDARD",
+      reviewScore: 1,
+      thresholdScore: 0.7,
+      findings: []
+    });
+    expect(result.accepted).toBeFalse();
+    expect(result.reason).toBe("verification_unavailable");
+  });
+
+  test("allows unavailable verification only for express work", () => {
+    const result = evaluatePrGate({
+      passRate: 1,
+      verificationStatus: "unavailable",
+      tier: "EXPRESS",
+      reviewScore: 1,
+      thresholdScore: 0.7,
+      findings: []
+    });
+    expect(result.accepted).toBeTrue();
   });
 });

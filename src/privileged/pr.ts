@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import type { ReviewFinding } from "../types/core";
+import type { ReviewFinding, Tier } from "../types/core";
 
 export interface PrPayload {
   title: string;
@@ -16,10 +16,15 @@ export interface PrGateResult {
 
 export function evaluatePrGate(params: {
   passRate: number;
+  verificationStatus: "passed" | "failed" | "unavailable";
+  tier: Tier;
   reviewScore: number;
   findings: ReviewFinding[];
   thresholdScore: number;
 }): PrGateResult {
+  if (params.verificationStatus === "unavailable" && params.tier !== "EXPRESS") {
+    return { accepted: false, reason: "verification_unavailable" };
+  }
   if (params.passRate < 1) {
     return { accepted: false, reason: "test_pass_rate_below_100" };
   }

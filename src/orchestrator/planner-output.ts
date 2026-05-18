@@ -84,6 +84,39 @@ export function extractBlockingQuestion(output: unknown): string | null {
 }
 
 function extractPlanSubtasksFromOutput(taskId: string, output: unknown, worktreePath?: string): PlanSubtask[] {
+  const normalizeSubtask = (subtask: Partial<PlanSubtask>, index: number): PlanSubtask => {
+    const description = subtask.description ?? `Subtask ${index + 1}`;
+    const testCriteria = subtask.testCriteria ?? [];
+    const contractProvided = {
+      behavior: typeof subtask.behavior === "string" && subtask.behavior.trim().length > 0,
+      filesInScope: Array.isArray(subtask.filesInScope) && subtask.filesInScope.length > 0,
+      verificationCommands: Array.isArray(subtask.verificationCommands) && subtask.verificationCommands.length > 0,
+      testCriteria: Array.isArray(subtask.testCriteria) && subtask.testCriteria.length > 0,
+      completionEvidence: Array.isArray(subtask.completionEvidence) && subtask.completionEvidence.length > 0
+    };
+    const verificationCommands =
+      subtask.verificationCommands && subtask.verificationCommands.length > 0
+        ? subtask.verificationCommands
+        : testCriteria;
+    const completionEvidence =
+      subtask.completionEvidence && subtask.completionEvidence.length > 0
+        ? subtask.completionEvidence
+        : verificationCommands.map((criterion) => `Evidence that passed: ${criterion}`);
+    return {
+      id: subtask.id ?? `${taskId}-subtask-${index + 1}`,
+      sequence: subtask.sequence ?? index + 1,
+      behavior: subtask.behavior ?? description,
+      description,
+      filesInScope: subtask.filesInScope ?? ["src/"],
+      dependencies: subtask.dependencies ?? [],
+      verificationCommands,
+      testCriteria,
+      completionEvidence,
+      contractProvided,
+      agentType: subtask.agentType
+    };
+  };
+
   if (
     output &&
     typeof output === "object" &&
@@ -92,15 +125,7 @@ function extractPlanSubtasksFromOutput(taskId: string, output: unknown, worktree
     (output as { subtasks: unknown[] }).subtasks.length > 0
   ) {
     const subtasks = (output as { subtasks: Array<Partial<PlanSubtask>> }).subtasks;
-    return subtasks.map((subtask, index) => ({
-      id: subtask.id ?? `${taskId}-subtask-${index + 1}`,
-      sequence: subtask.sequence ?? index + 1,
-      description: subtask.description ?? `Subtask ${index + 1}`,
-      filesInScope: subtask.filesInScope ?? ["src/"],
-      dependencies: subtask.dependencies ?? [],
-      testCriteria: subtask.testCriteria ?? ["Tests pass."],
-      agentType: subtask.agentType
-    }));
+    return subtasks.map(normalizeSubtask);
   }
 
   if (worktreePath) {
@@ -110,15 +135,7 @@ function extractPlanSubtasksFromOutput(taskId: string, output: unknown, worktree
         const parsed = JSON.parse(readFileSync(subtasksPath, "utf8"));
         const list = Array.isArray(parsed) ? parsed : parsed?.subtasks;
         if (Array.isArray(list) && list.length > 0) {
-          return (list as Array<Partial<PlanSubtask>>).map((subtask, index) => ({
-            id: subtask.id ?? `${taskId}-subtask-${index + 1}`,
-            sequence: subtask.sequence ?? index + 1,
-            description: subtask.description ?? `Subtask ${index + 1}`,
-            filesInScope: subtask.filesInScope ?? ["src/"],
-            dependencies: subtask.dependencies ?? [],
-            testCriteria: subtask.testCriteria ?? ["Tests pass."],
-            agentType: subtask.agentType
-          }));
+          return (list as Array<Partial<PlanSubtask>>).map(normalizeSubtask);
         }
       }
     } catch {
@@ -134,10 +151,20 @@ function fallbackSubtasks(taskId: string): PlanSubtask[] {
     {
       id: `${taskId}-subtask-1`,
       sequence: 1,
+      behavior: "Requested behavior is implemented and verified.",
       description: "Implement requested behavior with tests-first workflow.",
       filesInScope: ["src/"],
       dependencies: [],
-      testCriteria: ["All tests pass."]
+      verificationCommands: ["Run the project test suite."],
+      completionEvidence: ["Test output shows the project suite passing."],
+      testCriteria: ["All tests pass."],
+      contractProvided: {
+        behavior: true,
+        filesInScope: true,
+        verificationCommands: true,
+        testCriteria: true,
+        completionEvidence: true
+      }
     }
   ];
 }

@@ -49,7 +49,7 @@ function createDispatchTestService(
     worktrees,
     ...(options.useServiceConstructedDispatcher ? {} : { dispatcher }),
     embeddingProvider: options.embeddingProvider,
-    testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
+    testRunner: async () => ({ passRate: 1, output: "mock test runner", verificationStatus: "passed", runner: "mock" }),
     prCreator: async (payload) => `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`
   });
 

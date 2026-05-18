@@ -71,7 +71,7 @@ function createLifecycleService(input: {
     executor: new MockExecutor(input.handlers ?? {}),
     worktrees,
     dispatcher,
-    testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
+    testRunner: async () => ({ passRate: 1, output: "mock test runner", verificationStatus: "passed", runner: "mock" }),
     prCreator: input.prCreator ?? (async (payload) =>
       `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`),
     lifecycleHookRunner: hookRunner

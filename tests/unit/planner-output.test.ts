@@ -73,6 +73,13 @@ describe("parsePlannerStructuredOutput — phase classification", () => {
     expect(parsed.phase).toBe("execution_plan");
     expect(parsed.planSubtasks).toHaveLength(1);
     expect(parsed.planSubtasks[0].description).toBe("Wire endpoint");
+    expect(parsed.planSubtasks[0].contractProvided).toEqual({
+      behavior: false,
+      filesInScope: true,
+      verificationCommands: false,
+      testCriteria: true,
+      completionEvidence: false
+    });
     expect(parsed.planningContext.specRevision).toBe(0);
     expect(parsed.planningContext.planRevision).toBe(0);
     expect(parsed.planningContext.qmdContext).toBeNull();
@@ -273,9 +280,12 @@ describe("isPlannerFallbackOutput", () => {
         {
           id: "x",
           sequence: 1,
+          behavior: "Requested behavior is implemented and verified.",
           description: "Implement requested behavior with tests-first workflow.",
           filesInScope: [],
           dependencies: [],
+          verificationCommands: [],
+          completionEvidence: [],
           testCriteria: []
         }
       ])
@@ -288,9 +298,12 @@ describe("isPlannerFallbackOutput", () => {
         {
           id: "x",
           sequence: 1,
+          behavior: "Wire endpoint",
           description: "Wire the endpoint",
           filesInScope: [],
           dependencies: [],
+          verificationCommands: [],
+          completionEvidence: [],
           testCriteria: []
         }
       ])
@@ -303,17 +316,23 @@ describe("isPlannerFallbackOutput", () => {
         {
           id: "a",
           sequence: 1,
+          behavior: "Requested behavior is implemented and verified.",
           description: "Implement requested behavior with tests-first workflow.",
           filesInScope: [],
           dependencies: [],
+          verificationCommands: [],
+          completionEvidence: [],
           testCriteria: []
         },
         {
           id: "b",
           sequence: 2,
+          behavior: "Requested behavior is implemented and verified.",
           description: "Implement requested behavior with tests-first workflow.",
           filesInScope: [],
           dependencies: [],
+          verificationCommands: [],
+          completionEvidence: [],
           testCriteria: []
         }
       ])

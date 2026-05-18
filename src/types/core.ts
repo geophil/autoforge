@@ -53,10 +53,24 @@ export interface ReviewFinding {
 export interface PlanSubtask {
   id: string;
   sequence: number;
+  /** User-visible behavior this subtask must make true. */
+  behavior: string;
   description: string;
   filesInScope: string[];
   dependencies: string[];
+  /** Concrete commands or runtime checks that prove this subtask is complete. */
+  verificationCommands: string[];
   testCriteria: string[];
+  /** Evidence expected in the task log or status report after verification. */
+  completionEvidence: string[];
+  /** Parser provenance used by the orchestrator to reject incomplete planner contracts. */
+  contractProvided?: {
+    behavior: boolean;
+    filesInScope: boolean;
+    verificationCommands: boolean;
+    testCriteria: boolean;
+    completionEvidence: boolean;
+  };
   agentType?: AgentType;
 }
 
