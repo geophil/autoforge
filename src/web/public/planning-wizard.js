@@ -1,19 +1,7 @@
-function escHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function oneLine(str) {
-  return String(str ?? "").replace(/\s+/g, " ").trim();
-}
-
-function toArray(value) {
-  return Array.isArray(value) ? value : [];
-}
+const { escHtml, oneLine, toArray } =
+  typeof window !== "undefined" && window.UiHelpers
+    ? window.UiHelpers
+    : (typeof UiHelpers !== "undefined" ? UiHelpers : {});
 
 function getWizardSteps() {
   return ["Describe", "Spec", "Plan", "Execute"];

@@ -1,19 +1,7 @@
-function toObject(value) {
-  return value && typeof value === "object" ? value : {};
-}
-
-function toArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-function oneLine(value) {
-  return String(value ?? "").replace(/\s+/g, " ").trim();
-}
-
-function asNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
+const { toObject, toArray, oneLine, asNumber } =
+  typeof window !== "undefined" && window.UiHelpers
+    ? window.UiHelpers
+    : (typeof UiHelpers !== "undefined" ? UiHelpers : {});
 
 function latestEvent(events, predicate) {
   for (let i = events.length - 1; i >= 0; i -= 1) {
@@ -106,6 +94,8 @@ function eventTimelineSummary(ev) {
     label = payload.passed === false ? "Pre-review checks failed" : "Pre-review checks passed";
     if (payload.scope_check?.status) details.push(`scope ${payload.scope_check.status}`);
     if (payload.debug_code_scan?.status) details.push(`debug scan ${payload.debug_code_scan.status}`);
+    const advisory = toArray(payload.debug_code_scan?.advisory_matches);
+    if (advisory.length) details.push(`${advisory.length} advisory debug hint${advisory.length === 1 ? "" : "s"}`);
   } else if (type === "failure_analysis" && payload.failure_category === "pr_gate") {
     group = "intervention";
     label = "PR gate blocked";

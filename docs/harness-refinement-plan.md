@@ -311,11 +311,15 @@ Implemented:
 
 Remaining:
 
-- Add dedicated unit/integration tests for each cheap-check failure mode.
+- Add integration coverage for pre-review pause before reviewer dispatch.
 - Decide whether changed-file scope should inspect post-hook changed files,
   reported artifacts, or both.
-- Tune debug-code scanning to avoid false positives in intentional test fixtures
-  or logging-focused changes.
+
+Implemented (follow-up):
+
+- `tests/unit/pre-review-checks.test.ts` covers scope failure, debugger blocking,
+  advisory `console.log` hints, and test-path exclusions.
+- `console.log` is advisory only; `debugger` and `TODO DEBUG` remain blocking.
 
 ## Future Phases
 

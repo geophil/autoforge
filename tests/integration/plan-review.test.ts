@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createTestService } from "../helpers/create-service";
+import { fullPlanSubtask } from "../helpers/plan-subtask";
 
 describe("plan-review pause", () => {
   test("STANDARD task pauses at awaiting_spec_approval after planner", async () => {
@@ -309,14 +310,12 @@ describe("reviewPlan: false combined-phase persistence", () => {
               risks: []
             },
             subtasks: [
-              {
+              fullPlanSubtask({
                 id: "t1-subtask-1",
-                sequence: 1,
                 description: "Implement",
                 filesInScope: ["src/foo.ts"],
-                dependencies: [],
                 testCriteria: ["passes"]
-              }
+              })
             ]
           },
           metrics: { elapsedSeconds: 0.2 }
@@ -385,14 +384,12 @@ describe("reviewPlan: false combined-phase persistence", () => {
           artifacts: [],
           output: {
             subtasks: [
-              {
+              fullPlanSubtask({
                 id: "t-subtask-1",
-                sequence: 1,
                 description: "Wire it",
                 filesInScope: ["src/"],
-                dependencies: [],
                 testCriteria: ["Tests pass"]
-              }
+              })
             ]
           },
           metrics: { elapsedSeconds: 0.2 }

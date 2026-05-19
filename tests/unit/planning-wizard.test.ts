@@ -24,16 +24,27 @@ type WizardModule = {
 };
 
 function loadPlanningWizardModule(): WizardModule {
+  const uiHelpers = readFileSync(
+    resolve(process.cwd(), "src/web/public/ui-helpers.js"),
+    "utf8"
+  );
   const code = readFileSync(
     resolve(process.cwd(), "src/web/public/planning-wizard.js"),
     "utf8"
   );
   const fakeModule: { exports: Record<string, unknown> } = { exports: {} };
+  const windowShim: Record<string, unknown> = {};
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval
+  new Function("module", "exports", "window", uiHelpers)(
+    fakeModule,
+    fakeModule.exports,
+    windowShim
+  );
   // eslint-disable-next-line @typescript-eslint/no-implied-eval
   new Function("module", "exports", "window", code)(
     fakeModule,
     fakeModule.exports,
-    undefined
+    windowShim
   );
   return fakeModule.exports as WizardModule;
 }

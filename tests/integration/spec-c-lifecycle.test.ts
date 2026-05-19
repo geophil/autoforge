@@ -325,7 +325,8 @@ describe("Spec C lifecycle auto-tuner hook", () => {
       await Bun.sleep(10);
 
       const task = db.listTasks().find((candidate) => candidate.description === "frontend non-terminal crash");
-      expect(task?.state).toBe("reviewing");
+      // EXPRESS skips reviewer dispatch; PR creation fails while still executing.
+      expect(task?.state).toBe("executing");
       expect((service as unknown as { deps: { worktrees: WorktreeManager } }).deps.worktrees.findWorktreePath(task!.id)).toBeNull();
       expect(db.listEvents(task!.id).some((event) => event.type === "auto_tuner_failed")).toBe(false);
       expect(db.sqlite.query("SELECT id FROM events WHERE event_type = 'diagnostic_run_completed'").all()).toHaveLength(0);

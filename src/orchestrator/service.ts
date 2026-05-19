@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { resolve } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  normalizeArtifactPath,
+  PRE_REVIEW_IGNORED_PATHS,
+  runCheapPreReviewChecks
+} from "./pre-review-checks";
 import type { AppEnv } from "../config/env";
 import { assessComplexity, routeTier } from "../assessment/tier";
 import { type AutoforgeMessage } from "../nats/messages";
@@ -55,10 +59,7 @@ import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../run
 
 const QMD_TOOL_NAMES = new Set(["query", "get", "multi_get", "status"]);
 const ARTIFACT_VALIDATION_MISMATCH_THRESHOLD = 0.4;
-const ARTIFACT_VALIDATION_IGNORED_PATHS = new Set([
-  ".autoforge-status.json",
-  ".autoforge-worktree.json"
-]);
+const ARTIFACT_VALIDATION_IGNORED_PATHS = PRE_REVIEW_IGNORED_PATHS;
 
 interface ServiceDeps {
   env: AppEnv;
@@ -2574,9 +2575,12 @@ export class OrchestratorService {
     const artifactsUnavailable =
       input.artifactValidationStatuses.length === 0 ||
       input.artifactValidationStatuses.some((status) => status === "unavailable");
+    const verificationSatisfied =
+      input.verificationStatus === "passed" ||
+      (input.tier === "EXPRESS" && input.verificationStatus === "unavailable");
     const dimensions = {
-      build: input.verificationStatus === "passed",
-      tests: input.verificationStatus === "passed",
+      build: verificationSatisfied,
+      tests: verificationSatisfied,
       progress: input.planSubtasks.length > 0,
       artifacts: artifactsUnavailable ? null : artifactsVerified,
       startup: null
@@ -2853,7 +2857,7 @@ export class OrchestratorService {
         break;
       }
 
-      const preReviewChecks = this.runCheapPreReviewChecks({
+      const preReviewChecks = runCheapPreReviewChecks({
         worktreePath,
         planSubtasks,
         reportedArtifacts: [...reportedArtifactsForPreReview]
@@ -2864,7 +2868,7 @@ export class OrchestratorService {
         agent: "orchestrator",
         type: "pre_review_checks",
         status: preReviewChecks.passed ? "done" : "done_with_concerns",
-        payload: preReviewChecks,
+        payload: { ...preReviewChecks },
         budgetSeconds: 60
       });
       if (!preReviewChecks.passed) {
@@ -3285,82 +3289,6 @@ export class OrchestratorService {
       threshold: ARTIFACT_VALIDATION_MISMATCH_THRESHOLD,
       missing_reported: missingReported,
       unexpected_changed: unexpectedChanged
-    };
-  }
-
-  private runCheapPreReviewChecks(input: {
-    worktreePath: string;
-    planSubtasks: PlanSubtask[];
-    reportedArtifacts: string[];
-  }): {
-    passed: boolean;
-    scope_check: {
-      status: "passed" | "failed" | "unavailable";
-      unexpected_artifacts: string[];
-    };
-    debug_code_scan: {
-      status: "passed" | "failed" | "unavailable";
-      matches: Array<{ path: string; pattern: string }>;
-    };
-  } {
-    const normalizedArtifacts = [...new Set(
-      input.reportedArtifacts
-        .map((path) => normalizeArtifactPath(path))
-        .filter((path): path is string => path.length > 0 && !ARTIFACT_VALIDATION_IGNORED_PATHS.has(path))
-    )].sort();
-
-    const allowedScopes = input.planSubtasks
-      .flatMap((subtask) => subtask.filesInScope)
-      .map((path) => normalizeArtifactPath(path))
-      .filter((path): path is string => path.length > 0);
-
-    const scopeUnavailable = allowedScopes.length === 0 || normalizedArtifacts.length === 0;
-    const unexpectedArtifacts = scopeUnavailable
-      ? []
-      : normalizedArtifacts.filter((artifact) => !allowedScopes.some((scope) => artifactWithinScope(artifact, scope)));
-
-    const debugMatches: Array<{ path: string; pattern: string }> = [];
-    const worktreeRoot = resolve(input.worktreePath);
-    for (const artifact of normalizedArtifacts) {
-      if (!/\.(ts|tsx|js|jsx|mjs|cjs|css|html|md|json)$/.test(artifact)) continue;
-      if (artifact.startsWith("/")) continue;
-      const fullPath = resolve(worktreeRoot, artifact);
-      if (!(fullPath === worktreeRoot || fullPath.startsWith(`${worktreeRoot}/`)) || !existsSync(fullPath)) continue;
-      try {
-        const text = readFileSync(fullPath, "utf8").slice(0, 250_000);
-        const patterns = [
-          { label: "debugger statement", regex: /\bdebugger\s*;/ },
-          { label: "console.log", regex: /\bconsole\.log\s*\(/ },
-          { label: "TODO DEBUG", regex: /TODO\s+DEBUG/i }
-        ];
-        for (const pattern of patterns) {
-          if (pattern.regex.test(text)) {
-            debugMatches.push({ path: artifact, pattern: pattern.label });
-          }
-        }
-      } catch {
-        // Ignore unreadable artifacts; artifact validation and reviewer still
-        // cover semantic quality. This check is intentionally cheap.
-      }
-    }
-
-    const scopeStatus = scopeUnavailable
-      ? "unavailable"
-      : unexpectedArtifacts.length === 0 ? "passed" : "failed";
-    const debugStatus = normalizedArtifacts.length === 0
-      ? "unavailable"
-      : debugMatches.length === 0 ? "passed" : "failed";
-
-    return {
-      passed: scopeStatus !== "failed" && debugStatus !== "failed",
-      scope_check: {
-        status: scopeStatus,
-        unexpected_artifacts: unexpectedArtifacts
-      },
-      debug_code_scan: {
-        status: debugStatus,
-        matches: debugMatches
-      }
     };
   }
 
@@ -4079,17 +4007,3 @@ function normalizeToolStats(
   };
 }
 
-function normalizeArtifactPath(path: string): string {
-  const normalized = path.trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
-  return normalized;
-}
-
-function artifactWithinScope(artifact: string, scope: string): boolean {
-  const normalizedArtifact = normalizeArtifactPath(artifact);
-  const normalizedScope = normalizeArtifactPath(scope);
-  if (!normalizedArtifact || !normalizedScope) return false;
-  if (normalizedScope === "." || normalizedScope === "./") return true;
-  if (normalizedArtifact === normalizedScope) return true;
-  const directoryScope = normalizedScope.endsWith("/") ? normalizedScope : `${normalizedScope}/`;
-  return normalizedArtifact.startsWith(directoryScope);
-}
