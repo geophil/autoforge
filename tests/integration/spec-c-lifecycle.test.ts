@@ -71,7 +71,7 @@ function createLifecycleService(input: {
     executor: new MockExecutor(input.handlers ?? {}),
     worktrees,
     dispatcher,
-    testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
+    testRunner: async () => ({ passRate: 1, output: "mock test runner", verificationStatus: "passed", runner: "mock" }),
     prCreator: input.prCreator ?? (async (payload) =>
       `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`),
     lifecycleHookRunner: hookRunner
@@ -325,7 +325,8 @@ describe("Spec C lifecycle auto-tuner hook", () => {
       await Bun.sleep(10);
 
       const task = db.listTasks().find((candidate) => candidate.description === "frontend non-terminal crash");
-      expect(task?.state).toBe("reviewing");
+      // EXPRESS skips reviewer dispatch; PR creation fails while still executing.
+      expect(task?.state).toBe("executing");
       expect((service as unknown as { deps: { worktrees: WorktreeManager } }).deps.worktrees.findWorktreePath(task!.id)).toBeNull();
       expect(db.listEvents(task!.id).some((event) => event.type === "auto_tuner_failed")).toBe(false);
       expect(db.sqlite.query("SELECT id FROM events WHERE event_type = 'diagnostic_run_completed'").all()).toHaveLength(0);

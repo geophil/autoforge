@@ -109,13 +109,18 @@ CREATE TABLE IF NOT EXISTS tasks (
 export interface PlanSubtask {
   id: string;
   sequence: number;        // 1-based ordering
+  behavior: string;        // user-visible behavior to make true
   description: string;
   filesInScope: string[];  // paths the coder should touch
   dependencies: string[];  // IDs of subtasks this depends on
+  verificationCommands: string[]; // commands/runtime checks proving completion
   testCriteria: string[];  // acceptance criteria strings
+  completionEvidence: string[]; // evidence expected in events/status output
   agentType?: AgentType;   // override the default agent for this subtask
 }
 ```
+
+Execution-plan subtasks are harness contracts, not informal notes. The planner prompt requires the behavior/scope/verification/evidence fields, and the orchestrator emits an `execution_contract` event before coder work starts. Non-EXPRESS tasks pause to intervention if the contract is incomplete.
 
 ```sql
 CREATE TABLE IF NOT EXISTS subtasks (

@@ -1041,13 +1041,14 @@ export class DbClient {
     timestamp: string;
     elapsedSeconds: number | null;
     tokenUsage: { input: number; output: number } | null;
+    estimatedCost: number | null;
     failureCategory: string | null;
     failureReason: string | null;
     payload: Record<string, unknown>;
   }> {
     const rows = this.sqlite
       .query(
-        "SELECT id, event_type, agent, status, timestamp, elapsed_seconds, token_input, token_output, payload FROM events WHERE task_id = ? ORDER BY timestamp ASC"
+        "SELECT id, event_type, agent, status, timestamp, elapsed_seconds, token_input, token_output, estimated_cost, payload FROM events WHERE task_id = ? ORDER BY timestamp ASC"
       )
       .all(taskId) as Array<Record<string, unknown>>;
     return rows.map((row) => {
@@ -1064,6 +1065,7 @@ export class DbClient {
           row.token_input !== null && row.token_output !== null
             ? { input: Number(row.token_input), output: Number(row.token_output) }
             : null,
+        estimatedCost: row.estimated_cost !== null ? Number(row.estimated_cost) : null,
         failureCategory: (payload.failure_category as string) ?? null,
         failureReason: (payload.failure_reason as string) ?? (payload.reason as string) ?? null,
         payload

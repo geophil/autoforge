@@ -433,6 +433,16 @@ h2 {
   letter-spacing: 0.03em;
 }
 
+.tl-group {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.05rem 0.35rem;
+}
+
 .tl-type {
   color: var(--text);
 }
@@ -466,6 +476,94 @@ h2 {
   color: var(--red);
   margin-top: 0.2rem;
   font-style: italic;
+}
+
+.tl-details {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.15rem;
+}
+
+.tl-details span {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.1rem 0.35rem;
+}
+
+.pr-gate-report {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.pr-gate-ready { border-color: rgba(95, 190, 130, 0.35); }
+.pr-gate-blocked { border-color: rgba(220, 120, 80, 0.45); }
+.pr-gate-allowed { border-color: rgba(220, 185, 80, 0.45); }
+
+.pr-gate-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.pr-gate-header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.pr-gate-state {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.pr-gate-title {
+  color: var(--text);
+  font-weight: 600;
+  font-size: 0.85rem;
+  margin-bottom: 0.35rem;
+}
+
+.pr-gate-reason {
+  color: var(--red);
+  font-size: 0.82rem;
+  margin-bottom: 0.45rem;
+}
+
+.pr-gate-grid {
+  display: grid;
+  grid-template-columns: minmax(8rem, auto) 1fr;
+  gap: 0.25rem 0.75rem;
+  font-size: 0.82rem;
+}
+
+.pr-gate-row {
+  display: contents;
+}
+
+.pr-gate-label {
+  color: var(--text-dim);
+}
+
+.pr-gate-value {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.pr-gate-empty {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
 }
 
 /* Assessment Grid */
@@ -818,6 +916,46 @@ dialog select:focus {
   gap: 0.5rem;
   align-items: center;
   margin-top: 0.25rem;
+}
+
+.intervention-recommendation {
+  border: 1px solid rgba(220, 185, 80, 0.35);
+  background: rgba(220, 185, 80, 0.08);
+  border-radius: 6px;
+  padding: 0.65rem 0.75rem;
+}
+
+.recommendation-title {
+  font-weight: 700;
+  color: var(--text);
+  font-size: 0.88rem;
+}
+
+.recommendation-body {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  margin-top: 0.2rem;
+}
+
+.recommendation-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.45rem;
+}
+
+.recommendation-chip {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--yellow);
+  border: 1px solid rgba(220, 185, 80, 0.35);
+  border-radius: 999px;
+  padding: 0.1rem 0.4rem;
+}
+
+.recommendation-chip-secondary {
+  color: var(--text-muted);
+  border-color: var(--border);
 }
 
 /* Subtask card extensions */
@@ -2189,6 +2327,12 @@ button:disabled:not(.btn-working) {
   padding: 0.05rem 0.4rem;
 }
 
+.wizard-subtask-wip {
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
 .wizard-subtask-card h4 {
   margin: 0 0 0.35rem;
   font-size: 0.86rem;
@@ -2197,6 +2341,78 @@ button:disabled:not(.btn-working) {
 
 .wizard-subtask-card p {
   margin: 0.2rem 0;
+}
+
+.wizard-subtask-behavior {
+  color: var(--text-muted);
+}
+
+.wizard-contract-field {
+  margin-top: 0.45rem;
+}
+
+.wizard-contract-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 0.15rem;
+}
+
+.wizard-contract-field ul {
+  margin: 0.1rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.wizard-contract-empty {
+  color: var(--text-dim);
+}
+
+.wizard-contract-ok,
+.wizard-contract-warning-note {
+  margin-top: 0.55rem;
+  font-size: 0.74rem;
+  color: var(--text-dim);
+}
+
+.wizard-contract-warnings {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 0.55rem;
+}
+
+.wizard-contract-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35rem;
+  font-size: 0.76rem;
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.4rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.wizard-contract-warning span {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.wizard-contract-warning-blocking {
+  border-color: rgba(220, 120, 80, 0.42);
+}
+
+.wizard-contract-warning-blocking span {
+  color: var(--red);
+}
+
+.wizard-contract-warning-advisory {
+  border-color: rgba(220, 185, 80, 0.35);
+}
+
+.wizard-contract-warning-advisory span {
+  color: var(--yellow);
 }
 
 .wizard-describe-kicker {

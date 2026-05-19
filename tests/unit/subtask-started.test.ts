@@ -81,7 +81,7 @@ function createSubtaskTestService(input: {
     worktrees,
     dispatcher,
     shadowRunner: input.shadowRunner,
-    testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
+    testRunner: async () => ({ passRate: 1, output: "mock test runner", verificationStatus: "passed", runner: "mock" }),
     prCreator: async (payload: { branch: string }) =>
       `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`
   };

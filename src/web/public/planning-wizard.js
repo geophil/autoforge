@@ -1,19 +1,7 @@
-function escHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function oneLine(str) {
-  return String(str ?? "").replace(/\s+/g, " ").trim();
-}
-
-function toArray(value) {
-  return Array.isArray(value) ? value : [];
-}
+const { escHtml, oneLine, toArray } =
+  typeof window !== "undefined" && window.UiHelpers
+    ? window.UiHelpers
+    : (typeof UiHelpers !== "undefined" ? UiHelpers : {});
 
 function getWizardSteps() {
   return ["Describe", "Spec", "Plan", "Execute"];
@@ -297,7 +285,87 @@ function humanizeDependency(dep, subtasksById) {
   return dep;
 }
 
-function renderPlanSubtaskCards(subtasks) {
+function buildContractWarnings(subtask, options = {}) {
+  const tier = oneLine(options.tier);
+  const files = toArray(subtask?.filesInScope).map((x) => oneLine(x)).filter(Boolean);
+  const verification = toArray(subtask?.verificationCommands).map((x) => oneLine(x)).filter(Boolean);
+  const evidence = toArray(subtask?.completionEvidence).map((x) => oneLine(x)).filter(Boolean);
+  const tests = toArray(subtask?.testCriteria).map((x) => oneLine(x)).filter(Boolean);
+  const warnings = [];
+
+  if (!oneLine(subtask?.behavior)) {
+    warnings.push({ level: "blocking", message: "Missing behavior contract." });
+  }
+  if (!files.length) {
+    warnings.push({ level: "blocking", message: "Missing files in scope." });
+  }
+  if (!verification.length) {
+    warnings.push({ level: "blocking", message: "Missing verification commands." });
+  }
+  if (!tests.length) {
+    warnings.push({ level: "blocking", message: "Missing test criteria." });
+  }
+  if (!evidence.length) {
+    warnings.push({ level: "blocking", message: "Missing completion evidence." });
+  }
+
+  if (files.some((file) => file === "src" || file === "src/" || file === "." || file === "./")) {
+    warnings.push({ level: "advisory", message: "Scope is broad; consider naming specific files or directories." });
+  }
+
+  const genericEvidence = new Set([
+    "passes",
+    "tests pass",
+    "all tests pass",
+    "run tests",
+    "run the tests",
+    "test output shows passing"
+  ]);
+  if (evidence.some((item) => genericEvidence.has(item.toLowerCase()))) {
+    warnings.push({ level: "advisory", message: "Completion evidence is generic; ask for concrete output or artifact evidence." });
+  }
+
+  if (tier === "THOROUGH") {
+    const joinedVerification = verification.join(" ").toLowerCase();
+    const hasRuntimeCheck = /(runtime|integration|e2e|end-to-end|playwright|cypress|dev server|smoke)/.test(joinedVerification);
+    if (!hasRuntimeCheck) {
+      warnings.push({ level: "advisory", message: "THOROUGH work should include runtime, integration, or end-to-end verification." });
+    }
+  }
+
+  return warnings;
+}
+
+function renderContractList(title, values) {
+  const list = toArray(values).map((x) => oneLine(x)).filter(Boolean);
+  return `
+    <div class="wizard-contract-field">
+      <div class="wizard-contract-label">${escHtml(title)}</div>
+      ${list.length
+        ? `<ul>${list.map((item) => `<li>${escHtml(item)}</li>`).join("")}</ul>`
+        : `<p class="wizard-contract-empty">-</p>`}
+    </div>
+  `;
+}
+
+function renderContractWarnings(warnings) {
+  if (!warnings.length) {
+    return `<div class="wizard-contract-ok">Contract fields are present. Advisory warnings are absent.</div>`;
+  }
+  return `
+    <div class="wizard-contract-warnings">
+      <div class="wizard-contract-warning-note">Warnings are advisory unless marked blocking by the execution contract gate.</div>
+      ${warnings.map((warning) => `
+        <div class="wizard-contract-warning wizard-contract-warning-${escHtml(warning.level)}">
+          <span>${escHtml(warning.level)}</span>
+          ${escHtml(warning.message)}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderPlanSubtaskCards(subtasks, options = {}) {
   const list = toArray(subtasks);
   const map = new Map();
   list.forEach((subtask, idx) => {
@@ -308,23 +376,27 @@ function renderPlanSubtaskCards(subtasks) {
   return list.map((subtask, idx) => {
     const sequence = subtask?.sequence ?? idx + 1;
     const description = oneLine(subtask?.description) || `Subtask ${sequence}`;
+    const behavior = oneLine(subtask?.behavior);
     const agent = oneLine(subtask?.agentType) || "coder";
     const files = toArray(subtask?.filesInScope).map((x) => oneLine(x)).filter(Boolean);
     const deps = toArray(subtask?.dependencies).map((x) => humanizeDependency(x, map)).filter(Boolean);
     const tests = toArray(subtask?.testCriteria).map((x) => oneLine(x)).filter(Boolean);
+    const warnings = buildContractWarnings(subtask, options);
     return `
       <article class="wizard-subtask-card">
         <header>
           <span class="wizard-subtask-seq">#${sequence}</span>
           <span class="wizard-subtask-agent">${escHtml(agent)}</span>
+          <span class="wizard-subtask-wip">WIP order ${sequence}</span>
         </header>
         <h4>${escHtml(description)}</h4>
-        <p><strong>Files:</strong> ${files.length ? escHtml(files.join(", ")) : "—"}</p>
-        <p><strong>Depends on:</strong> ${deps.length ? escHtml(deps.join(", ")) : "—"}</p>
-        <p><strong>Tests:</strong></p>
-        ${tests.length
-          ? `<ul>${tests.map((item) => `<li>${escHtml(item)}</li>`).join("")}</ul>`
-          : "<p>—</p>"}
+        ${behavior ? `<p class="wizard-subtask-behavior">${escHtml(behavior)}</p>` : ""}
+        <p><strong>Depends on:</strong> ${deps.length ? escHtml(deps.join(", ")) : "-"}</p>
+        ${renderContractList("Files in scope", files)}
+        ${renderContractList("Verification commands", subtask?.verificationCommands)}
+        ${renderContractList("Test criteria", tests)}
+        ${renderContractList("Completion evidence", subtask?.completionEvidence)}
+        ${renderContractWarnings(warnings)}
       </article>
     `;
   }).join("");
@@ -422,7 +494,7 @@ function renderPlanReviewPanel(task, options) {
       <section class="wizard-card wizard-plan-card">
         <h4>Execution subtasks</h4>
         <div class="wizard-subtask-grid">
-          ${renderPlanSubtaskCards(task?.planSubtasks)}
+          ${renderPlanSubtaskCards(task?.planSubtasks, { tier: task?.tier })}
         </div>
       </section>
       ${renderQmdEvidence(task)}
@@ -453,6 +525,7 @@ const api = {
   getSpecReviewMode,
   buildQmdEvidence,
   getPromptChips,
+  buildContractWarnings,
   renderPlanSubtaskCards,
   renderSpecReviewPanel,
   renderPlanReviewPanel

@@ -41,7 +41,7 @@ function createBackfillTestService(embeddingProvider: EmbeddingProvider): {
     executor: new MockExecutor(),
     worktrees: new WorktreeManager(join(baseDir, "worktrees")),
     embeddingProvider,
-    testRunner: async () => ({ passRate: 1, output: "mock test runner" })
+    testRunner: async () => ({ passRate: 1, output: "mock test runner", verificationStatus: "passed", runner: "mock" })
   });
 
   return {

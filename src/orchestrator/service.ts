@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { resolve } from "node:path";
+import {
+  normalizeArtifactPath,
+  PRE_REVIEW_IGNORED_PATHS,
+  runCheapPreReviewChecks
+} from "./pre-review-checks";
 import type { AppEnv } from "../config/env";
 import { assessComplexity, routeTier } from "../assessment/tier";
 import { type AutoforgeMessage } from "../nats/messages";
@@ -34,7 +39,7 @@ import { createEmbeddingProvider, serializeEmbedding, type EmbeddingProvider } f
 import { runShadowDispatches, type ShadowRunner } from "./shadow";
 import { defaultDispatchConfig } from "../config/dispatch";
 import { createPullRequest, evaluatePrGate, mergePullRequest, closePullRequest } from "../privileged/pr";
-import { runAuthenticatedTests } from "../privileged/tests";
+import { runAuthenticatedTests, type TestRunResult } from "../privileged/tests";
 import { validateMetaOutput } from "../schemas/meta-output";
 import { handleMetaOperation } from "./meta-operations";
 import { AutoTuner, evaluateAutoRetire, evaluateCandidate } from "./auto-tuner";
@@ -54,10 +59,7 @@ import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../run
 
 const QMD_TOOL_NAMES = new Set(["query", "get", "multi_get", "status"]);
 const ARTIFACT_VALIDATION_MISMATCH_THRESHOLD = 0.4;
-const ARTIFACT_VALIDATION_IGNORED_PATHS = new Set([
-  ".autoforge-status.json",
-  ".autoforge-worktree.json"
-]);
+const ARTIFACT_VALIDATION_IGNORED_PATHS = PRE_REVIEW_IGNORED_PATHS;
 
 interface ServiceDeps {
   env: AppEnv;
@@ -65,7 +67,7 @@ interface ServiceDeps {
   executor: AgentExecutor;
   worktrees: WorktreeManager;
   nats?: NatsClient;
-  testRunner?: (workingDirectory: string, projectId: string, workspace: Workspace) => Promise<{ passRate: number; output: string }>;
+  testRunner?: (workingDirectory: string, projectId: string, workspace: Workspace) => Promise<TestRunResult>;
   prCreator?: (payload: import("../privileged/pr").PrPayload) => Promise<string>;
   dispatcher?: ReturnType<typeof createDispatcher>;
   embeddingProvider?: EmbeddingProvider;
@@ -2504,6 +2506,112 @@ export class OrchestratorService {
     return { variantId };
   }
 
+  private buildExecutionContract(planSubtasks: PlanSubtask[], tier: Tier): {
+    wipLimit: 1;
+    tier: Tier;
+    validationHierarchy: string[];
+    subtasks: Array<{
+      id: string;
+      sequence: number;
+      behavior: string;
+      filesInScope: string[];
+      verificationCommands: string[];
+      testCriteria: string[];
+      completionEvidence: string[];
+    }>;
+    invalidSubtasks: Array<{ id: string; missing: string[] }>;
+    valid: boolean;
+  } {
+    const validationHierarchy = [
+      "static_or_unit_checks",
+      "affected_behavior_tests",
+      ...(tier === "THOROUGH" ? ["runtime_or_end_to_end_verification"] : [])
+    ];
+    const subtasks = planSubtasks.map((subtask) => ({
+      id: subtask.id,
+      sequence: subtask.sequence,
+      behavior: subtask.behavior,
+      filesInScope: subtask.filesInScope,
+      verificationCommands: subtask.verificationCommands,
+      testCriteria: subtask.testCriteria,
+      completionEvidence: subtask.completionEvidence
+    }));
+    const invalidSubtasks = planSubtasks.map((subtask) => {
+      const missing: string[] = [];
+      const provided = subtask.contractProvided;
+      if (!subtask.behavior?.trim() || provided?.behavior === false) missing.push("behavior");
+      if (subtask.filesInScope.length === 0 || provided?.filesInScope === false) missing.push("filesInScope");
+      if (subtask.verificationCommands.length === 0 || provided?.verificationCommands === false) missing.push("verificationCommands");
+      if (subtask.testCriteria.length === 0 || provided?.testCriteria === false) missing.push("testCriteria");
+      if (subtask.completionEvidence.length === 0 || provided?.completionEvidence === false) missing.push("completionEvidence");
+      return { id: subtask.id, missing };
+    }).filter((row) => row.missing.length > 0);
+
+    return {
+      wipLimit: 1,
+      tier,
+      validationHierarchy,
+      subtasks,
+      invalidSubtasks,
+      valid: invalidSubtasks.length === 0
+    };
+  }
+
+  private recordTaskExitCheck(input: {
+    taskId: string;
+    projectId: string;
+    tier: Tier;
+    planSubtasks: PlanSubtask[];
+    testResult: TestRunResult;
+    verificationStatus: TestRunResult["verificationStatus"];
+    reviewScore: number;
+    unresolvedFindings: ReviewFinding[];
+    artifactValidationStatuses: Array<"ok" | "mismatch" | "unavailable">;
+    iteration: number;
+  }): void {
+    const artifactsVerified =
+      input.artifactValidationStatuses.length > 0 &&
+      input.artifactValidationStatuses.every((status) => status === "ok");
+    const artifactsUnavailable =
+      input.artifactValidationStatuses.length === 0 ||
+      input.artifactValidationStatuses.some((status) => status === "unavailable");
+    const verificationSatisfied =
+      input.verificationStatus === "passed" ||
+      (input.tier === "EXPRESS" && input.verificationStatus === "unavailable");
+    const dimensions = {
+      build: verificationSatisfied,
+      tests: verificationSatisfied,
+      progress: input.planSubtasks.length > 0,
+      artifacts: artifactsUnavailable ? null : artifactsVerified,
+      startup: null
+    };
+    this.recordEvent({
+      taskId: input.taskId,
+      projectId: input.projectId,
+      agent: "orchestrator",
+      type: "task_exit_check",
+      status: Object.values(dimensions).every((value) => value === true) ? "done" : "done_with_concerns",
+      payload: {
+        tier: input.tier,
+        clean_state: dimensions,
+        verification_status: input.verificationStatus,
+        test_pass_rate: input.testResult.passRate,
+        test_runner: input.testResult.runner ?? null,
+        review_score: input.reviewScore,
+        unresolved_findings: input.unresolvedFindings.length,
+        artifact_validation_statuses: input.artifactValidationStatuses,
+        plan_subtasks: input.planSubtasks.map((subtask) => ({
+          id: subtask.id,
+          behavior: subtask.behavior,
+          verificationCommands: subtask.verificationCommands,
+          completionEvidence: subtask.completionEvidence
+        })),
+        iteration: input.iteration
+      },
+      budgetSeconds: 60
+    });
+  }
+
   private async executeAndReview(
     taskId: string,
     projectId: string,
@@ -2525,6 +2633,30 @@ export class OrchestratorService {
       skill_version_ids: string[];
       tool_stats: ToolStats | null;
     } | null = null;
+    const artifactValidationStatuses: Array<"ok" | "mismatch" | "unavailable"> = [];
+    const contract = this.buildExecutionContract(planSubtasks, tier);
+    this.recordEvent({
+      taskId,
+      projectId,
+      agent: "orchestrator",
+      type: "execution_contract",
+      status: contract.valid ? "done" : "done_with_concerns",
+      payload: contract,
+      budgetSeconds: 60
+    });
+    if (!contract.valid && tier !== "EXPRESS") {
+      this.pauseForIntervention({
+        taskId,
+        projectId,
+        fromStage: this.requireTask(taskId).state,
+        failureCategory: "planner_contract_incomplete",
+        failureReason: "execution plan is missing required behavior, scope, or verification evidence",
+        forensics: {
+          invalid_subtasks: contract.invalidSubtasks,
+          tier
+        }
+      });
+    }
 
     while (true) {
       const currentState = this.requireTask(taskId).state;
@@ -2539,6 +2671,7 @@ export class OrchestratorService {
         iteration === startingIteration
           ? planSubtasks.slice(Math.max(0, firstIterationStart))
           : planSubtasks;
+      const reportedArtifactsForPreReview = new Set<string>();
 
       for (const subtask of subtasksForIteration) {
         const subtaskAgentType = subtask.agentType ?? "coder";
@@ -2584,7 +2717,15 @@ export class OrchestratorService {
           agent: subtaskAgentType,
           type: "subtask_started",
           status: "running",
-          payload: { subtaskId: subtask.id, iteration, sequence: subtask.sequence, agentType: subtaskAgentType },
+          payload: {
+            subtaskId: subtask.id,
+            iteration,
+            sequence: subtask.sequence,
+            agentType: subtaskAgentType,
+            behavior: subtask.behavior,
+            verificationCommands: subtask.verificationCommands,
+            completionEvidence: subtask.completionEvidence
+          },
           budgetSeconds: this.budgetForTier(tier, "coder")
         });
         const coderResult = await coderExecutor.execute(liveTask);
@@ -2648,6 +2789,11 @@ export class OrchestratorService {
         }
 
         const artifactValidation = this.validateArtifactReport(worktreePath, coderResult.artifacts);
+        artifactValidationStatuses.push(artifactValidation.status);
+        for (const artifact of coderResult.artifacts) {
+          const normalizedArtifact = normalizeArtifactPath(artifact);
+          if (normalizedArtifact) reportedArtifactsForPreReview.add(normalizedArtifact);
+        }
         const artifactMismatchConcern =
           artifactValidation.status === "mismatch"
             ? `reported artifacts diverge from changed files (ratio=${artifactValidation.mismatch_ratio})`
@@ -2705,12 +2851,41 @@ export class OrchestratorService {
         iteration
       });
 
-      this.transition(taskId, projectId, "executing", "reviewing", { iteration });
-
-      // EXPRESS tier skips the reviewer — faster turnaround, lower risk tolerance.
+      // EXPRESS tier skips the reviewer, so pre-review checks do not run here;
+      // the PR gate still handles final verification.
       if (tier === "EXPRESS") {
         break;
       }
+
+      const preReviewChecks = runCheapPreReviewChecks({
+        worktreePath,
+        planSubtasks,
+        reportedArtifacts: [...reportedArtifactsForPreReview]
+      });
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "pre_review_checks",
+        status: preReviewChecks.passed ? "done" : "done_with_concerns",
+        payload: { ...preReviewChecks },
+        budgetSeconds: 60
+      });
+      if (!preReviewChecks.passed) {
+        this.pauseForIntervention({
+          taskId,
+          projectId,
+          fromStage: "executing",
+          failureCategory: "pre_review_check_failed",
+          failureReason: "cheap pre-review checks failed before reviewer dispatch",
+          forensics: {
+            checks: preReviewChecks,
+            iteration
+          }
+        });
+      }
+
+      this.transition(taskId, projectId, "executing", "reviewing", { iteration });
 
       const reviewerDispatch = await this.selectPersonaForDispatch("reviewer", { description, tier, projectId });
       const reviewerPersonaId = reviewerDispatch.selection.variantId;
@@ -2894,20 +3069,28 @@ export class OrchestratorService {
 
     const runTests = this.deps.testRunner ?? runAuthenticatedTests;
     const testResult = await runTests(worktreePath, projectId, this.requireTaskWorkspace(taskId));
+    const verificationStatus = testResult.verificationStatus ?? (testResult.passRate >= 1 ? "passed" : "failed");
 
     this.recordEvent({
       taskId,
       projectId,
       agent: "orchestrator",
       type: "test_results",
-      status: testResult.passRate >= 1 ? "done" : "done_with_concerns",
-      payload: { passRate: testResult.passRate, output: testResult.output.slice(0, 2000) },
+      status: verificationStatus === "passed" ? "done" : "done_with_concerns",
+      payload: {
+        passRate: testResult.passRate,
+        verificationStatus,
+        runner: testResult.runner ?? null,
+        output: testResult.output.slice(0, 2000)
+      },
       budgetSeconds: 60
     });
 
     const reviewScore = unresolvedFindings.length === 0 ? 1 : 0.5;
     const gate = evaluatePrGate({
       passRate: testResult.passRate,
+      verificationStatus,
+      tier,
       reviewScore,
       thresholdScore: this.deps.env.REVIEW_SCORE_THRESHOLD,
       findings: unresolvedFindings
@@ -2923,6 +3106,7 @@ export class OrchestratorService {
         forensics: {
           ...(lastReviewerFailureForensics ?? {}),
           test_pass_rate: testResult.passRate,
+          verification_status: verificationStatus,
           review_score: reviewScore,
           unresolved_findings: unresolvedFindings.length,
           planner_fallback: planSubtasks.length === 1 &&
@@ -2932,6 +3116,19 @@ export class OrchestratorService {
         }
       });
     }
+
+    this.recordTaskExitCheck({
+      taskId,
+      projectId,
+      tier,
+      planSubtasks,
+      testResult,
+      verificationStatus,
+      reviewScore,
+      unresolvedFindings,
+      artifactValidationStatuses,
+      iteration
+    });
 
     const createPr = this.deps.prCreator ?? createPullRequest;
     const prUrl = await createPr({
@@ -3717,7 +3914,10 @@ function buildCoderPrompt(description: string, subtask: PlanSubtask, iteration: 
   const lines = [
     `## Feature\n${description}`,
     `## Subtask (${subtask.sequence})\n${subtask.description}`,
+    `## Required behavior\n${subtask.behavior}`,
     `## Files in scope\n${subtask.filesInScope.join(", ")}`,
+    `## Verification commands\n${subtask.verificationCommands.map((c) => `- ${c}`).join("\n")}`,
+    `## Completion evidence\n${subtask.completionEvidence.map((c) => `- ${c}`).join("\n")}`,
     `## Test criteria\n${subtask.testCriteria.map((c) => `- ${c}`).join("\n")}`
   ];
   if (iteration > 0) {
@@ -3728,9 +3928,11 @@ function buildCoderPrompt(description: string, subtask: PlanSubtask, iteration: 
 
 function buildReviewerPrompt(description: string, subtasks: PlanSubtask[]): string {
   const criteria = subtasks.flatMap((s) => s.testCriteria).map((c) => `- ${c}`).join("\n");
+  const verification = subtasks.flatMap((s) => s.verificationCommands).map((c) => `- ${c}`).join("\n");
   return [
     `## Feature\n${description}`,
     `## Test criteria to verify\n${criteria}`,
+    `## Verification evidence expected\n${verification}`,
     "## Instructions\nReview the code in this working directory. Conduct spec compliance review first, then code quality review. Output findings to .autoforge-status.json."
   ].join("\n\n");
 }
@@ -3805,7 +4007,3 @@ function normalizeToolStats(
   };
 }
 
-function normalizeArtifactPath(path: string): string {
-  const normalized = path.trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
-  return normalized;
-}

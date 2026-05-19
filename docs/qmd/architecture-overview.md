@@ -99,6 +99,7 @@ Human → HTTP POST /api/meta
         planner call emits both spec and subtasks; no pauses, runs straight to g.
         EXPRESS tasks skip both pauses entirely.
    g. for each subtask:
+        recordEvent("execution_contract", { wipLimit: 1, subtasks: behavior/scope/verification/evidence })
         routeExecutor(tier, agentType).execute({
           type: subtask.agentType ?? "coder",
           systemPrompt: personas.resolve(agentType),  ← specialist persona
@@ -108,11 +109,12 @@ Human → HTTP POST /api/meta
         worktrees.commit(branch, message)
         recordEvent("subtask_done", { persona_version_id, skill_version_ids, token_usage })
       (loop up to 3x if reviewer finds CRITICAL/MAJOR; EXPRESS skips reviewer)
-   h. runAuthenticatedTests(worktreePath)
-   i. recordEvent("test_results", { passRate })
-   j. evaluatePrGate(passRate, reviewScore, findings)
-   k. createPullRequest(branch, description, findings)
-   l. recordEvent("state.awaiting_approval")
+   h. runAuthenticatedTests(worktreePath, projectId, workspace)
+   i. recordEvent("test_results", { passRate, verificationStatus })
+   j. evaluatePrGate(passRate, verificationStatus, tier, reviewScore, findings)
+   k. recordEvent("task_exit_check", { clean_state, verification_status, review_score })
+   l. createPullRequest(branch, description, findings)
+   m. recordEvent("state.awaiting_approval")
 3. Return task { state: "awaiting_approval", prUrl }
 
 4. Human reviews PR on GitHub

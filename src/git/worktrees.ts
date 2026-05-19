@@ -56,6 +56,7 @@ export class WorktreeManager {
    */
   commit(worktree: WorktreeRef, message: string): void {
     if (!this.isGitRepo()) return;
+    if (!existsSync(join(worktree.path, ".git"))) return;
     // Stage everything in the worktree.
     run("git", ["add", "-A"], { cwd: worktree.path, ignore: false });
     // Commit (exit 1 with "nothing to commit" is not an error).

@@ -15,6 +15,7 @@ type EnvOverrides = Partial<Record<string, string>>;
 
 interface CreateTestServiceOptions {
   workspaceFactory?: ConstructorParameters<typeof OrchestratorService>[0]["workspaceFactory"];
+  testRunner?: ConstructorParameters<typeof OrchestratorService>[0]["testRunner"];
 }
 
 export interface TestService {
@@ -59,7 +60,12 @@ export function createTestService(
     db,
     executor,
     worktrees,
-    testRunner: async () => ({ passRate: 1, output: "mock test runner" }),
+    testRunner: options.testRunner ?? (async () => ({
+      passRate: 1,
+      output: "mock test runner",
+      verificationStatus: "passed",
+      runner: "mock"
+    })),
     prCreator: async (payload) => `https://github.com/local/autoforge/pull/mock?branch=${encodeURIComponent(payload.branch)}`,
     workspaceFactory: options.workspaceFactory
   });

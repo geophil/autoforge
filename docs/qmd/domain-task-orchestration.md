@@ -72,6 +72,23 @@ V1 is Bun-only and only discovers fixed allowlisted script names from `package.j
 
 If a lifecycle hook fails, the orchestrator records `lifecycle_hook_failed` and pauses the task in `awaiting_intervention` with `failure_category=lifecycle_hook_failed`.
 
+### Cheap Pre-Review Checks Run Before Model Review
+
+After coder work and the `post_coder_pre_review` lifecycle phase, Autoforge runs
+deterministic checks before dispatching the reviewer. These checks are cheap and
+do not replace the authenticated PR-gate test runner:
+
+- reported artifacts must remain inside the planner's declared files-in-scope
+  contract when enough data is available;
+- reported source artifacts are scanned for obvious debug leftovers such as
+  `debugger;`, `console.log(...)`, and `TODO DEBUG`.
+
+The orchestrator records `pre_review_checks`. A failed check pauses the task in
+`awaiting_intervention` with `failure_category=pre_review_check_failed`, saving
+reviewer tokens for work that has passed deterministic hygiene checks. Full
+test execution remains in the PR gate unless a project configures tests as a
+lifecycle hook.
+
 ### Rollback and Steering Are Boundary-Safe
 
 - Checkpoints are durable event-log markers (`checkpoint_created`) captured at safe stage boundaries and subtask commits.
@@ -154,15 +171,18 @@ A new task progresses from submission through to a PR awaiting human approval.
 8. **Phase 2 — Execution-plan generation**: the prompt carries `## Phase\nexecution_plan` plus the approved spec under `## Approved Spec` (compacted on retries to bound token growth). Output is `PlanSubtask[]`, persisted to `agent_transcripts` (stage `planner:execution_plan`). QMD evidence enforcement applies here too when configured. Planner retries also enforce a prompt-token guardrail: over-budget retries pause to intervention (`failure_category=planner_prompt_budget_exceeded`) instead of dispatching an oversized prompt.
 9. **Plan-review pause**: Same critique loop as spec, capped by `PLANNER_MAX_ITERATIONS` and scoped to `planner:execution_plan` transcripts. The two budgets are independent.
 10. **Combined fast path** (`reviewPlan: false`): phases 6–9 collapse to a single planner call with `## Phase\ncombined`; output carries both spec and subtasks. `planningContext.approvalMode = "auto"` is set and the task runs straight to step 11 with no pause. If the combined call returns spec only, the orchestrator transparently issues a second `execution_plan` call (records `planner_phase_fallback_to_two_call`) and never pauses — this is the path `rejectTask` exercises on every restart.
-11. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, runs `post_coder_pre_review` lifecycle hooks, then runs the reviewer (unless EXPRESS). Each planner/coder/reviewer/doc dispatch selects a population variant, injects selected variant content and lineage lessons, and runs any candidate shadow variants after the live result. Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
-12. **PR Gate**: `evaluatePrGate()` checks test pass rate, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
-13. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
-14. **State**: Task transitions to `awaiting_approval`.
+11. **Execution contract**: Before coder work, the orchestrator emits `execution_contract` with WIP limit 1, validation hierarchy, and each subtask's behavior/scope/verification/evidence contract. STANDARD/THOROUGH tasks pause to `awaiting_intervention` if the contract is incomplete.
+12. **Execute & Review loop**: `executeAndReview()` runs coders for each subtask, commits their output, runs `post_coder_pre_review` lifecycle hooks, then runs the reviewer (unless EXPRESS). Each planner/coder/reviewer/doc dispatch selects a population variant, injects selected variant content and lineage lessons, and runs any candidate shadow variants after the live result. Repeats up to 3 iterations if CRITICAL/MAJOR findings exist.
+13. **PR Gate**: `evaluatePrGate()` checks test pass rate, verification availability, review score, and unresolved CRITICAL findings. See `domain-pr-gate.md`.
+14. **Task exit check**: If the PR gate accepts, the orchestrator emits `task_exit_check` summarizing clean-state dimensions, verification status, review score, and subtask evidence.
+15. **PR creation**: If gate passes, `createPullRequest()` pushes the branch and opens a GitHub PR.
+16. **State**: Task transitions to `awaiting_approval`.
 
 **Error paths**:
 - Any coder returning FAILED/TIMEOUT → task transitions to `failed`
 - Rework iteration > 3 → `failed`
-- PR gate rejected → `failed`
+- PR gate rejected → `awaiting_intervention` with `failure_category=pr_gate`
+- Execution contract incomplete for STANDARD/THOROUGH → `awaiting_intervention` with `failure_category=planner_contract_incomplete`
 - Planner output missing required QMD evidence (while `QMD_MCP_URL` is configured) → task transitions to `awaiting_intervention` with `failure_category=planner_missing_qmd_context`
 
 ### Population Dispatch Flow (`OrchestratorService.selectPersonaForDispatch`)

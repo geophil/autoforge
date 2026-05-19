@@ -48,9 +48,12 @@ describe("buildPlannerPrompt", () => {
       priorPlan: [{
         id: "t-subtask-1",
         sequence: 1,
+        behavior: "Endpoint is implemented",
         description: "Implement",
         filesInScope: ["src/x.ts"],
         dependencies: [],
+        verificationCommands: ["bun test"],
+        completionEvidence: ["passing test output"],
         testCriteria: ["tests pass"]
       }],
       approvedSpec,
@@ -78,9 +81,12 @@ describe("buildPlannerPrompt", () => {
       priorPlan: [{
         id: "t-subtask-1",
         sequence: 1,
+        behavior: "Endpoint is implemented",
         description: "Implement",
         filesInScope: ["src/x.ts"],
         dependencies: [],
+        verificationCommands: ["bun test"],
+        completionEvidence: ["passing test output"],
         testCriteria: ["tests pass"]
       }],
       critique: "Keep only essential behavior."
