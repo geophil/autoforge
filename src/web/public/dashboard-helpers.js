@@ -1,3 +1,4 @@
+(() => {
 const { toObject, toArray, oneLine, asNumber } =
   typeof window !== "undefined" && window.UiHelpers
     ? window.UiHelpers
@@ -317,3 +318,4 @@ if (typeof window !== "undefined") {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = dashboardHelpersApi;
 }
+})();

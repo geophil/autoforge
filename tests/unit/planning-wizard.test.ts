@@ -21,6 +21,7 @@ type WizardModule = {
     options?: Record<string, unknown>
   ) => Array<{ level: string; message: string }>;
   renderPlanSubtaskCards: (subtasks: Array<Record<string, unknown>>) => string;
+  renderSpecReviewPanel: (task: Record<string, unknown>, options?: Record<string, unknown>) => string;
 };
 
 function loadPlanningWizardModule(): WizardModule {
@@ -167,6 +168,55 @@ describe("planning wizard helpers", () => {
     expect(html).toContain("WIP order 2");
     expect(html).toContain("Unit tests for phase classification");
     expect(html).toContain("Spec + plan cards render in review states");
+  });
+
+  test("renders long subtask descriptions as a readable developer handoff", () => {
+    const html = wizard.renderPlanSubtaskCards([
+      {
+        id: "t1-subtask-1",
+        sequence: 1,
+        description:
+          "Extend the PlanningContext type and Zod parser to carry the new telemetry field alongside existing fields. Add the field to the canonical type in src/types/core.ts, extend the Zod schema and shape detection in src/orchestrator/planner-output.ts, and ensure parsing tolerates older planner outputs.",
+        agentType: "coder",
+        filesInScope: ["src/types/core.ts"],
+        verificationCommands: ["bun test tests/unit/planner-output.test.ts"],
+        testCriteria: ["Parser round-trips telemetry"],
+        completionEvidence: ["planner-output.test.ts passes"]
+      }
+    ]);
+
+    expect(html).toContain("wizard-subtask-summary");
+    expect(html).toContain("Implementation notes");
+    expect(html).toContain("Add the field to the canonical type");
+    expect(html).toContain("data-feedback-seed");
+  });
+
+  test("marks dense review sections as wide so shared grids stay readable", () => {
+    const html = wizard.renderSpecReviewPanel(
+      {
+        id: "task-1",
+        state: "awaiting_spec_approval",
+        specArtifacts: {
+          discovery: {
+            intent: "Improve planning review",
+            constraints: ["Keep comments scoped"]
+          },
+          spec: {
+            problem: "Dense planning content is hard to scan.",
+            acceptanceCriteria: [
+              "PlanningContext type exposes the new optional field.",
+              "Parser accepts planner outputs with and without the field.",
+              "Orchestrator persists the field without changing transitions.",
+              "Documentation explains the field for future planner personas."
+            ]
+          }
+        }
+      },
+      { maxAttempts: 4 }
+    );
+
+    expect(html).toContain("wizard-review-section wizard-review-wide");
+    expect(html).toContain("Acceptance criteria");
   });
 
   test("builds advisory and blocking contract warnings", () => {

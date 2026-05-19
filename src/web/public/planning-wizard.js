@@ -1,3 +1,4 @@
+(() => {
 const { escHtml, oneLine, toArray } =
   typeof window !== "undefined" && window.UiHelpers
     ? window.UiHelpers
@@ -111,6 +112,29 @@ function getPromptChips(kind, mode) {
   ];
 }
 
+function truncateReviewText(value, max = 150) {
+  const text = oneLine(value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}...`;
+}
+
+function buildFeedbackSeed(title, value) {
+  const text = truncateReviewText(value, 180);
+  return text
+    ? `${title}: "${text}" — `
+    : `${title}: `;
+}
+
+function renderCommentButton(title, value, targetId = "critique-spec-input") {
+  return `
+    <button type="button" class="wizard-comment-button"
+      data-feedback-target="${escHtml(targetId)}"
+      data-feedback-seed="${escHtml(buildFeedbackSeed(title, value))}">
+      Comment
+    </button>
+  `;
+}
+
 function renderChips(targetId, chips) {
   if (!chips.length) return "";
   return `
@@ -153,27 +177,46 @@ function renderHistoryDrawer(label, transcripts, maxAttempts) {
   `;
 }
 
+function isWideReviewSection(values) {
+  return values.length > 3 || values.some((value) => oneLine(value).length > 120);
+}
+
 function renderListCard(title, items) {
   const values = toArray(items).map((x) => oneLine(x)).filter(Boolean);
   if (!values.length) return "";
+  const wideClass = isWideReviewSection(values) ? " wizard-review-wide" : "";
   return `
-    <section class="wizard-card">
-      <h4>${escHtml(title)}</h4>
-      <ul>
-        ${values.map((value) => `<li>${escHtml(value)}</li>`).join("")}
+    <details class="wizard-review-section${wideClass}" open>
+      <summary>
+        <span class="wizard-review-title">${escHtml(title)}</span>
+        <span class="wizard-review-count">${values.length} ${values.length === 1 ? "item" : "items"}</span>
+        ${renderCommentButton(title, values.join("; "))}
+      </summary>
+      <ul class="wizard-review-list">
+        ${values.map((value) => `
+          <li class="wizard-review-item">
+            <span>${escHtml(value)}</span>
+            ${renderCommentButton(title, value)}
+          </li>
+        `).join("")}
       </ul>
-    </section>
+    </details>
   `;
 }
 
 function renderTextCard(title, value) {
   const text = oneLine(value);
   if (!text) return "";
+  const wideClass = text.length > 180 ? " wizard-review-wide" : "";
   return `
-    <section class="wizard-card">
-      <h4>${escHtml(title)}</h4>
-      <p>${escHtml(text)}</p>
-    </section>
+    <details class="wizard-review-section${wideClass}" open>
+      <summary>
+        <span class="wizard-review-title">${escHtml(title)}</span>
+        <span class="wizard-review-count">1 item</span>
+        ${renderCommentButton(title, text)}
+      </summary>
+      <div class="wizard-review-text">${escHtml(text)}</div>
+    </details>
   `;
 }
 
@@ -181,8 +224,12 @@ function renderDecisionCard(decisions) {
   const rows = toArray(decisions).filter((x) => x && typeof x === "object");
   if (!rows.length) return "";
   return `
-    <section class="wizard-card">
-      <h4>Decisions</h4>
+    <details class="wizard-review-section" open>
+      <summary>
+        <span class="wizard-review-title">Decisions</span>
+        <span class="wizard-review-count">${rows.length} ${rows.length === 1 ? "item" : "items"}</span>
+        ${renderCommentButton("Decisions", rows.map((row) => row?.decision).join("; "))}
+      </summary>
       <div class="wizard-decision-list">
         ${rows.map((row) => {
           const decision = oneLine(row.decision) || "(decision)";
@@ -191,7 +238,10 @@ function renderDecisionCard(decisions) {
           const alternatives = toArray(row.alternativesRejected).map((x) => oneLine(x)).filter(Boolean);
           return `
             <article class="wizard-decision-item">
-              <div class="wizard-decision-title">${escHtml(decision)}</div>
+              <div class="wizard-decision-title">
+                <span>${escHtml(decision)}</span>
+                ${renderCommentButton("Decision", decision)}
+              </div>
               ${reason ? `<p>${escHtml(reason)}</p>` : ""}
               ${alternatives.length ? `<p><strong>Alternatives:</strong> ${escHtml(alternatives.join("; "))}</p>` : ""}
               ${consequence ? `<p><strong>Consequence:</strong> ${escHtml(consequence)}</p>` : ""}
@@ -199,7 +249,7 @@ function renderDecisionCard(decisions) {
           `;
         }).join("")}
       </div>
-    </section>
+    </details>
   `;
 }
 
@@ -207,8 +257,12 @@ function renderQmdEvidence(task) {
   const qmd = buildQmdEvidence(task);
   if (qmd.state === "none") return "";
   return `
-    <section class="wizard-card wizard-qmd-card wizard-qmd-${escHtml(qmd.state)}">
-      <h4>QMD Evidence</h4>
+    <details class="wizard-review-section wizard-qmd-card wizard-qmd-${escHtml(qmd.state)}" open>
+      <summary>
+        <span class="wizard-review-title">QMD Evidence</span>
+        <span class="wizard-review-count">${escHtml(qmd.state)}</span>
+        ${renderCommentButton("QMD Evidence", [...qmd.chips, qmd.fallbackReason, ...qmd.documents].filter(Boolean).join("; "))}
+      </summary>
       <div class="wizard-chip-list">
         ${qmd.chips.map((chip) => `<span class="wizard-chip">${escHtml(chip)}</span>`).join("")}
       </div>
@@ -216,7 +270,7 @@ function renderQmdEvidence(task) {
       ${qmd.documents.length
         ? `<p class="wizard-qmd-note"><strong>Documents:</strong> ${escHtml(qmd.documents.join(", "))}</p>`
         : ""}
-    </section>
+    </details>
   `;
 }
 
@@ -224,10 +278,13 @@ function renderSpecCards(task) {
   const specArtifacts = task?.specArtifacts;
   if (!specArtifacts || typeof specArtifacts !== "object") {
     return `
-      <section class="wizard-card">
-        <h4>Spec not available yet</h4>
-        <p>The planner has not returned a structured discovery/spec payload for this attempt.</p>
-      </section>
+      <details class="wizard-review-section" open>
+        <summary>
+          <span class="wizard-review-title">Spec not available yet</span>
+          <span class="wizard-review-count">empty</span>
+        </summary>
+        <div class="wizard-review-text">The planner has not returned a structured discovery/spec payload for this attempt.</div>
+      </details>
     `;
   }
   const discovery = specArtifacts.discovery && typeof specArtifacts.discovery === "object"
@@ -340,9 +397,17 @@ function renderContractList(title, values) {
   const list = toArray(values).map((x) => oneLine(x)).filter(Boolean);
   return `
     <div class="wizard-contract-field">
-      <div class="wizard-contract-label">${escHtml(title)}</div>
+      <div class="wizard-contract-label">
+        <span>${escHtml(title)}</span>
+        ${renderCommentButton(title, list.join("; "), "critique-input")}
+      </div>
       ${list.length
-        ? `<ul>${list.map((item) => `<li>${escHtml(item)}</li>`).join("")}</ul>`
+        ? `<ul>${list.map((item) => `
+          <li class="wizard-review-item wizard-contract-item">
+            <span>${escHtml(item)}</span>
+            ${renderCommentButton(title, item, "critique-input")}
+          </li>
+        `).join("")}</ul>`
         : `<p class="wizard-contract-empty">-</p>`}
     </div>
   `;
@@ -361,6 +426,95 @@ function renderContractWarnings(warnings) {
           ${escHtml(warning.message)}
         </div>
       `).join("")}
+    </div>
+  `;
+}
+
+function splitSentences(text) {
+  const matches = oneLine(text).match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+  return matches.map((part) => oneLine(part)).filter(Boolean);
+}
+
+function splitAtReadableBoundary(text, maxLength = 130) {
+  const value = oneLine(text);
+  if (value.length <= maxLength) {
+    return { head: value, tail: "" };
+  }
+
+  const candidates = [
+    ". ",
+    "; ",
+    ": ",
+    ", and ",
+    ", ensure ",
+    ", default",
+    ", reject",
+    ", add ",
+    ", extend ",
+    ", wire ",
+    ", preserve "
+  ];
+
+  let best = -1;
+  for (const token of candidates) {
+    const idx = value.toLowerCase().lastIndexOf(token, maxLength);
+    if (idx > 60 && idx > best) {
+      best = idx + token.length;
+    }
+  }
+
+  if (best === -1) {
+    const fallback = value.lastIndexOf(" ", maxLength);
+    best = fallback > 60 ? fallback + 1 : maxLength;
+  }
+
+  return {
+    head: value.slice(0, best).trim(),
+    tail: value.slice(best).trim()
+  };
+}
+
+function buildReadableSubtaskDescription(description) {
+  const text = oneLine(description);
+  const sentences = splitSentences(text);
+  const first = sentences.shift() || text;
+  const split = splitAtReadableBoundary(first);
+  const headline = split.head || `Subtask`;
+  const notes = [split.tail, ...sentences]
+    .flatMap((note) => {
+      const pieces = [];
+      let remaining = oneLine(note);
+      while (remaining.length > 180) {
+        const next = splitAtReadableBoundary(remaining, 160);
+        pieces.push(next.head);
+        remaining = next.tail;
+        if (!remaining) break;
+      }
+      if (remaining) pieces.push(remaining);
+      return pieces;
+    })
+    .map((note) => oneLine(note))
+    .filter(Boolean);
+
+  return { headline, notes };
+}
+
+function renderReadableSubtaskDescription(sequence, description) {
+  const readable = buildReadableSubtaskDescription(description);
+  return `
+    <div class="wizard-subtask-summary">
+      <div class="wizard-subtask-title-row">
+        <h4>${escHtml(readable.headline)}</h4>
+        ${renderCommentButton(`Subtask #${sequence}`, description, "critique-input")}
+      </div>
+      ${readable.notes.length
+        ? `<div class="wizard-subtask-notes">
+            <div class="wizard-subtask-notes-label">Implementation notes</div>
+            <ul>
+              ${readable.notes.map((note) => `<li>${escHtml(note)}</li>`).join("")}
+            </ul>
+          </div>`
+        : ""}
     </div>
   `;
 }
@@ -389,7 +543,7 @@ function renderPlanSubtaskCards(subtasks, options = {}) {
           <span class="wizard-subtask-agent">${escHtml(agent)}</span>
           <span class="wizard-subtask-wip">WIP order ${sequence}</span>
         </header>
-        <h4>${escHtml(description)}</h4>
+        ${renderReadableSubtaskDescription(sequence, description)}
         ${behavior ? `<p class="wizard-subtask-behavior">${escHtml(behavior)}</p>` : ""}
         <p><strong>Depends on:</strong> ${deps.length ? escHtml(deps.join(", ")) : "-"}</p>
         ${renderContractList("Files in scope", files)}
@@ -402,7 +556,17 @@ function renderPlanSubtaskCards(subtasks, options = {}) {
   }).join("");
 }
 
-function renderStepper(currentStep) {
+function phaseStatusLabel(step, idx, currentIndex, status) {
+  if (idx < currentIndex) return "Done";
+  if (idx > currentIndex) return "Next";
+  if (status === "needs_operator") return "Needs review";
+  if (status === "waiting_on_planner") return "Working";
+  if (status === "blocked") return "Blocked";
+  if (status === "running") return "Running";
+  return "Current";
+}
+
+function renderStepper(currentStep, status = "idle") {
   const steps = getWizardSteps();
   const currentIndex = steps.indexOf(currentStep);
   return `
@@ -412,7 +576,10 @@ function renderStepper(currentStep) {
         return `
           <div class="wizard-step ${state}">
             <span class="wizard-step-dot">${idx + 1}</span>
-            <span class="wizard-step-label">${escHtml(step)}</span>
+            <span class="wizard-step-copy">
+              <span class="wizard-step-label">${escHtml(step)}</span>
+              <span class="wizard-step-state">${escHtml(phaseStatusLabel(step, idx, currentIndex, status))}</span>
+            </span>
           </div>
         `;
       }).join("")}
@@ -423,6 +590,7 @@ function renderStepper(currentStep) {
 function renderSpecReviewPanel(task, options) {
   const maxAttempts = Number(options?.maxAttempts || 1);
   const attemptCount = Number(task?.specAttempt || 0);
+  const displayAttempt = Math.min(attemptCount + 1, maxAttempts);
   const mode = getSpecReviewMode(task);
   const reviewState = classifyWizardPhase(task);
   const pendingSubmission = options?.pendingSubmission || null;
@@ -432,17 +600,17 @@ function renderSpecReviewPanel(task, options) {
   const chips = getPromptChips("spec", mode.mode);
   return `
     <div class="task-detail-actions wizard-panel">
-      ${renderStepper(reviewState.step)}
+      ${renderStepper(reviewState.step, reviewState.status)}
       <div class="wizard-header-row">
         <h3 class="wizard-title">Spec review</h3>
-        <span class="wizard-attempt">Attempt ${attemptCount + 1} / ${maxAttempts}</span>
+        <span class="wizard-attempt">Attempt ${displayAttempt} / ${maxAttempts}</span>
       </div>
       ${renderHistoryDrawer("Spec", task?.specTranscripts, maxAttempts)}
       ${blockingQuestion ? `<div class="wizard-blocking-question"><strong>Blocking question:</strong> ${escHtml(blockingQuestion)}</div>` : ""}
       ${pendingSubmission
         ? `<div class="wizard-pending-note"><strong>Submitted:</strong> ${escHtml(pendingSubmission.text)}</div>`
         : ""}
-      <div class="wizard-card-grid">
+      <div class="wizard-review-board">
         ${renderSpecCards(task)}
       </div>
       <div class="critique-wrapper">
@@ -474,6 +642,7 @@ function renderSpecReviewPanel(task, options) {
 function renderPlanReviewPanel(task, options) {
   const maxAttempts = Number(options?.maxAttempts || 1);
   const attemptCount = Number(task?.planAttempt || 0);
+  const displayAttempt = Math.min(attemptCount + 1, maxAttempts);
   const reviewState = classifyWizardPhase(task);
   const pendingSubmission = options?.pendingSubmission || null;
   const reviseDisabled = attemptCount >= (maxAttempts - 1);
@@ -481,10 +650,10 @@ function renderPlanReviewPanel(task, options) {
   const chips = getPromptChips("plan");
   return `
     <div class="task-detail-actions wizard-panel">
-      ${renderStepper(reviewState.step)}
+      ${renderStepper(reviewState.step, reviewState.status)}
       <div class="wizard-header-row">
         <h3 class="wizard-title">Plan review</h3>
-        <span class="wizard-attempt">Attempt ${attemptCount + 1} / ${maxAttempts}</span>
+        <span class="wizard-attempt">Attempt ${displayAttempt} / ${maxAttempts}</span>
       </div>
       ${renderHistoryDrawer("Plan", task?.planTranscripts, maxAttempts)}
       ${pendingSubmission
@@ -538,3 +707,4 @@ if (typeof window !== "undefined") {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = api;
 }
+})();

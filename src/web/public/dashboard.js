@@ -105,6 +105,26 @@ const EXECUTION_STATES = new Set(["executing", "reviewing", "reworking", "docume
 // (hardcoded rework cap; use server config if a dedicated setting is added later)
 const REWORK_MAX = 3;
 
+const EXECUTION_STAGE_STEPS = [
+  { key: "executing", label: "Code" },
+  { key: "reviewing", label: "Review" },
+  { key: "reworking", label: "Rework" },
+  { key: "documenting", label: "Docs" }
+];
+
+const ARCHIVABLE_STATES = new Set(["completed", "failed"]);
+
+function shouldShowExecutionProgress(task, subtasks) {
+  if (!subtasks.length) return false;
+  if (task.state === "awaiting_plan_approval") return false;
+  if (task.state === "awaiting_spec_approval" || task.state === "planning" || task.state === "replanning") return false;
+  return true;
+}
+
+function canArchiveTask(task) {
+  return ARCHIVABLE_STATES.has(task?.state);
+}
+
 function renderTaskList() {
   if (tasks.length === 0) {
     const msg = taskListTab === 'archived'
@@ -132,7 +152,9 @@ function renderTaskList() {
         const actionBtns = isArchivedView
           ? `<button class="task-card-action-btn" title="Restore task" onclick="unarchiveTask('${t.id}', event)">↩</button>
              <button class="task-card-action-btn task-card-delete-btn" title="Delete permanently" onclick="deleteTask('${t.id}', event)">⊗</button>`
-          : `<button class="task-card-action-btn" title="Archive task" onclick="archiveTask('${t.id}', event)">⊡</button>`;
+          : canArchiveTask(t)
+            ? `<button class="task-card-action-btn" title="Archive task" onclick="archiveTask('${t.id}', event)">⊡</button>`
+            : `<span class="task-card-action-btn task-card-action-btn-disabled" title="Archive is available after a task completes or fails" aria-disabled="true">⊡</span>`;
         return `
     <div class="task-card ${isRunning ? "running-pulse" : ""}" data-id="${t.id}">
       <div class="task-card-body">
@@ -478,30 +500,36 @@ function renderTaskDetail(task) {
       ${assessment.rationale ? `<p style="margin-top: 0.75rem; font-size: 0.85rem; color: var(--text-muted);">${esc(assessment.rationale)}</p>` : ""}
     </div>
 
-    ${EXECUTION_STATES.has(task.state) ? `
+    ${shouldShowExecutionProgress(task, subtasks) ? `
     <div class="detail-section exec-progress-section" id="exec-progress-header">
       ${renderExecProgressContent(task, [])}
     </div>` : ""}
 
     ${subtasks.length > 0 ? (() => {
-      const subtaskCards = subtasks.map((s) => `
+      const subtaskCards = subtasks.map((s) => {
+        const readable = buildExecutionSubtaskSummary(s.description || "");
+        return `
         <div class="subtask-item" data-subtask-id="${esc(s.id)}" data-subtask-status="pending">
           <div class="subtask-header">
             <span class="subtask-status-icon" aria-hidden="true"></span>
             <span class="subtask-seq">#${s.sequence}</span>
             <span class="subtask-agent">${esc(s.agentType ?? "coder")}</span>
-            <span class="subtask-desc">${esc(s.description)}</span>
+            <span class="subtask-state-label">Pending</span>
           </div>
-          ${s.filesInScope?.length ? `<div class="subtask-files">files: ${s.filesInScope.join(", ")}</div>` : ""}
-          ${s.testCriteria?.length ? `<div class="subtask-tests">
-            <div class="subtask-tests-label">Test criteria:</div>
-            <ul>${s.testCriteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
-          </div>` : ""}
+          <div class="subtask-summary">
+            <div class="subtask-title">${esc(readable.title || `Subtask ${s.sequence}`)}</div>
+            ${readable.notes.length
+              ? `<ul class="subtask-notes">${readable.notes.map((note) => `<li>${esc(note)}</li>`).join("")}</ul>`
+              : ""}
+          </div>
+          ${renderSubtaskFiles(s.filesInScope)}
+          ${renderSubtaskTests(s.testCriteria)}
           <div class="subtask-runtime"></div>
           <div class="subtask-history-strip"></div>
           <div class="subtask-shadow-wrap"></div>
         </div>
-      `).join("");
+      `;
+      }).join("");
       const heading = `Plan (${subtasks.length} subtask${subtasks.length !== 1 ? "s" : ""})`;
       // When the markdown plan is shown above (awaiting_plan_approval state), collapse
       // the raw structured view to avoid duplication. Otherwise keep it expanded so the
@@ -536,7 +564,93 @@ function renderTaskDetail(task) {
   wireCritiqueInput(task);
   wireSpecCritiqueInput(task);
   wireWizardPromptChips();
+  wireWizardCommentButtons();
   loadEvents(task.id, task.preloadedEvents ?? null);
+}
+
+/**
+ * Keep execution subtasks readable by turning planner-prose descriptions into
+ * a short work-item title plus supporting notes.
+ */
+function buildExecutionSubtaskSummary(description) {
+  const text = String(description ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return { title: "", notes: [] };
+  const sentences = text.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((x) => x.trim()).filter(Boolean) ?? [text];
+  const first = sentences.shift() ?? text;
+  const split = splitExecutionText(first, 118);
+  const notes = [split.tail, ...sentences]
+    .flatMap((note) => splitLongExecutionNote(note))
+    .filter(Boolean);
+  return { title: split.head, notes };
+}
+
+function splitExecutionText(text, maxLength) {
+  const value = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (value.length <= maxLength) return { head: value, tail: "" };
+  const boundaries = [". ", "; ", ": ", ", and ", ", add ", ", update ", ", wire ", ", ensure ", ", verify "];
+  let best = -1;
+  const lower = value.toLowerCase();
+  for (const boundary of boundaries) {
+    const idx = lower.lastIndexOf(boundary, maxLength);
+    if (idx > 55 && idx > best) best = idx + boundary.length;
+  }
+  if (best === -1) {
+    const fallback = value.lastIndexOf(" ", maxLength);
+    best = fallback > 55 ? fallback + 1 : maxLength;
+  }
+  return {
+    head: value.slice(0, best).trim(),
+    tail: value.slice(best).trim()
+  };
+}
+
+function splitLongExecutionNote(note) {
+  const pieces = [];
+  let remaining = String(note ?? "").replace(/\s+/g, " ").trim();
+  while (remaining.length > 180) {
+    const split = splitExecutionText(remaining, 155);
+    pieces.push(split.head);
+    remaining = split.tail;
+    if (!remaining) break;
+  }
+  if (remaining) pieces.push(remaining);
+  return pieces;
+}
+
+function renderSubtaskFiles(filesInScope) {
+  const files = Array.isArray(filesInScope)
+    ? filesInScope.map((file) => String(file ?? "").trim()).filter(Boolean)
+    : [];
+  if (!files.length) return "";
+  return `
+    <div class="subtask-files">
+      <span class="subtask-meta-label">Files</span>
+      <div class="subtask-file-list">
+        ${files.map((file) => `<code>${esc(file)}</code>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderSubtaskTests(testCriteria) {
+  const tests = Array.isArray(testCriteria)
+    ? testCriteria.map((item) => String(item ?? "").trim()).filter(Boolean)
+    : [];
+  if (!tests.length) return "";
+  return `
+    <details class="subtask-tests">
+      <summary>Test criteria (${tests.length})</summary>
+      <ul>${tests.map((criterion) => `<li>${esc(criterion)}</li>`).join("")}</ul>
+    </details>
+  `;
+}
+
+function subtaskStatusLabel(status) {
+  if (status === "done") return "Done";
+  if (status === "done_with_concerns") return "Concerns";
+  if (status === "failed") return "Failed";
+  if (status === "running") return "Running";
+  return "Pending";
 }
 
 /**
@@ -606,6 +720,51 @@ function computeExecProgressInfo(task, events) {
   return { currentIteration, doneInCurrentIter, totalSubtasks, activeSubtask, elapsedSeconds };
 }
 
+function executionStageFromEvents(task, events) {
+  if (EXECUTION_STAGE_STEPS.some((step) => step.key === task.state)) {
+    return task.state;
+  }
+  const failure = [...events].reverse().find((ev) => ev.type === "failure_analysis");
+  const failedStage = failure?.payload?.stage_failed ?? failure?.stageFailed;
+  if (failedStage === "reviewing" || failedStage === "reviewer") return "reviewing";
+  if (failedStage === "reworking") return "reworking";
+  if (failedStage === "documenting" || failedStage === "doc") return "documenting";
+  if (failedStage === "executing" || failedStage === "coder") return "executing";
+  if (task.state === "awaiting_approval" || task.state === "pr_created" || task.state === "completed") {
+    return "reviewing";
+  }
+  return "executing";
+}
+
+function executionStageIndex(stage) {
+  const idx = EXECUTION_STAGE_STEPS.findIndex((step) => step.key === stage);
+  return idx === -1 ? 0 : idx;
+}
+
+function renderExecutionStageTrack(task, events) {
+  const stage = executionStageFromEvents(task, events);
+  const currentIndex = executionStageIndex(stage);
+  const paused = task.state === "awaiting_intervention";
+  const failed = task.state === "failed";
+  return `
+    <div class="exec-stage-track" aria-label="Execution stage progress">
+      ${EXECUTION_STAGE_STEPS.map((step, idx) => {
+        const stageClass = idx < currentIndex ? "done" : idx === currentIndex ? failed ? "failed" : paused ? "paused" : "current" : "todo";
+        const stateLabel = idx < currentIndex ? "Done" : idx === currentIndex ? failed ? "Failed" : paused ? "Paused" : "Now" : "Next";
+        return `
+          <div class="exec-stage ${stageClass}">
+            <span class="exec-stage-dot">${idx + 1}</span>
+            <span class="exec-stage-copy">
+              <span class="exec-stage-label">${esc(step.label)}</span>
+              <span class="exec-stage-state">${esc(stateLabel)}</span>
+            </span>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function renderExecProgressContent(task, events) {
   const { currentIteration, doneInCurrentIter, totalSubtasks, activeSubtask, elapsedSeconds } =
     computeExecProgressInfo(task, events);
@@ -614,11 +773,10 @@ function renderExecProgressContent(task, events) {
   const { inputTokens, outputTokens, estimatedCostUsd } = summarizeTokenUsage(events);
 
   const stateBadge = `<span class="badge badge-state" data-state="${esc(task.state)}">${formatState(task.state)}</span>`;
-  const iterLine = `<span class="exec-iter">Iteration ${currentIteration} of ${REWORK_MAX}</span>`;
   const subtaskNoun = totalSubtasks !== 1 ? "subtasks" : "subtask";
-  const subtaskLine = hasEvents
-    ? `<span class="exec-subtasks-done">${doneInCurrentIter} of ${totalSubtasks} ${subtaskNoun} done in iteration ${currentIteration}</span>`
-    : `<span class="exec-subtasks-done exec-placeholder">— of ${totalSubtasks} ${subtaskNoun} done</span>`;
+  const progressLabel = hasEvents
+    ? `${doneInCurrentIter} / ${totalSubtasks} ${subtaskNoun}`
+    : `0 / ${totalSubtasks} ${subtaskNoun}`;
 
   let activeHtml;
   if (activeSubtask) {
@@ -641,25 +799,46 @@ function renderExecProgressContent(task, events) {
     activeHtml = `<div class="exec-active exec-placeholder">No active subtask</div>`;
   }
 
-  const tokensHtml = hasEvents && (inputTokens > 0 || outputTokens > 0)
-    ? `<div class="exec-tokens">
-        <span class="exec-token-stat"><span class="exec-token-label">Input</span> ${inputTokens.toLocaleString()}</span>
-        <span class="exec-token-stat"><span class="exec-token-label">Output</span> ${outputTokens.toLocaleString()}</span>
-        <span class="exec-token-stat"><span class="exec-token-label">Est. cost</span> $${estimatedCostUsd.toFixed(4)}</span>
-      </div>`
-    : `<div class="exec-tokens exec-placeholder">Token usage will appear after the first agent event.</div>`;
+  const tokenLabel = hasEvents && (inputTokens > 0 || outputTokens > 0)
+    ? `${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out`
+    : "Waiting for agent events";
+  const costLabel = hasEvents && (inputTokens > 0 || outputTokens > 0)
+    ? `$${estimatedCostUsd.toFixed(4)}`
+    : "—";
+  const activeLabel = activeSubtask
+    ? `#${activeSubtask.sequence} ${activeSubtask.agentType ?? "coder"}`
+    : hasEvents ? "None" : "Loading";
 
   return `
     <div class="exec-progress-title-row">
       <h3 class="exec-progress-title">Execution Progress</h3>
       ${stateBadge}
     </div>
-    <div class="exec-progress-meta">
-      ${iterLine}
-      ${subtaskLine}
+    ${renderExecutionStageTrack(task, events)}
+    <div class="exec-summary-grid">
+      <div class="exec-summary-item">
+        <span class="exec-summary-label">Iteration</span>
+        <span class="exec-summary-value">${currentIteration} / ${REWORK_MAX}</span>
+      </div>
+      <div class="exec-summary-item">
+        <span class="exec-summary-label">Subtasks</span>
+        <span class="exec-summary-value">${esc(progressLabel)}</span>
+      </div>
+      <div class="exec-summary-item">
+        <span class="exec-summary-label">Active</span>
+        <span class="exec-summary-value">${esc(activeLabel)}</span>
+      </div>
+      <div class="exec-summary-item">
+        <span class="exec-summary-label">Tokens</span>
+        <span class="exec-summary-value">${esc(tokenLabel)}</span>
+      </div>
+      <div class="exec-summary-item">
+        <span class="exec-summary-label">Est. cost</span>
+        <span class="exec-summary-value">${esc(costLabel)}</span>
+      </div>
     </div>
     ${activeHtml}
-    ${tokensHtml}`;
+  `;
 }
 
 function updateExecProgressHeader(events) {
@@ -728,6 +907,29 @@ function wireWizardPromptChips() {
       input.value = next;
       input.dispatchEvent(new Event("input"));
       input.focus();
+    });
+  });
+}
+
+function wireWizardCommentButtons() {
+  const buttons = document.querySelectorAll(".wizard-comment-button");
+  buttons.forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const targetId = button.getAttribute("data-feedback-target");
+      const seed = button.getAttribute("data-feedback-seed");
+      if (!targetId || !seed) return;
+      const input = document.getElementById(targetId);
+      if (!input) return;
+      const prefix = input.value.trim() ? "\n- " : "- ";
+      input.value = `${input.value.trim()}${prefix}${seed}`;
+      input.dispatchEvent(new Event("input"));
+      input.focus();
+      if (typeof input.setSelectionRange === "function") {
+        const end = input.value.length;
+        input.setSelectionRange(end, end);
+      }
     });
   });
 }
@@ -1079,6 +1281,10 @@ function updateSubtaskCards(events, task) {
     }
 
     el.setAttribute("data-subtask-status", status);
+    const statusLabelEl = el.querySelector(".subtask-state-label");
+    if (statusLabelEl) {
+      statusLabelEl.textContent = subtaskStatusLabel(status);
+    }
 
     // --- Populate runtime div (executor, elapsed, tokens) ---
     const runtimeEl = el.querySelector(".subtask-runtime");
@@ -1704,6 +1910,11 @@ async function submitSteering(taskId, btnEl) {
 
 async function archiveTask(taskId, event) {
   event.stopPropagation();
+  const task = tasks.find((candidate) => candidate.id === taskId);
+  if (task && !canArchiveTask(task)) {
+    toast("Archive is available after the task completes or fails. Cancel the task first if you want to archive it.", "error");
+    return;
+  }
   try {
     const res = await fetch(`${API}/api/tasks/${taskId}/archive`, { method: 'POST' });
     if (!res.ok) throw new Error(await res.text());
