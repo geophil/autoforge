@@ -7,6 +7,7 @@ let plannerMaxIterations = 3;
 let plannerSpecMaxIterations = 3;
 let taskListTab = 'active'; // 'active' | 'archived'
 let currentTask = null;
+let runtimeStatus = null;
 const pendingReviewSubmissions = new Map();
 
 // --- DOM refs ---
@@ -14,6 +15,7 @@ const badge = document.getElementById("connection-badge");
 const taskList = document.getElementById("task-list");
 const detailContent = document.getElementById("task-detail-content");
 const metricsGrid = document.getElementById("metrics-grid");
+const runtimeGrid = document.getElementById("runtime-grid");
 
 // --- Navigation ---
 document.querySelectorAll(".nav-btn").forEach((btn) => {
@@ -41,6 +43,10 @@ function showView(name) {
 document.getElementById("btn-back-to-tasks").addEventListener("click", () => {
   showView("tasks");
   currentTaskId = null;
+});
+
+document.getElementById("btn-refresh-runtime")?.addEventListener("click", () => {
+  loadRuntimeStatus();
 });
 
 // --- SSE ---
@@ -91,6 +97,84 @@ async function refreshTasks() {
   } catch {
     taskList.innerHTML = `<div class="empty-state">Failed to load tasks.</div>`;
   }
+}
+
+// --- Runtime readiness ---
+async function loadRuntimeStatus() {
+  if (!runtimeGrid) return;
+  runtimeGrid.innerHTML = `<div class="runtime-empty">Checking runtime setup...</div>`;
+  try {
+    const res = await fetch(`${API}/api/runtime`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    runtimeStatus = await res.json();
+    renderRuntimeStatus();
+  } catch (error) {
+    runtimeGrid.innerHTML = `
+      <div class="runtime-tile" data-state="danger">
+        <div class="runtime-tile-main">
+          <span class="runtime-dot"></span>
+          <span class="runtime-label">Runtime</span>
+          <span class="runtime-value">Unavailable</span>
+        </div>
+        <div class="runtime-detail">${esc(error instanceof Error ? error.message : String(error))}</div>
+      </div>`;
+  }
+}
+
+function renderRuntimeStatus() {
+  if (!runtimeGrid || !runtimeStatus) return;
+  runtimeGrid.innerHTML = [
+    renderQmdRuntimeTile(runtimeStatus.qmd),
+    renderWorkspaceRuntimeTile(runtimeStatus.workspace)
+  ].join("");
+}
+
+function renderQmdRuntimeTile(qmd) {
+  const state = qmd?.available ? "ok" : qmd?.configured ? "danger" : "warn";
+  const value = qmd?.available ? "Available" : qmd?.configured ? "Unreachable" : "Not configured";
+  const detail = qmd?.available
+    ? `${qmd.url}${typeof qmd.httpStatus === "number" ? ` · HTTP ${qmd.httpStatus}` : ""}`
+    : qmd?.configured
+      ? `${qmd.url} · ${qmd.error || "probe failed"}`
+      : "Set QMD_MCP_URL to enable knowledgebase grounding.";
+  return runtimeTile("QMD MCP", value, detail, state);
+}
+
+function renderWorkspaceRuntimeTile(workspace) {
+  const docker = workspace?.docker || {};
+  if (workspace?.provider !== "docker") {
+    return runtimeTile(
+      "Task workspace",
+      "Local worktrees",
+      "Set WORKSPACE_PROVIDER=docker to run task tools in containers.",
+      "warn"
+    );
+  }
+
+  const status = docker.status;
+  const state = status === "ready" ? "ok" : status === "unavailable" ? "danger" : "warn";
+  const value = status === "ready"
+    ? "Docker ready"
+    : status === "unavailable"
+      ? "Docker issue"
+      : "Docker configured";
+  const failedCheck = Array.isArray(docker.checks) ? docker.checks.find((check) => !check.ok) : null;
+  const detail = failedCheck
+    ? `${failedCheck.name}: ${failedCheck.error || `exit ${failedCheck.exitCode}`}`
+    : `${docker.image || "image unset"} · network ${docker.network || "unset"} · ${docker.cpus || "?"} CPU · ${docker.memory || "?"}`;
+  return runtimeTile("Task workspace", value, detail, state);
+}
+
+function runtimeTile(label, value, detail, state) {
+  return `
+    <div class="runtime-tile" data-state="${esc(state)}">
+      <div class="runtime-tile-main">
+        <span class="runtime-dot"></span>
+        <span class="runtime-label">${esc(label)}</span>
+        <span class="runtime-value">${esc(value)}</span>
+      </div>
+      <div class="runtime-detail">${esc(detail)}</div>
+    </div>`;
 }
 
 // States that mean "server is actively doing something with this task right now"
@@ -2421,5 +2505,6 @@ async function loadConfig() {
 
 // --- Init ---
 loadConfig();
+loadRuntimeStatus();
 connectSSE();
 refreshTasks();

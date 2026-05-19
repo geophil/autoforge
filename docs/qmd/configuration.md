@@ -107,12 +107,14 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Type**: string (optional)
 - **Default**: unset
 - **Affects**: `domain-agent-execution.md` — when set, `OrchestratorService.agentEnvironment()` forwards this non-secret URL to task-facing planner/coder/reviewer/doc/doc-review runs. The harness `exec` tool can use it to reach QMD MCP-backed flows where configured. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
+- **Dashboard visibility**: `/api/runtime` probes this URL and the dashboard Runtime panel reports whether QMD MCP is configured and reachable. For host-local dev with the Compose QMD service, set `QMD_MCP_URL=http://127.0.0.1:8181/mcp` before `bun run dev`.
 
 ### `WORKSPACE_PROVIDER`
 
 - **Type**: `"local"` or `"docker"`
 - **Default**: `"local"`
-- **Affects**: Agent workspace isolation. `local` runs agent tools directly in the task worktree, matching legacy behavior. `docker` creates one local Docker container per agent dispatch and mounts the task worktree at `/workspace`.
+- **Affects**: Agent workspace isolation. `local` runs agent tools directly in the task worktree, matching legacy behavior. `docker` creates one local Docker container per task and mounts the task worktree at `/workspace`.
+- **Dashboard visibility**: `/api/runtime` reports the active workspace provider. When Docker mode is enabled and `WORKSPACE_DOCKER_PRECHECK=1`, it also runs the same Docker daemon/image checks used before creating the first container workspace.
 - **Rollback**: Set `WORKSPACE_PROVIDER=local` and restart Autoforge.
 
 ### `WORKSPACE_DOCKER_IMAGE`

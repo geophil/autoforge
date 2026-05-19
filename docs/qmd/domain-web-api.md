@@ -75,6 +75,7 @@ publish(event: { type: string; data: unknown }): void {
 | `GET`  | `/` | `server.ts` | Static HTML dashboard (`src/web/public/index.html`) |
 | `GET`  | `/api/health` | `server.ts` | Health check — returns `{ status, uptime }` |
 | `GET`  | `/api/config` | `server.ts` | Dashboard config: `{ plannerMaxIterations, plannerSpecMaxIterations }` |
+| `GET`  | `/api/runtime` | `server.ts` | Runtime readiness for the dashboard: QMD MCP probe plus workspace/container mode |
 | `POST` | `/api/tasks` | `tasks.ts` | Submit a new task; returns the task object directly |
 | `GET`  | `/api/tasks` | `tasks.ts` | List tasks; supports `archived=true` and `includeArchived=true` |
 | `GET`  | `/api/tasks/:id` | `tasks.ts` | Get single task |
@@ -149,7 +150,7 @@ POST /api/tasks/:id/approve
 
 ### SSE Dashboard Flow
 
-The static dashboard at `GET /` polls `/api/tasks` on load, then subscribes to `/api/events` via `EventSource`. On receiving a `task.updated` event, it refreshes the task list.
+The static dashboard at `GET /` polls `/api/runtime` and `/api/tasks` on load, then subscribes to `/api/events` via `EventSource`. On receiving a `task.updated` event, it refreshes the task list. The runtime panel surfaces whether `QMD_MCP_URL` is configured and reachable, and whether task workspaces are local worktrees or Docker containers.
 
 ```javascript
 // src/web/public/dashboard.js

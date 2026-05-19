@@ -13,6 +13,9 @@ import type { OrchestratorService } from "../orchestrator/service";
 import type { DbClient } from "../db/client";
 import { LiveEventHub } from "./events";
 import { loadEnv, type AppEnv } from "../config/env";
+import { buildDockerPreflightChecks } from "../runtime/container-diagnostics";
+import { spawnAsExecEvents } from "../runtime/spawn-streaming";
+import type { ExecEvent } from "../runtime/workspace";
 
 export function createWebServer(
   service: OrchestratorService,
@@ -42,6 +45,21 @@ export function createWebServer(
     });
   });
 
+  app.get("/api/runtime", async (ctx) => {
+    const [qmd, docker] = await Promise.all([
+      probeQmdMcp(env.QMD_MCP_URL),
+      inspectDockerWorkspace(env)
+    ]);
+    return ctx.json({
+      qmd,
+      workspace: {
+        provider: env.WORKSPACE_PROVIDER,
+        taskExecutionMode: env.WORKSPACE_PROVIDER === "docker" ? "docker_container" : "local_worktree",
+        docker
+      }
+    });
+  });
+
   app.get("/api/events", (ctx) => {
     return streamSSE(ctx, async (stream) => {
       const unsubscribe = events.subscribe((payload) => {
@@ -63,4 +81,109 @@ export function createWebServer(
   app.get("/", serveStatic({ path: "./src/web/public/index.html" }));
 
   return app;
+}
+
+async function probeQmdMcp(url: string | undefined): Promise<{
+  configured: boolean;
+  available: boolean;
+  status: "not_configured" | "available" | "unreachable";
+  url: string | null;
+  httpStatus?: number;
+  error?: string;
+}> {
+  if (!url) {
+    return { configured: false, available: false, status: "not_configured", url: null };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1_500);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { accept: "application/json, text/event-stream, */*" },
+      signal: controller.signal
+    });
+    const available = response.status < 500 && response.status !== 404;
+    return {
+      configured: true,
+      available,
+      status: available ? "available" : "unreachable",
+      url,
+      httpStatus: response.status,
+      ...(available ? {} : { error: `HTTP ${response.status}` })
+    };
+  } catch (error) {
+    return {
+      configured: true,
+      available: false,
+      status: "unreachable",
+      url,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function inspectDockerWorkspace(env: AppEnv): Promise<{
+  enabled: boolean;
+  image: string;
+  network: string;
+  cpus: string;
+  memory: string;
+  precheckEnabled: boolean;
+  reapOnStart: boolean;
+  status: "not_enabled" | "ready" | "unavailable" | "not_checked";
+  checks: Array<{ name: string; ok: boolean; exitCode: number; error?: string }>;
+}> {
+  const base = {
+    enabled: env.WORKSPACE_PROVIDER === "docker",
+    image: env.WORKSPACE_DOCKER_IMAGE,
+    network: env.WORKSPACE_DOCKER_NETWORK,
+    cpus: env.WORKSPACE_DOCKER_CPUS,
+    memory: env.WORKSPACE_DOCKER_MEMORY,
+    precheckEnabled: env.WORKSPACE_DOCKER_PRECHECK === "1",
+    reapOnStart: env.WORKSPACE_DOCKER_REAP_ON_START === "1"
+  };
+
+  if (!base.enabled) {
+    return { ...base, status: "not_enabled", checks: [] };
+  }
+
+  if (!base.precheckEnabled) {
+    return { ...base, status: "not_checked", checks: [] };
+  }
+
+  const checks = [];
+  for (const check of buildDockerPreflightChecks(env.WORKSPACE_DOCKER_IMAGE)) {
+    const result = await collectExec(spawnAsExecEvents(check.cmd, check.args, { timeoutSeconds: 2 }));
+    checks.push({
+      name: [check.cmd, ...check.args].join(" "),
+      ok: result.exitCode === 0,
+      exitCode: result.exitCode,
+      ...(result.exitCode === 0 ? {} : { error: result.stderr.trim() || result.stdout.trim() || "check failed" })
+    });
+  }
+
+  return {
+    ...base,
+    status: checks.every((check) => check.ok) ? "ready" : "unavailable",
+    checks
+  };
+}
+
+async function collectExec(events: AsyncIterable<ExecEvent>): Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}> {
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+  for await (const event of events) {
+    if (event.kind === "stdout") stdout += event.chunk;
+    if (event.kind === "stderr") stderr += event.chunk;
+    if (event.kind === "exit") exitCode = event.exitCode;
+  }
+  return { stdout, stderr, exitCode };
 }

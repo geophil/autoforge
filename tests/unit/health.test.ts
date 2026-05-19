@@ -28,3 +28,51 @@ describe("GET /api/health", () => {
     expect(body.uptime).toBeGreaterThanOrEqual(0);
   });
 });
+
+describe("GET /api/runtime", () => {
+  test("reports local workspace mode and unconfigured QMD by default", async () => {
+    const app = createWebServer(stubService, stubDb, testEnv());
+    const res = await app.request("/api/runtime");
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.qmd).toMatchObject({
+      configured: false,
+      available: false,
+      status: "not_configured",
+      url: null
+    });
+    expect(body.workspace).toMatchObject({
+      provider: "local",
+      taskExecutionMode: "local_worktree"
+    });
+    expect(body.workspace.docker.status).toBe("not_enabled");
+  });
+
+  test("probes configured QMD MCP URL", async () => {
+    const app = createWebServer(stubService, stubDb, testEnv({ QMD_MCP_URL: "data:text/plain,ok" }));
+    const res = await app.request("/api/runtime");
+    const body = await res.json();
+
+    expect(body.qmd.configured).toBe(true);
+    expect(body.qmd.available).toBe(true);
+    expect(body.qmd.status).toBe("available");
+    expect(body.qmd.httpStatus).toBe(200);
+  });
+
+  test("reports docker workspace config without preflight when disabled", async () => {
+    const app = createWebServer(
+      stubService,
+      stubDb,
+      testEnv({ WORKSPACE_PROVIDER: "docker", WORKSPACE_DOCKER_PRECHECK: "0" })
+    );
+    const res = await app.request("/api/runtime");
+    const body = await res.json();
+
+    expect(body.workspace.provider).toBe("docker");
+    expect(body.workspace.taskExecutionMode).toBe("docker_container");
+    expect(body.workspace.docker.enabled).toBe(true);
+    expect(body.workspace.docker.precheckEnabled).toBe(false);
+    expect(body.workspace.docker.status).toBe("not_checked");
+  });
+});

@@ -31,6 +31,16 @@
         <button class="btn btn-primary" id="btn-new-task">New Task</button>
       </div>
 
+      <section class="runtime-panel" id="runtime-panel" aria-label="Runtime readiness">
+        <div class="runtime-panel-top">
+          <h3>Runtime</h3>
+          <button class="btn btn-ghost btn-sm" id="btn-refresh-runtime" type="button">Refresh</button>
+        </div>
+        <div class="runtime-grid" id="runtime-grid">
+          <div class="runtime-empty">Checking runtime setup...</div>
+        </div>
+      </section>
+
       <dialog id="dialog-new-task">
         <form id="form-new-task" method="dialog">
           <p class="wizard-describe-kicker">Step 1 of 4</p>
