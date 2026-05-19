@@ -16,6 +16,10 @@ type WizardModule = {
     fallbackReason: string | null;
   };
   getPromptChips: (kind: "spec" | "plan", mode?: string) => string[];
+  buildContractWarnings: (
+    subtask: Record<string, unknown>,
+    options?: Record<string, unknown>
+  ) => Array<{ level: string; message: string }>;
   renderPlanSubtaskCards: (subtasks: Array<Record<string, unknown>>) => string;
 };
 
@@ -122,26 +126,52 @@ describe("planning wizard helpers", () => {
         id: "t1-subtask-1",
         sequence: 1,
         description: "Create wizard module",
+        behavior: "Render the planning wizard helper module.",
         agentType: "coder",
         filesInScope: ["src/web/public/planning-wizard.js"],
         dependencies: [],
-        testCriteria: ["Unit tests for phase classification"]
+        verificationCommands: ["bun test tests/unit/planning-wizard.test.ts"],
+        testCriteria: ["Unit tests for phase classification"],
+        completionEvidence: ["planning-wizard.test.ts passes"]
       },
       {
         id: "t1-subtask-2",
         sequence: 2,
         description: "Wire dashboard rendering",
+        behavior: "Use the module from task detail rendering.",
         agentType: "coder",
         filesInScope: ["src/web/public/dashboard.js"],
         dependencies: ["t1-subtask-1"],
-        testCriteria: ["Spec + plan cards render in review states"]
+        verificationCommands: ["bun test tests/unit/planning-wizard.test.ts"],
+        testCriteria: ["Spec + plan cards render in review states"],
+        completionEvidence: ["dashboard render path covered"]
       }
     ]);
 
     expect(html).toContain("Create wizard module");
     expect(html).toContain("Wire dashboard rendering");
     expect(html).toContain("<strong>Depends on:</strong> #1");
+    expect(html).toContain("Verification commands");
+    expect(html).toContain("Completion evidence");
+    expect(html).toContain("WIP order 2");
     expect(html).toContain("Unit tests for phase classification");
     expect(html).toContain("Spec + plan cards render in review states");
+  });
+
+  test("builds advisory and blocking contract warnings", () => {
+    const warnings = wizard.buildContractWarnings(
+      {
+        description: "Broad change",
+        filesInScope: ["src/"],
+        verificationCommands: ["bun test"],
+        testCriteria: ["passes"],
+        completionEvidence: ["tests pass"]
+      },
+      { tier: "THOROUGH" }
+    );
+
+    expect(warnings.some((w) => w.level === "blocking" && w.message.includes("behavior"))).toBe(true);
+    expect(warnings.some((w) => w.level === "advisory" && w.message.includes("Scope is broad"))).toBe(true);
+    expect(warnings.some((w) => w.level === "advisory" && w.message.includes("THOROUGH"))).toBe(true);
   });
 });

@@ -277,6 +277,7 @@ function renderTaskDetail(task) {
   currentTask = task;
   const assessment = task.assessment || {};
   const subtasks = task.planSubtasks || [];
+  const detailEvents = normalizeEventPayloads(task.preloadedEvents ?? []);
 
   const terminalStates = ["completed", "failed"];
   const nonTerminalStates = [
@@ -330,6 +331,8 @@ function renderTaskDetail(task) {
     const toolStats = fa.tool_stats
       ? `<div class="forensic-row"><span class="forensic-label">Tool stats</span><span class="forensic-value"><code>${esc(JSON.stringify(fa.tool_stats))}</code></span></div>`
       : "";
+    const recommendation = getInterventionRecommendation(category, reason);
+    const recommendationHtml = renderInterventionRecommendation(recommendation);
 
     // Retry target: if planner failed, retrying "the failed stage" re-runs
     // planning. If coder failed, the operator can either re-run the coder
@@ -371,6 +374,7 @@ function renderTaskDetail(task) {
           ${toolStats}
           ${transcriptLink}
         </div>
+        ${recommendationHtml}
         <div class="intervention-rollback">
           <label for="retry-checkpoint-id" class="forensic-label">Rollback checkpoint (optional)</label>
           ${checkpoints.length > 0
@@ -519,6 +523,7 @@ function renderTaskDetail(task) {
     })() : ""}
 
     <div class="detail-section" id="findings-section">
+      ${renderPrGateReport(task, detailEvents)}
       <div id="cost-summary" class="cost-summary"></div>
       <details class="event-log-details"${["completed", "failed", "awaiting_intervention"].includes(task.state) ? " open" : ""}>
         <summary class="event-log-summary">Event log (forensics)</summary>
@@ -727,22 +732,86 @@ function wireWizardPromptChips() {
   });
 }
 
-// Per-token pricing (Claude Sonnet-class): $3/1M input, $15/1M output
-const INPUT_COST_PER_TOKEN = 3 / 1_000_000;
-const OUTPUT_COST_PER_TOKEN = 15 / 1_000_000;
-
 function summarizeTokenUsage(events) {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  for (const ev of events) {
-    if (ev.tokenUsage) {
-      inputTokens += ev.tokenUsage.input;
-      outputTokens += ev.tokenUsage.output;
-    }
+  return window.DashboardHelpers?.summarizeTokenUsage
+    ? window.DashboardHelpers.summarizeTokenUsage(events)
+    : { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, costSource: "unavailable" };
+}
+
+function normalizeEventPayloads(rawEvents) {
+  return (rawEvents || []).map((ev) => ({
+    ...ev,
+    payload: typeof ev.payload === "string" ? safeJsonParse(ev.payload, {}) : ev.payload
+  }));
+}
+
+function safeJsonParse(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
   }
-  const estimatedCostUsd =
-    inputTokens * INPUT_COST_PER_TOKEN + outputTokens * OUTPUT_COST_PER_TOKEN;
-  return { inputTokens, outputTokens, estimatedCostUsd };
+}
+
+function getTimelineSummary(ev) {
+  return window.DashboardHelpers?.eventTimelineSummary
+    ? window.DashboardHelpers.eventTimelineSummary(ev)
+    : { group: ev.agent ?? "event", label: ev.type, details: [] };
+}
+
+function getInterventionRecommendation(category, reason) {
+  return window.DashboardHelpers?.interventionRecommendation
+    ? window.DashboardHelpers.interventionRecommendation(category, reason)
+    : {
+      title: "Inspect transcript and retry from failed stage",
+      body: reason || "Use the transcript and event log to choose a retry path.",
+      primaryStage: null,
+      secondaryStage: null,
+      focus: "transcript"
+    };
+}
+
+function renderInterventionRecommendation(recommendation) {
+  const primary = recommendation.primaryStage
+    ? `<span class="recommendation-chip">Primary: retry ${esc(recommendation.primaryStage)}</span>`
+    : `<span class="recommendation-chip">Primary: inspect transcript</span>`;
+  const secondary = recommendation.secondaryStage
+    ? `<span class="recommendation-chip recommendation-chip-secondary">Also: retry ${esc(recommendation.secondaryStage)}</span>`
+    : "";
+  return `
+    <div class="intervention-recommendation">
+      <div class="recommendation-title">${esc(recommendation.title)}</div>
+      <div class="recommendation-body">${esc(recommendation.body)}</div>
+      <div class="recommendation-chips">${primary}${secondary}<span class="recommendation-chip recommendation-chip-secondary">Focus: ${esc(recommendation.focus)}</span></div>
+    </div>`;
+}
+
+function renderPrGateReport(task, events) {
+  const report = window.DashboardHelpers?.buildPrGateReport
+    ? window.DashboardHelpers.buildPrGateReport(task, events)
+    : { state: "unavailable", title: "PR gate report unavailable", reason: "", rows: [] };
+  if (report.state === "unavailable") {
+    return "";
+  }
+  const rows = report.rows.length
+    ? report.rows.map(([label, value]) => {
+      const isUrl = label === "PR" && /^https?:\/\//.test(String(value));
+      return `<div class="pr-gate-row">
+        <span class="pr-gate-label">${esc(label)}</span>
+        <span class="pr-gate-value">${isUrl ? `<a href="${esc(value)}" target="_blank">${esc(value)}</a>` : esc(value)}</span>
+      </div>`;
+    }).join("")
+    : `<div class="pr-gate-empty">${esc(report.reason || "No PR gate evidence recorded yet.")}</div>`;
+  return `
+    <section class="pr-gate-report pr-gate-${esc(report.state)}">
+      <div class="pr-gate-header">
+        <h3>PR Gate Report</h3>
+        <span class="pr-gate-state">${esc(report.state)}</span>
+      </div>
+      <div class="pr-gate-title">${esc(report.title)}</div>
+      ${report.reason ? `<div class="pr-gate-reason">${esc(report.reason)}</div>` : ""}
+      <div class="pr-gate-grid">${rows}</div>
+    </section>`;
 }
 
 const AGENT_COLORS = {
@@ -788,20 +857,27 @@ async function loadEvents(taskId, preloadedRawEvents = null) {
       const res = await fetch(`${API}/api/tasks/${taskId}/events`);
       rawEvents = await res.json();
     }
-    const events = rawEvents.map((ev) => ({
-      ...ev,
-      payload: typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload
-    }));
+    const events = normalizeEventPayloads(rawEvents);
     if (events.length === 0) {
       container.innerHTML = `<span style="color: var(--text-dim); font-size: 0.85rem;">No events yet.</span>`;
       return;
     }
     container.innerHTML = events
       .map((ev) => {
+        const summary = getTimelineSummary(ev);
         const agentCol = agentColor(ev.agent);
         const dotColor = statusColor(ev.status);
         const elapsed = ev.elapsedSeconds !== null ? `<span class="tl-meta">${formatElapsed(ev.elapsedSeconds)}</span>` : "";
         const tokens = ev.tokenUsage ? `<span class="tl-meta">${ev.tokenUsage.input + ev.tokenUsage.output} tok</span>` : "";
+        const eventCost = window.DashboardHelpers?.summarizeTokenUsage
+          ? window.DashboardHelpers.summarizeTokenUsage([ev])
+          : null;
+        const cost = eventCost && eventCost.estimatedCostUsd > 0
+          ? `<span class="tl-meta">$${eventCost.estimatedCostUsd.toFixed(4)}${eventCost.costSource === "fallback_estimate" ? " est." : ""}</span>`
+          : "";
+        const details = summary.details.length
+          ? `<div class="tl-details">${summary.details.map((item) => `<span>${esc(item)}</span>`).join("")}</div>`
+          : "";
         const failureBadge = ev.failureCategory
           ? `<span class="tl-failure-badge">${esc(ev.failureCategory)}</span>`
           : "";
@@ -825,22 +901,23 @@ async function loadEvents(taskId, preloadedRawEvents = null) {
           <div class="tl-item" data-type="${esc(ev.type)}" data-agent="${esc(ev.agent ?? "")}" ${clickAttr}>
             <span class="tl-dot" style="background:${dotColor}"></span>
             <div class="tl-body">
+              <span class="tl-group">${esc(summary.group)}</span>
               <span class="tl-agent" style="color:${agentCol}">${esc(ev.agent)}</span>
-              <span class="tl-type">${esc(ev.type)}</span>
-              ${failureBadge}${elapsed}${tokens}
+              <span class="tl-type">${esc(summary.label)}</span>
+              ${failureBadge}${elapsed}${tokens}${cost}
               <span class="tl-time">${timeAgo(ev.timestamp)}</span>
-              ${failureReason}${rejectionCategories}${rejectionGuidance}${restartLink}
+              ${details}${failureReason}${rejectionCategories}${rejectionGuidance}${restartLink}
             </div>
           </div>`;
       })
       .join("");
 
-    const { inputTokens, outputTokens, estimatedCostUsd } = summarizeTokenUsage(events);
+    const { inputTokens, outputTokens, estimatedCostUsd, costSource } = summarizeTokenUsage(events);
     if (costSummary && (inputTokens > 0 || outputTokens > 0)) {
       costSummary.innerHTML = `
         <span class="cost-stat"><span class="cost-label">Input</span> ${inputTokens.toLocaleString()} tok</span>
         <span class="cost-stat"><span class="cost-label">Output</span> ${outputTokens.toLocaleString()} tok</span>
-        <span class="cost-stat"><span class="cost-label">Est. cost</span> $${estimatedCostUsd.toFixed(4)}</span>`;
+        <span class="cost-stat"><span class="cost-label">${costSource === "persisted" ? "Cost" : "Est. cost"}</span> $${estimatedCostUsd.toFixed(4)}</span>`;
     }
 
     updateSubtaskCards(events, currentTask);
@@ -1030,11 +1107,8 @@ function updateSubtaskCards(events, task) {
           const tu =
             latestDoneEvent.tokenUsage ?? latestDoneEvent.payload?.tokenUsage ?? null;
           if (tu && (tu.input > 0 || tu.output > 0)) {
-            const cost = (
-              tu.input * INPUT_COST_PER_TOKEN +
-              tu.output * OUTPUT_COST_PER_TOKEN
-            ).toFixed(4);
-            tokenDisplay = `${tu.input.toLocaleString()} in / ${tu.output.toLocaleString()} out · $${cost}`;
+            const summary = summarizeTokenUsage([{ ...latestDoneEvent, tokenUsage: tu }]);
+            tokenDisplay = `${tu.input.toLocaleString()} in / ${tu.output.toLocaleString()} out · $${summary.estimatedCostUsd.toFixed(4)}`;
           }
         } else if (currentIterStartedEvent && status === "running") {
           // Live elapsed from the current iteration's started event (executor unknown until done)
@@ -1882,6 +1956,10 @@ async function openTranscript(transcriptId) {
         const taskRes = await fetch(`${API}/api/tasks/${currentTranscript.taskId}`);
         if (taskRes.ok) currentTranscriptTask = await taskRes.json();
       } catch { /* ignore */ }
+      try {
+        const txRes = await fetch(`${API}/api/transcripts/by-task/${currentTranscript.taskId}`);
+        if (txRes.ok && currentTranscriptTask) currentTranscriptTask.transcripts = await txRes.json();
+      } catch { /* ignore */ }
     }
     document.getElementById("transcript-title").textContent =
       `Planner — attempt ${currentTranscript.attempt} — ${currentTranscript.model ?? currentTranscript.executorUsed}`;
@@ -1889,6 +1967,7 @@ async function openTranscript(transcriptId) {
       <span>tokens: ${currentTranscript.tokenInput ?? "?"} in / ${currentTranscript.tokenOutput ?? "?"} out</span>
       <span>elapsed: ${formatElapsed(currentTranscript.elapsedSeconds)}</span>
       <span>executor: ${esc(currentTranscript.executorUsed)}</span>
+      ${renderCurrentTranscriptDiffSummary()}
     `;
     currentTab = "plan";
     document.querySelectorAll(".tab-btn").forEach((b) =>
@@ -1901,6 +1980,31 @@ async function openTranscript(transcriptId) {
   }
 }
 window.openTranscript = openTranscript;
+
+function renderCurrentTranscriptDiffSummary() {
+  const transcripts = currentTranscriptTask?.transcripts ?? currentTask?.transcripts ?? [];
+  const diffs = window.DashboardHelpers?.transcriptAttemptDiffs
+    ? window.DashboardHelpers.transcriptAttemptDiffs(transcripts)
+    : [];
+  const match = diffs.find((diff) =>
+    diff.stage === currentTranscript?.stage &&
+    Number(diff.toAttempt) === Number(currentTranscript?.attempt)
+  );
+  if (!match) {
+    return `<span>attempt diff: unavailable</span>`;
+  }
+  const input = match.tokenInputDelta >= 0 ? `+${match.tokenInputDelta}` : String(match.tokenInputDelta);
+  const output = match.tokenOutputDelta >= 0 ? `+${match.tokenOutputDelta}` : String(match.tokenOutputDelta);
+  const elapsed = match.elapsedDelta == null
+    ? "elapsed ?"
+    : `${match.elapsedDelta >= 0 ? "+" : ""}${formatElapsed(Math.abs(match.elapsedDelta))}`;
+  const changed = [
+    match.promptChanged ? "prompt" : "",
+    match.outputChanged ? "output" : "",
+    match.critiqueChanged ? "critique" : ""
+  ].filter(Boolean).join(", ") || "no content delta";
+  return `<span title="${esc(changed)}">attempt diff: ${esc(input)} in / ${esc(output)} out · ${esc(elapsed)}</span>`;
+}
 
 // Map tool names to visual icons for the transcript viewer
 const TOOL_ICONS = {

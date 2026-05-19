@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import type { AppEnv } from "../config/env";
 import { assessComplexity, routeTier } from "../assessment/tier";
 import { type AutoforgeMessage } from "../nats/messages";
@@ -2666,6 +2667,7 @@ export class OrchestratorService {
         iteration === startingIteration
           ? planSubtasks.slice(Math.max(0, firstIterationStart))
           : planSubtasks;
+      const reportedArtifactsForPreReview = new Set<string>();
 
       for (const subtask of subtasksForIteration) {
         const subtaskAgentType = subtask.agentType ?? "coder";
@@ -2784,6 +2786,10 @@ export class OrchestratorService {
 
         const artifactValidation = this.validateArtifactReport(worktreePath, coderResult.artifacts);
         artifactValidationStatuses.push(artifactValidation.status);
+        for (const artifact of coderResult.artifacts) {
+          const normalizedArtifact = normalizeArtifactPath(artifact);
+          if (normalizedArtifact) reportedArtifactsForPreReview.add(normalizedArtifact);
+        }
         const artifactMismatchConcern =
           artifactValidation.status === "mismatch"
             ? `reported artifacts diverge from changed files (ratio=${artifactValidation.mismatch_ratio})`
@@ -2841,12 +2847,41 @@ export class OrchestratorService {
         iteration
       });
 
-      this.transition(taskId, projectId, "executing", "reviewing", { iteration });
-
-      // EXPRESS tier skips the reviewer — faster turnaround, lower risk tolerance.
+      // EXPRESS tier skips the reviewer, so pre-review checks do not run here;
+      // the PR gate still handles final verification.
       if (tier === "EXPRESS") {
         break;
       }
+
+      const preReviewChecks = this.runCheapPreReviewChecks({
+        worktreePath,
+        planSubtasks,
+        reportedArtifacts: [...reportedArtifactsForPreReview]
+      });
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "pre_review_checks",
+        status: preReviewChecks.passed ? "done" : "done_with_concerns",
+        payload: preReviewChecks,
+        budgetSeconds: 60
+      });
+      if (!preReviewChecks.passed) {
+        this.pauseForIntervention({
+          taskId,
+          projectId,
+          fromStage: "executing",
+          failureCategory: "pre_review_check_failed",
+          failureReason: "cheap pre-review checks failed before reviewer dispatch",
+          forensics: {
+            checks: preReviewChecks,
+            iteration
+          }
+        });
+      }
+
+      this.transition(taskId, projectId, "executing", "reviewing", { iteration });
 
       const reviewerDispatch = await this.selectPersonaForDispatch("reviewer", { description, tier, projectId });
       const reviewerPersonaId = reviewerDispatch.selection.variantId;
@@ -3250,6 +3285,82 @@ export class OrchestratorService {
       threshold: ARTIFACT_VALIDATION_MISMATCH_THRESHOLD,
       missing_reported: missingReported,
       unexpected_changed: unexpectedChanged
+    };
+  }
+
+  private runCheapPreReviewChecks(input: {
+    worktreePath: string;
+    planSubtasks: PlanSubtask[];
+    reportedArtifacts: string[];
+  }): {
+    passed: boolean;
+    scope_check: {
+      status: "passed" | "failed" | "unavailable";
+      unexpected_artifacts: string[];
+    };
+    debug_code_scan: {
+      status: "passed" | "failed" | "unavailable";
+      matches: Array<{ path: string; pattern: string }>;
+    };
+  } {
+    const normalizedArtifacts = [...new Set(
+      input.reportedArtifacts
+        .map((path) => normalizeArtifactPath(path))
+        .filter((path): path is string => path.length > 0 && !ARTIFACT_VALIDATION_IGNORED_PATHS.has(path))
+    )].sort();
+
+    const allowedScopes = input.planSubtasks
+      .flatMap((subtask) => subtask.filesInScope)
+      .map((path) => normalizeArtifactPath(path))
+      .filter((path): path is string => path.length > 0);
+
+    const scopeUnavailable = allowedScopes.length === 0 || normalizedArtifacts.length === 0;
+    const unexpectedArtifacts = scopeUnavailable
+      ? []
+      : normalizedArtifacts.filter((artifact) => !allowedScopes.some((scope) => artifactWithinScope(artifact, scope)));
+
+    const debugMatches: Array<{ path: string; pattern: string }> = [];
+    const worktreeRoot = resolve(input.worktreePath);
+    for (const artifact of normalizedArtifacts) {
+      if (!/\.(ts|tsx|js|jsx|mjs|cjs|css|html|md|json)$/.test(artifact)) continue;
+      if (artifact.startsWith("/")) continue;
+      const fullPath = resolve(worktreeRoot, artifact);
+      if (!(fullPath === worktreeRoot || fullPath.startsWith(`${worktreeRoot}/`)) || !existsSync(fullPath)) continue;
+      try {
+        const text = readFileSync(fullPath, "utf8").slice(0, 250_000);
+        const patterns = [
+          { label: "debugger statement", regex: /\bdebugger\s*;/ },
+          { label: "console.log", regex: /\bconsole\.log\s*\(/ },
+          { label: "TODO DEBUG", regex: /TODO\s+DEBUG/i }
+        ];
+        for (const pattern of patterns) {
+          if (pattern.regex.test(text)) {
+            debugMatches.push({ path: artifact, pattern: pattern.label });
+          }
+        }
+      } catch {
+        // Ignore unreadable artifacts; artifact validation and reviewer still
+        // cover semantic quality. This check is intentionally cheap.
+      }
+    }
+
+    const scopeStatus = scopeUnavailable
+      ? "unavailable"
+      : unexpectedArtifacts.length === 0 ? "passed" : "failed";
+    const debugStatus = normalizedArtifacts.length === 0
+      ? "unavailable"
+      : debugMatches.length === 0 ? "passed" : "failed";
+
+    return {
+      passed: scopeStatus !== "failed" && debugStatus !== "failed",
+      scope_check: {
+        status: scopeStatus,
+        unexpected_artifacts: unexpectedArtifacts
+      },
+      debug_code_scan: {
+        status: debugStatus,
+        matches: debugMatches
+      }
     };
   }
 
@@ -3971,4 +4082,14 @@ function normalizeToolStats(
 function normalizeArtifactPath(path: string): string {
   const normalized = path.trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
   return normalized;
+}
+
+function artifactWithinScope(artifact: string, scope: string): boolean {
+  const normalizedArtifact = normalizeArtifactPath(artifact);
+  const normalizedScope = normalizeArtifactPath(scope);
+  if (!normalizedArtifact || !normalizedScope) return false;
+  if (normalizedScope === "." || normalizedScope === "./") return true;
+  if (normalizedArtifact === normalizedScope) return true;
+  const directoryScope = normalizedScope.endsWith("/") ? normalizedScope : `${normalizedScope}/`;
+  return normalizedArtifact.startsWith(directoryScope);
 }

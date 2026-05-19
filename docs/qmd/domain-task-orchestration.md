@@ -72,6 +72,23 @@ V1 is Bun-only and only discovers fixed allowlisted script names from `package.j
 
 If a lifecycle hook fails, the orchestrator records `lifecycle_hook_failed` and pauses the task in `awaiting_intervention` with `failure_category=lifecycle_hook_failed`.
 
+### Cheap Pre-Review Checks Run Before Model Review
+
+After coder work and the `post_coder_pre_review` lifecycle phase, Autoforge runs
+deterministic checks before dispatching the reviewer. These checks are cheap and
+do not replace the authenticated PR-gate test runner:
+
+- reported artifacts must remain inside the planner's declared files-in-scope
+  contract when enough data is available;
+- reported source artifacts are scanned for obvious debug leftovers such as
+  `debugger;`, `console.log(...)`, and `TODO DEBUG`.
+
+The orchestrator records `pre_review_checks`. A failed check pauses the task in
+`awaiting_intervention` with `failure_category=pre_review_check_failed`, saving
+reviewer tokens for work that has passed deterministic hygiene checks. Full
+test execution remains in the PR gate unless a project configures tests as a
+lifecycle hook.
+
 ### Rollback and Steering Are Boundary-Safe
 
 - Checkpoints are durable event-log markers (`checkpoint_created`) captured at safe stage boundaries and subtask commits.
