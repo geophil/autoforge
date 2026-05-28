@@ -8,7 +8,7 @@ import type {
 } from "../executors/interface";
 import { readStatusFileFromWorkspace } from "../executors/status-convention";
 import type { ModelContentBlock, ModelMessage, ModelProvider, ModelResponse } from "./model-provider";
-import { statsBucketForTool, ToolRegistry } from "./tool-registry";
+import { ToolRegistry, type ToolStatsBucket } from "./tool-registry";
 import { TelemetryLedger } from "../executors/telemetry";
 import { getModelCost } from "./pricing";
 import { isExecResult } from "./tool-output-shaping";
@@ -25,7 +25,7 @@ import {
   promptEnvelopeSystemBlocks,
   renderPromptEnvelope
 } from "./prompt-envelope";
-import { guardrailToolResult, type ToolExecutionOutcome } from "./tool-execution-outcome";
+import { executeToolUse } from "./tool-execution";
 
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_TOOL_ITERATIONS = 50;
@@ -210,102 +210,44 @@ export class HarnessExecutor implements AgentExecutor {
         if (response.stopReason === "tool_use") {
           const toolResults: ModelContentBlock[] = [];
           for (const toolUse of toolUsesIn(responseContent)) {
-            let tool: ReturnType<ToolRegistry["get"]> | null = null;
-            let result: unknown;
-            const toolStart = Date.now();
-            let toolStatus: "success" | "error" = "success";
-            let outcome: ToolExecutionOutcome;
-            try {
-              const isQmdTool = mcpAdapter.hasTool(toolUse.name);
-              const guardBlock = guardrails.beforeTool({ toolName: toolUse.name, isQmd: isQmdTool, budget });
-              if (guardBlock) {
-                outcome = {
-                  source: "guardrail",
-                  status: "error",
-                  result: guardrailToolResult(guardBlock.message, guardBlock.failureSubtype),
-                  isQmdTool,
-                  failureSubtype: guardBlock.failureSubtype
-                };
-              } else if (isQmdTool) {
-                guardrails.recordTool({ isQmd: true });
-                const qmdTimeout = budget.timeoutForQmdCall();
-                const call = await mcpAdapter.callTool(toolUse.name, toolUse.input as Record<string, unknown>, qmdTimeout);
-                budget.observeQmdElapsed(call.elapsedMs);
-                outcome = {
-                  source: "qmd",
-                  status: call.status,
-                  result: call.failureSubtype === "qmd_allowance_exceeded"
-                    ? guardrailToolResult(call.text, call.failureSubtype)
-                    : call.text,
-                  isQmdTool: true,
-                  qmdElapsedMs: call.elapsedMs,
-                  qmdAllowanceUsedMs: budget.qmdAllowanceUsedMs(),
-                  qmdAllowanceRemainingMs: budget.qmdAllowanceRemainingMs(),
-                  failureSubtype: call.failureSubtype
-                };
-              } else {
-                guardrails.recordTool({ isQmd: false });
-                const localTimeout = budget.timeoutForLocalTool();
-                if (localTimeout.timeoutMs <= 0) {
-                  const error = new Error("Task budget exhausted before tool execution");
-                  error.name = "AbortError";
-                  throw error;
-                }
-                tool = this.options.tools.get(toolUse.name);
-                result = await tool.execute(toolUse.input, task.workspace, {
-                  environment: task.environment,
-                  deadlineMs: Date.now() + localTimeout.timeoutMs,
-                  timeoutSeconds: localTimeout.timeoutSeconds,
-                  recordLoadedSkill: (name) => {
-                    if (!loadedSkills.includes(name)) loadedSkills.push(name);
-                  }
-                });
-                outcome = {
-                  source: "local",
-                  status: result instanceof Error ? "error" : "success",
-                  result,
-                  isQmdTool: false
-                };
+            const outcome = await executeToolUse({
+              toolUse,
+              task,
+              tools: this.options.tools,
+              mcpAdapter,
+              budget,
+              guardrails,
+              recordLoadedSkill: (name) => {
+                if (!loadedSkills.includes(name)) loadedSkills.push(name);
               }
-            } catch (error) {
-              if (isTimeoutError(error)) throw error;
-              outcome = {
-                source: "error",
-                status: "error",
-                result: error instanceof Error ? error : new Error(String(error)),
-                isQmdTool: false
-              };
-            } finally {
-              if (tool) recordToolStat(toolStats, statsBucketForTool(tool));
-            }
-            toolStatus = outcome.status;
-            result = outcome.result;
-            const shaped = toolUse.name === "exec" && isExecResult(result)
+            });
+            recordToolStat(toolStats, outcome.statsBucket);
+            const shaped = outcome.toolName === "exec" && isExecResult(outcome.result)
               ? await shaper.shapeExecResult({
                 workspace: task.workspace,
                 toolUseId: toolUse.id,
-                input: toolUse.input,
-                result
+                input: outcome.input,
+                result: outcome.result
               })
-              : outcome.isQmdTool && typeof result === "string"
+              : outcome.isQmdTool && typeof outcome.result === "string"
                 ? await shaper.shapeMcpResult({
                   workspace: task.workspace,
                   toolUseId: toolUse.id,
-                  toolName: toolUse.name,
-                  input: toolUse.input,
-                  text: result,
-                  isError: toolStatus === "error"
+                  toolName: outcome.toolName,
+                  input: outcome.input,
+                  text: outcome.result,
+                  isError: outcome.status === "error"
                 })
               : null;
             const serialized = shaped
               ? { raw: shaped.content, bounded: shaped.content }
-              : serializeToolResultDetailed(result);
+              : serializeToolResultDetailed(outcome.result);
             const currentHistoryChars = serializedHistoryChars(history);
             const currentTranscriptChars = transcriptChars(transcript());
             ledger.recordToolCall({
-              toolName: toolUse.name,
-              status: toolStatus,
-              latencyMs: Date.now() - toolStart,
+              toolName: outcome.toolName,
+              status: outcome.status,
+              latencyMs: outcome.latencyMs,
               rawOutputBytes: shaped?.rawOutputBytes ?? Buffer.byteLength(serialized.raw, "utf8"),
               truncatedOutputBytes: Buffer.byteLength(serialized.bounded, "utf8"),
               artifactBytes: shaped?.artifactBytes,
@@ -584,7 +526,7 @@ function elapsedMetrics(start: number, tokenInput: number, tokenOutput: number, 
   };
 }
 
-function recordToolStat(stats: ToolStats, bucket: ReturnType<typeof statsBucketForTool>): void {
+function recordToolStat(stats: ToolStats, bucket: ToolStatsBucket | null | undefined): void {
   if (bucket === "read") stats.readCount += 1;
   if (bucket === "write") stats.writeCount += 1;
   if (bucket === "bash") stats.bashCount += 1;
