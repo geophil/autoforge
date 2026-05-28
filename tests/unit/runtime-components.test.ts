@@ -68,6 +68,113 @@ describe("runtime components", () => {
     expect(call).toMatchObject({ status: "success", text: "answer" });
   });
 
+  test("McpToolAdapter extracts text and resource content and preserves MCP error status", async () => {
+    const adapter = new McpToolAdapter(async () => ({
+      listTools: async () => ({ tools: [{ name: "get", inputSchema: { type: "object" } }] }),
+      callTool: async () => ({
+        isError: true,
+        content: [
+          { type: "text", text: "first" },
+          { type: "resource", resource: { text: "second" } },
+          { type: "json", value: 3 }
+        ]
+      }),
+      close: async () => {}
+    }));
+    await adapter.setup("http://qmd.test", {
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      baseRemainingMs: 1000,
+      wallRemainingMs: 1000
+    });
+
+    const call = await adapter.callTool("get", {}, {
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      baseRemainingMs: 1000,
+      wallRemainingMs: 1000
+    });
+
+    expect(call.status).toBe("error");
+    expect(call.text).toContain("first\nsecond\n");
+    expect(call.text).toContain("\"type\":\"json\"");
+  });
+
+  test("McpToolAdapter closes a partially opened client when setup fails", async () => {
+    let closed = 0;
+    const adapter = new McpToolAdapter(async () => ({
+      listTools: async () => {
+        throw new Error("list failed");
+      },
+      callTool: async () => ({ content: [] }),
+      close: async () => {
+        closed += 1;
+      }
+    }));
+
+    const setup = await adapter.setup("http://qmd.test", {
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      baseRemainingMs: 1000,
+      wallRemainingMs: 1000
+    });
+
+    expect(setup).toMatchObject({ status: "error", message: "list failed" });
+    expect(adapter.hasTool("query")).toBe(false);
+    expect(closed).toBe(1);
+  });
+
+  test("McpToolAdapter closes a partially opened client when setup times out", async () => {
+    let closed = 0;
+    const adapter = new McpToolAdapter(async () => ({
+      listTools: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { tools: [] };
+      },
+      callTool: async () => ({ content: [] }),
+      close: async () => {
+        closed += 1;
+      }
+    }));
+
+    const setup = await adapter.setup("http://qmd.test", {
+      timeoutMs: 1,
+      timeoutSeconds: 0.001,
+      baseRemainingMs: 1000,
+      wallRemainingMs: 1000
+    });
+
+    expect(setup).toMatchObject({ status: "error", failureSubtype: "qmd_call_timeout" });
+    expect(adapter.hasTool("query")).toBe(false);
+    expect(closed).toBe(1);
+  });
+
+  test("McpToolAdapter closes a client opened after setup timeout", async () => {
+    let closed = 0;
+    const adapter = new McpToolAdapter(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {
+          closed += 1;
+        }
+      };
+    });
+
+    const setup = await adapter.setup("http://qmd.test", {
+      timeoutMs: 1,
+      timeoutSeconds: 0.001,
+      baseRemainingMs: 1000,
+      wallRemainingMs: 1000
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(setup).toMatchObject({ status: "error", failureSubtype: "qmd_call_timeout" });
+    expect(adapter.hasTool("query")).toBe(false);
+    expect(closed).toBe(1);
+  });
+
   test("McpToolAdapter reports setup and call timeout outcomes", async () => {
     const adapter = new McpToolAdapter(async () => ({
       listTools: async () => ({ tools: [] }),

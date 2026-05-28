@@ -850,6 +850,46 @@ describe("HarnessExecutor", () => {
     expect(setupEvent?.qmdAllowanceRemainingMs).toBeDefined();
   });
 
+  test("closes QMD client on terminal model return", async () => {
+    let closed = 0;
+    const workspace = new MockWorkspace({
+      id: "workspace-qmd-close",
+      files: { ".autoforge-status.json": JSON.stringify({ status: "DONE", artifacts: [] }) }
+    });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: new ToolRegistry(),
+      defaultModel: "test-model",
+      mcpClientFactory: async () => ({
+        listTools: async () => ({ tools: [{ name: "get", inputSchema: { type: "object" } }] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {
+          closed += 1;
+        }
+      })
+    }).execute({
+      id: "task-qmd-close",
+      type: "planner",
+      systemPrompt: "system",
+      prompt: "plan",
+      workspace,
+      budgetSeconds: 60,
+      environment: { QMD_MCP_URL: "http://qmd.test/mcp" },
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    expect(closed).toBe(1);
+  });
+
   test("summarizes large QMD error results as retrievable artifacts", async () => {
     const workspace = new MockWorkspace({ id: "workspace-qmd-error-summary" });
     const largeErrorText = `QMD error\n${"docs/qmd/domain-task-orchestration.md failed\n".repeat(400)}`;

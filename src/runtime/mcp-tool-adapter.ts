@@ -22,7 +22,6 @@ export interface McpClient {
 export interface McpSetupOutcome {
   status: "success" | "error";
   toolDefinitions: ToolDefinition[];
-  toolNames: Set<string>;
   message: string;
   elapsedMs: number;
   failureSubtype?: RuntimeFailureSubtype;
@@ -51,16 +50,38 @@ export class McpToolAdapter {
     let message = "";
     let failureSubtype: RuntimeFailureSubtype | undefined = timeout.failureSubtype;
     let toolDefinitions: ToolDefinition[] = [];
+    await this.close();
+    let setupCancelled = false;
+    let setupClient: McpClient | null = null;
+    let setupClientClosed = false;
+    const closeSetupClient = async () => {
+      const client = setupClient;
+      setupClient = null;
+      if (client && !setupClientClosed) {
+        setupClientClosed = true;
+        await client.close();
+      }
+    };
     try {
       if (timeout.timeoutMs <= 0 || failureSubtype) {
         throw new RuntimeFailureError("qmd_allowance_exceeded", "QMD allowance exhausted before MCP setup");
       }
       const setup = await withTimeout((async () => {
         const client = await this.factory(url);
+        setupClient = client;
+        if (setupCancelled) {
+          await closeSetupClient();
+          throw new RuntimeFailureError("qmd_call_timeout", "QMD MCP setup completed after timeout");
+        }
         const listed = await client.listTools();
+        if (setupCancelled) {
+          await closeSetupClient();
+          throw new RuntimeFailureError("qmd_call_timeout", "QMD MCP setup completed after timeout");
+        }
         return { client, tools: listed.tools };
       })(), timeout.timeoutMs, `QMD MCP setup timed out after ${timeout.timeoutSeconds.toFixed(3)}s`);
       this.client = setup.client;
+      setupClient = null;
       toolDefinitions = setup.tools.map((tool) => ({
         name: tool.name,
         description: tool.description ?? "",
@@ -77,12 +98,13 @@ export class McpToolAdapter {
         failureSubtype = "qmd_call_timeout";
       }
       message = err instanceof Error ? err.message : String(err);
+      setupCancelled = true;
+      try { await closeSetupClient(); } catch {}
       try { await this.close(); } catch {}
     }
     return {
       status,
       toolDefinitions,
-      toolNames: new Set(this.toolNames),
       message,
       elapsedMs: Date.now() - start,
       failureSubtype
@@ -144,10 +166,17 @@ async function createDefaultMcpClient(url: string): Promise<McpClient> {
   return client as unknown as McpClient;
 }
 
-function extractMcpText(content: any): string {
-  if (content?.type === "text") return content.text ?? "";
-  if (content?.type === "resource" && content.resource) return content.resource.text ?? "";
+function extractMcpText(content: unknown): string {
+  if (!isRecord(content)) return JSON.stringify(content);
+  if (content.type === "text") return typeof content.text === "string" ? content.text : "";
+  if (content.type === "resource" && isRecord(content.resource)) {
+    return typeof content.resource.text === "string" ? content.resource.text : "";
+  }
   return JSON.stringify(content);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
