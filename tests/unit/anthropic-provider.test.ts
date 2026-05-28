@@ -36,7 +36,7 @@ describe("AnthropicProvider", () => {
     expect(captured.params).toEqual({
       model: "claude-sonnet-test",
       max_tokens: 1234,
-      system: [{ type: "text", text: "system", cache_control: { type: "ephemeral" } }],
+      system: [{ type: "text", text: "system" }],
       messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       tools: [
         {
@@ -119,8 +119,8 @@ describe("AnthropicProvider", () => {
     await provider.message({
       model: "claude-sonnet-test",
       system: [
-        { type: "text", text: "stable", cache: true },
-        { type: "text", text: "dynamic", cache: false }
+        { type: "text", text: "stable", cache: true, stable: true },
+        { type: "text", text: "dynamic", cache: false, stable: false }
       ],
       history: [{ role: "user", content: [{ type: "text", text: "task" }] }],
       tools: []
@@ -131,6 +131,47 @@ describe("AnthropicProvider", () => {
       { type: "text", text: "dynamic" }
     ]);
     expect(captured.params.messages[0].content[0].cache_control).toBeUndefined();
+  });
+
+  test("ignores cache hints on dynamic and unstructured system blocks", async () => {
+    const captured: { params?: any } = {};
+    const provider = new AnthropicProvider({
+      apiKey: "test-key",
+      createMessage: async (params) => {
+        captured.params = params;
+        return {
+          usage: { input_tokens: 1, output_tokens: 1 },
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "done" }]
+        };
+      }
+    });
+
+    await provider.message({
+      model: "claude-sonnet-test",
+      system: [
+        { type: "text", text: "stable", cache: true, stable: true },
+        { type: "text", text: "runtime budget", cache: true, stable: false, name: "runtime_budget" },
+        { type: "text", text: "legacy hint", cache: true }
+      ],
+      history: [{ role: "user", content: [{ type: "text", text: "task" }] }],
+      tools: []
+    });
+
+    expect(captured.params.system).toEqual([
+      { type: "text", text: "stable", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "runtime budget" },
+      { type: "text", text: "legacy hint" }
+    ]);
+
+    await provider.message({
+      model: "claude-sonnet-test",
+      systemPrompt: "unstructured fallback",
+      history: [{ role: "user", content: [{ type: "text", text: "task" }] }],
+      tools: []
+    });
+
+    expect(captured.params.system).toEqual([{ type: "text", text: "unstructured fallback" }]);
   });
 
   test("maps Anthropic cache usage into provider usage", async () => {
