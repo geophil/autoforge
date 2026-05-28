@@ -14,7 +14,10 @@ export interface ToolDefinition {
 export interface ModelSystemBlock {
   type: "text";
   text: string;
-  /** Provider adapters may map this to provider-specific prompt-cache controls. */
+  /**
+   * Provider-specific prompt-cache hint. Providers should only honor this
+   * when the block is also marked stable.
+   */
   cache?: boolean;
   name?: string;
   stable?: boolean;

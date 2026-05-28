@@ -80,14 +80,18 @@ export class AnthropicProvider implements ModelProvider {
 function toAnthropicSystem(args: { systemPrompt?: string; system?: ModelSystemBlock[] }): Anthropic.TextBlockParam[] {
   const blocks = args.system && args.system.length > 0
     ? args.system
-    : [{ type: "text" as const, text: args.systemPrompt ?? "", cache: true }];
+    : [{ type: "text" as const, text: args.systemPrompt ?? "", cache: false, stable: false }];
   return blocks.map((block) => {
     const out: Anthropic.TextBlockParam = { type: "text", text: block.text };
-    if (block.cache) {
+    if (shouldCacheSystemBlock(block)) {
       return { ...out, cache_control: { type: "ephemeral" as const } };
     }
     return out;
   });
+}
+
+function shouldCacheSystemBlock(block: ModelSystemBlock): boolean {
+  return block.stable === true && block.cache === true;
 }
 
 export function toToolDefinition(tool: Anthropic.Tool): ToolDefinition {
