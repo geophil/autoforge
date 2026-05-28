@@ -44,7 +44,7 @@ export async function readStatusFileFromWorkspace(workspace: Workspace): Promise
   }
 }
 
-export function buildStatusReportingPrompt(budgetSeconds: number): string {
+export function buildStatusReportingContractPrompt(): string {
   return `# Status Reporting (required)
 
 When you have finished the task you MUST write \`${STATUS_FILE}\` in the working directory with this exact JSON format:
@@ -60,7 +60,15 @@ Valid status values:
 - **"DONE"** — completed successfully, all criteria met
 - **"DONE_WITH_CONCERNS"** — completed but add a "concerns" field explaining what was imperfect
 - **"BLOCKED"** — cannot proceed; add a "blockReason" field with a clear explanation
-- **"NEEDS_CONTEXT"** — missing information; add a "blockReason" field specifying what is needed
+- **"NEEDS_CONTEXT"** — missing information; add a "blockReason" field specifying what is needed`;
+}
+
+export function buildRuntimeBudgetPrompt(budgetSeconds: number): string {
+  return `# Runtime Budget
 
 Time budget: ${budgetSeconds} seconds. Work efficiently.`;
+}
+
+export function buildStatusReportingPrompt(budgetSeconds: number): string {
+  return `${buildStatusReportingContractPrompt()}\n\n${buildRuntimeBudgetPrompt(budgetSeconds)}`;
 }
