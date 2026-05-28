@@ -7,6 +7,18 @@ export interface RuntimeTelemetrySummary {
   finalStatus: AgentResult["status"];
   modelCallCount: number;
   toolCallCount: number;
+  modelCounts: {
+    total: number;
+    byProvider: Record<string, number>;
+    byModel: Record<string, number>;
+  };
+  toolCounts: {
+    total: number;
+    byName: Record<string, number>;
+    byStatus: Record<string, number>;
+    qmd: number;
+    errors: number;
+  };
   tokenTotals: {
     input: number;
     output: number;
@@ -20,10 +32,23 @@ export interface RuntimeTelemetrySummary {
   stablePrefixHash: string | null;
   qmdAllowanceUsedMs: number | null;
   qmdAllowanceRemainingMs: number | null;
+  qmd: {
+    callCount: number;
+    elapsedMs: number;
+    allowanceUsedMs: number | null;
+    allowanceRemainingMs: number | null;
+  };
   rawToolOutputBytes: number;
   returnedToolOutputBytes: number;
   artifactBytes: number;
+  toolOutputBytes: {
+    raw: number;
+    returnedToModel: number;
+    artifact: number;
+    summary: number;
+  };
   maxHistoryChars: number;
+  maxTranscriptChars: number;
   failureSubtypeCounts: Record<string, number>;
 }
 
@@ -49,6 +74,9 @@ export function buildRuntimeTelemetrySummary(args: {
   const qmdEvents = toolEvents.filter((event) => event.qmdAllowanceUsedMs !== undefined || event.qmdAllowanceRemainingMs !== undefined);
   const lastQmd = qmdEvents.at(-1);
   const firstStable = modelEvents.find((event) => event.stablePrefixHash);
+  const rawToolOutputBytes = toolEvents.reduce((sum, event) => sum + event.rawOutputBytes, 0);
+  const returnedToolOutputBytes = toolEvents.reduce((sum, event) => sum + (event.returnedToModelBytes ?? event.truncatedOutputBytes), 0);
+  const artifactBytes = toolEvents.reduce((sum, event) => sum + (event.artifactBytes ?? 0), 0);
   const estimatedCachedInputSavings = modelEvents.reduce((sum, event) => {
     const cachedTokens = event.tokens.cached ?? 0;
     if (cachedTokens <= 0) return sum;
@@ -61,6 +89,18 @@ export function buildRuntimeTelemetrySummary(args: {
     finalStatus: args.result.status,
     modelCallCount: modelEvents.length,
     toolCallCount: toolEvents.length,
+    modelCounts: {
+      total: modelEvents.length,
+      byProvider: countBy(modelEvents, (event) => event.provider),
+      byModel: countBy(modelEvents, (event) => event.model)
+    },
+    toolCounts: {
+      total: toolEvents.length,
+      byName: countBy(toolEvents, (event) => event.toolName),
+      byStatus: countBy(toolEvents, (event) => event.status),
+      qmd: qmdEvents.length,
+      errors: toolEvents.filter((event) => event.status === "error").length
+    },
     tokenTotals,
     cacheHitRatio: tokenTotals.input > 0 ? tokenTotals.cached / tokenTotals.input : 0,
     estimatedCachedInputSavings,
@@ -69,10 +109,32 @@ export function buildRuntimeTelemetrySummary(args: {
     stablePrefixHash: firstStable?.stablePrefixHash ?? null,
     qmdAllowanceUsedMs: lastQmd?.qmdAllowanceUsedMs ?? null,
     qmdAllowanceRemainingMs: lastQmd?.qmdAllowanceRemainingMs ?? null,
-    rawToolOutputBytes: toolEvents.reduce((sum, event) => sum + event.rawOutputBytes, 0),
-    returnedToolOutputBytes: toolEvents.reduce((sum, event) => sum + (event.returnedToModelBytes ?? event.truncatedOutputBytes), 0),
-    artifactBytes: toolEvents.reduce((sum, event) => sum + (event.artifactBytes ?? 0), 0),
+    qmd: {
+      callCount: qmdEvents.length,
+      elapsedMs: qmdEvents.reduce((sum, event) => sum + (event.qmdElapsedMs ?? 0), 0),
+      allowanceUsedMs: lastQmd?.qmdAllowanceUsedMs ?? null,
+      allowanceRemainingMs: lastQmd?.qmdAllowanceRemainingMs ?? null
+    },
+    rawToolOutputBytes,
+    returnedToolOutputBytes,
+    artifactBytes,
+    toolOutputBytes: {
+      raw: rawToolOutputBytes,
+      returnedToModel: returnedToolOutputBytes,
+      artifact: artifactBytes,
+      summary: toolEvents.reduce((sum, event) => sum + (event.summaryBytes ?? 0), 0)
+    },
     maxHistoryChars: Math.max(0, ...modelEvents.map((event) => event.historyChars ?? 0), ...toolEvents.map((event) => event.historyChars ?? 0)),
+    maxTranscriptChars: Math.max(0, ...modelEvents.map((event) => event.transcriptChars ?? 0), ...toolEvents.map((event) => event.transcriptChars ?? 0)),
     failureSubtypeCounts
   };
+}
+
+function countBy<T>(items: T[], keyFor: (item: T) => string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const item of items) {
+    const key = keyFor(item);
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
 }
