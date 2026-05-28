@@ -6,8 +6,10 @@ import {
   buildPlannerTokenKpiProjectQuery,
   buildPlannerTokenKpiQuery,
   buildRuntimeCacheKpiProjectQuery,
+  computeRuntimeCacheKpiReport,
   computePlannerTokenKpis,
   computeRuntimeCacheKpis,
+  computeRuntimeStablePrefixKpis,
   meetsPlannerReductionTarget,
   plannerReductionAchieved
 } from "../../src/web/token-kpi-utils";
@@ -45,7 +47,7 @@ describe("computePlannerTokenKpis", () => {
 
 describe("computeRuntimeCacheKpis", () => {
   test("summarizes prompt-cache and runtime contribution metrics", () => {
-    const summary = computeRuntimeCacheKpis([
+    const rows = [
       {
         stablePrefixHash: "hash-a",
         cachedInputTokens: 80,
@@ -61,14 +63,112 @@ describe("computeRuntimeCacheKpis", () => {
         estimatedCachedInputSavings: 0.002,
         maxHistoryChars: 300,
         toolOutputContributionBytes: 25
+      },
+      {
+        stablePrefixHash: "hash-b",
+        cachedInputTokens: 0,
+        inputTokens: 50,
+        estimatedCachedInputSavings: 0,
+        maxHistoryChars: 100,
+        toolOutputContributionBytes: 10
+      },
+      {
+        stablePrefixHash: null,
+        cachedInputTokens: 0,
+        inputTokens: 50,
+        estimatedCachedInputSavings: 0,
+        maxHistoryChars: 50,
+        toolOutputContributionBytes: 5
+      }
+    ];
+    const summary = computeRuntimeCacheKpis(rows);
+
+    expect(summary.repeatedStablePrefixCount).toBe(1);
+    expect(summary.cachedInputTokenRatio).toBe(100 / 300);
+    expect(summary.estimatedCachedInputSavings).toBeCloseTo(0.003);
+    expect(summary.maxHistoryChars).toBe(300);
+    expect(summary.toolOutputContributionBytes).toBe(90);
+  });
+
+  test("builds repeated stable-prefix aggregates from event rows", () => {
+    const rows = [
+      {
+        stablePrefixHash: "hash-b",
+        cachedInputTokens: 20,
+        inputTokens: 40,
+        estimatedCachedInputSavings: 0.001,
+        maxHistoryChars: 200,
+        toolOutputContributionBytes: 10
+      },
+      {
+        stablePrefixHash: "hash-a",
+        cachedInputTokens: 80,
+        inputTokens: 100,
+        estimatedCachedInputSavings: 0.002,
+        maxHistoryChars: 300,
+        toolOutputContributionBytes: 30
+      },
+      {
+        stablePrefixHash: "hash-a",
+        cachedInputTokens: 20,
+        inputTokens: 100,
+        estimatedCachedInputSavings: 0.003,
+        maxHistoryChars: 250,
+        toolOutputContributionBytes: 20
+      },
+      {
+        stablePrefixHash: "hash-b",
+        cachedInputTokens: 10,
+        inputTokens: 40,
+        estimatedCachedInputSavings: 0.001,
+        maxHistoryChars: 400,
+        toolOutputContributionBytes: 5
+      },
+      {
+        stablePrefixHash: "hash-c",
+        cachedInputTokens: 50,
+        inputTokens: 50,
+        estimatedCachedInputSavings: 0.004,
+        maxHistoryChars: 500,
+        toolOutputContributionBytes: 50
+      },
+      {
+        stablePrefixHash: null,
+        cachedInputTokens: 100,
+        inputTokens: 100,
+        estimatedCachedInputSavings: 0.01,
+        maxHistoryChars: 900,
+        toolOutputContributionBytes: 90
+      }
+    ];
+
+    const prefixes = computeRuntimeStablePrefixKpis(rows);
+    expect(prefixes).toEqual([
+      {
+        stablePrefixHash: "hash-a",
+        occurrences: 2,
+        cachedInputTokens: 100,
+        inputTokens: 200,
+        cachedInputTokenRatio: 0.5,
+        estimatedCachedInputSavings: 0.005,
+        maxHistoryChars: 300,
+        toolOutputContributionBytes: 50
+      },
+      {
+        stablePrefixHash: "hash-b",
+        occurrences: 2,
+        cachedInputTokens: 30,
+        inputTokens: 80,
+        cachedInputTokenRatio: 0.375,
+        estimatedCachedInputSavings: 0.002,
+        maxHistoryChars: 400,
+        toolOutputContributionBytes: 15
       }
     ]);
 
-    expect(summary.repeatedStablePrefixCount).toBe(1);
-    expect(summary.cachedInputTokenRatio).toBe(0.5);
-    expect(summary.estimatedCachedInputSavings).toBeCloseTo(0.003);
-    expect(summary.maxHistoryChars).toBe(300);
-    expect(summary.toolOutputContributionBytes).toBe(75);
+    const report = computeRuntimeCacheKpiReport(rows);
+    expect(report.summary.repeatedStablePrefixCount).toBe(2);
+    expect(report.stablePrefixes).toEqual(prefixes);
   });
 });
 
@@ -106,6 +206,7 @@ describe("token KPI SQL helpers", () => {
     expect(sql).toContain("event_type = 'agent_runtime_telemetry'");
     expect(sql).toContain("$.stablePrefixHash");
     expect(sql).toContain("$.tokenTotals.cached");
+    expect(sql).toContain("$.toolOutputBytes.returnedToModel");
     expect(sql).toContain("$.returnedToolOutputBytes");
     expect(params).toEqual(["p3", 21]);
   });

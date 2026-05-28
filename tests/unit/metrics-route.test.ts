@@ -48,6 +48,7 @@ function appendRuntimeTelemetryEvent(input: {
   savings: number;
   maxHistoryChars: number;
   returnedToolOutputBytes: number;
+  nestedReturnedToolOutputBytes?: number;
 }): void {
   input.db.appendEvent({
     id: randomUUID(),
@@ -67,7 +68,12 @@ function appendRuntimeTelemetryEvent(input: {
       },
       estimatedCachedInputSavings: input.savings,
       maxHistoryChars: input.maxHistoryChars,
-      returnedToolOutputBytes: input.returnedToolOutputBytes
+      returnedToolOutputBytes: input.returnedToolOutputBytes,
+      toolOutputBytes: input.nestedReturnedToolOutputBytes === undefined
+        ? undefined
+        : {
+            returnedToModel: input.nestedReturnedToolOutputBytes
+          }
     },
     budgetSeconds: 30
   });
@@ -147,7 +153,8 @@ describe("GET /api/metrics/:projectId/runtime-cache-kpis", () => {
         cachedInputTokens: 80,
         savings: 0.001,
         maxHistoryChars: 200,
-        returnedToolOutputBytes: 10
+        returnedToolOutputBytes: 10,
+        nestedReturnedToolOutputBytes: 15
       });
       appendRuntimeTelemetryEvent({
         db,
@@ -181,7 +188,17 @@ describe("GET /api/metrics/:projectId/runtime-cache-kpis", () => {
       expect(body.summary.cachedInputTokenRatio).toBe(0.5);
       expect(body.summary.estimatedCachedInputSavings).toBeCloseTo(0.003);
       expect(body.summary.maxHistoryChars).toBe(300);
-      expect(body.summary.toolOutputContributionBytes).toBe(40);
+      expect(body.summary.toolOutputContributionBytes).toBe(45);
+      expect(body.stablePrefixes).toEqual([{
+        stablePrefixHash: "prefix-a",
+        occurrences: 2,
+        cachedInputTokens: 100,
+        inputTokens: 200,
+        cachedInputTokenRatio: 0.5,
+        estimatedCachedInputSavings: 0.003,
+        maxHistoryChars: 300,
+        toolOutputContributionBytes: 45
+      }]);
     } finally {
       cleanup();
     }

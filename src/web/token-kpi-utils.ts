@@ -28,6 +28,22 @@ export interface RuntimeCacheKpiSummary {
   toolOutputContributionBytes: number;
 }
 
+export interface RuntimeStablePrefixKpi {
+  stablePrefixHash: string;
+  occurrences: number;
+  cachedInputTokens: number;
+  inputTokens: number;
+  cachedInputTokenRatio: number;
+  estimatedCachedInputSavings: number;
+  maxHistoryChars: number;
+  toolOutputContributionBytes: number;
+}
+
+export interface RuntimeCacheKpiReport {
+  summary: RuntimeCacheKpiSummary;
+  stablePrefixes: RuntimeStablePrefixKpi[];
+}
+
 const PLANNER_REDUCTION_TARGET_MIN = 0.2;
 
 export function computePlannerTokenKpis(rows: TokenKpiEventRow[]): PlannerTokenKpiSummary {
@@ -59,16 +75,12 @@ export function meetsPlannerReductionTarget(beforeMedianInputTokens: number, aft
 }
 
 export function computeRuntimeCacheKpis(rows: RuntimeCacheKpiRow[]): RuntimeCacheKpiSummary {
-  const occurrencesByPrefix = new Map<string, number>();
   let cachedInputTokens = 0;
   let inputTokens = 0;
   let estimatedCachedInputSavings = 0;
   let maxHistoryChars = 0;
   let toolOutputContributionBytes = 0;
   for (const row of rows) {
-    if (row.stablePrefixHash) {
-      occurrencesByPrefix.set(row.stablePrefixHash, (occurrencesByPrefix.get(row.stablePrefixHash) ?? 0) + 1);
-    }
     cachedInputTokens += row.cachedInputTokens;
     inputTokens += row.inputTokens;
     estimatedCachedInputSavings += row.estimatedCachedInputSavings;
@@ -76,11 +88,52 @@ export function computeRuntimeCacheKpis(rows: RuntimeCacheKpiRow[]): RuntimeCach
     toolOutputContributionBytes += row.toolOutputContributionBytes;
   }
   return {
-    repeatedStablePrefixCount: [...occurrencesByPrefix.values()].filter((count) => count > 1).length,
+    repeatedStablePrefixCount: computeRuntimeStablePrefixKpis(rows).length,
     cachedInputTokenRatio: inputTokens > 0 ? cachedInputTokens / inputTokens : 0,
     estimatedCachedInputSavings,
     maxHistoryChars,
     toolOutputContributionBytes
+  };
+}
+
+export function computeRuntimeStablePrefixKpis(rows: RuntimeCacheKpiRow[]): RuntimeStablePrefixKpi[] {
+  const byPrefix = new Map<string, RuntimeStablePrefixKpi>();
+  for (const row of rows) {
+    if (!row.stablePrefixHash) continue;
+    const current = byPrefix.get(row.stablePrefixHash) ?? {
+      stablePrefixHash: row.stablePrefixHash,
+      occurrences: 0,
+      cachedInputTokens: 0,
+      inputTokens: 0,
+      cachedInputTokenRatio: 0,
+      estimatedCachedInputSavings: 0,
+      maxHistoryChars: 0,
+      toolOutputContributionBytes: 0
+    };
+    current.occurrences += 1;
+    current.cachedInputTokens += row.cachedInputTokens;
+    current.inputTokens += row.inputTokens;
+    current.estimatedCachedInputSavings += row.estimatedCachedInputSavings;
+    current.maxHistoryChars = Math.max(current.maxHistoryChars, row.maxHistoryChars);
+    current.toolOutputContributionBytes += row.toolOutputContributionBytes;
+    current.cachedInputTokenRatio =
+      current.inputTokens > 0 ? current.cachedInputTokens / current.inputTokens : 0;
+    byPrefix.set(row.stablePrefixHash, current);
+  }
+  return [...byPrefix.values()]
+    .filter((row) => row.occurrences > 1)
+    .sort((a, b) =>
+      b.occurrences - a.occurrences ||
+      b.cachedInputTokenRatio - a.cachedInputTokenRatio ||
+      b.inputTokens - a.inputTokens ||
+      a.stablePrefixHash.localeCompare(b.stablePrefixHash)
+    );
+}
+
+export function computeRuntimeCacheKpiReport(rows: RuntimeCacheKpiRow[]): RuntimeCacheKpiReport {
+  return {
+    summary: computeRuntimeCacheKpis(rows),
+    stablePrefixes: computeRuntimeStablePrefixKpis(rows)
   };
 }
 
@@ -181,7 +234,11 @@ export function buildRuntimeCacheKpiProjectQuery(
         CAST(COALESCE(json_extract(payload, '$.tokenTotals.input'), 0) AS INTEGER) AS inputTokens,
         CAST(COALESCE(json_extract(payload, '$.estimatedCachedInputSavings'), 0) AS REAL) AS estimatedCachedInputSavings,
         CAST(COALESCE(json_extract(payload, '$.maxHistoryChars'), 0) AS INTEGER) AS maxHistoryChars,
-        CAST(COALESCE(json_extract(payload, '$.returnedToolOutputBytes'), 0) AS INTEGER) AS toolOutputContributionBytes
+        CAST(COALESCE(
+          json_extract(payload, '$.toolOutputBytes.returnedToModel'),
+          json_extract(payload, '$.returnedToolOutputBytes'),
+          0
+        ) AS INTEGER) AS toolOutputContributionBytes
       FROM events
       WHERE project_id = ?
         AND event_type = 'agent_runtime_telemetry'

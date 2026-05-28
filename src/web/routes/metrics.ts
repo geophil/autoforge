@@ -4,7 +4,7 @@ import {
   buildEnvelopeReuseProjectQuery,
   buildProjectTokenUsageQuery,
   buildRuntimeCacheKpiProjectQuery,
-  computeRuntimeCacheKpis,
+  computeRuntimeCacheKpiReport,
   computePlannerTokenKpis
 } from "../token-kpi-utils";
 
@@ -73,11 +73,13 @@ export function createMetricsRoutes(db: DbClient): Hono {
       maxHistoryChars: number;
       toolOutputContributionBytes: number;
     }>;
+    const report = computeRuntimeCacheKpiReport(rows);
     return ctx.json({
       projectId,
       windowDays,
       rows,
-      summary: computeRuntimeCacheKpis(rows)
+      summary: report.summary,
+      stablePrefixes: report.stablePrefixes
     });
   });
 
