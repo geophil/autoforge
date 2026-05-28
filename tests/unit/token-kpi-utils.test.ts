@@ -5,7 +5,9 @@ import {
   buildProjectTokenUsageQuery,
   buildPlannerTokenKpiProjectQuery,
   buildPlannerTokenKpiQuery,
+  buildRuntimeCacheKpiProjectQuery,
   computePlannerTokenKpis,
+  computeRuntimeCacheKpis,
   meetsPlannerReductionTarget,
   plannerReductionAchieved
 } from "../../src/web/token-kpi-utils";
@@ -41,6 +43,35 @@ describe("computePlannerTokenKpis", () => {
   });
 });
 
+describe("computeRuntimeCacheKpis", () => {
+  test("summarizes prompt-cache and runtime contribution metrics", () => {
+    const summary = computeRuntimeCacheKpis([
+      {
+        stablePrefixHash: "hash-a",
+        cachedInputTokens: 80,
+        inputTokens: 100,
+        estimatedCachedInputSavings: 0.001,
+        maxHistoryChars: 200,
+        toolOutputContributionBytes: 50
+      },
+      {
+        stablePrefixHash: "hash-a",
+        cachedInputTokens: 20,
+        inputTokens: 100,
+        estimatedCachedInputSavings: 0.002,
+        maxHistoryChars: 300,
+        toolOutputContributionBytes: 25
+      }
+    ]);
+
+    expect(summary.repeatedStablePrefixCount).toBe(1);
+    expect(summary.cachedInputTokenRatio).toBe(0.5);
+    expect(summary.estimatedCachedInputSavings).toBeCloseTo(0.003);
+    expect(summary.maxHistoryChars).toBe(300);
+    expect(summary.toolOutputContributionBytes).toBe(75);
+  });
+});
+
 describe("token KPI SQL helpers", () => {
   test("buildPlannerTokenKpiQuery scopes to planner stages and window", () => {
     const { sql, params } = buildPlannerTokenKpiQuery(7);
@@ -68,5 +99,14 @@ describe("token KPI SQL helpers", () => {
     expect(envelope.params).toEqual(["p1", 14, 5]);
     expect(allUsage.params).toEqual(["p2", 30]);
     expect(allUsage.sql).toContain("COALESCE");
+  });
+
+  test("buildRuntimeCacheKpiProjectQuery reads runtime telemetry payloads", () => {
+    const { sql, params } = buildRuntimeCacheKpiProjectQuery("p3", 21);
+    expect(sql).toContain("event_type = 'agent_runtime_telemetry'");
+    expect(sql).toContain("$.stablePrefixHash");
+    expect(sql).toContain("$.tokenTotals.cached");
+    expect(sql).toContain("$.returnedToolOutputBytes");
+    expect(params).toEqual(["p3", 21]);
   });
 });

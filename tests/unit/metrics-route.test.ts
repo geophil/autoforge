@@ -38,6 +38,41 @@ function appendTokenEvent(input: {
   }, { contextEnvelopeHash: input.contextEnvelopeHash });
 }
 
+function appendRuntimeTelemetryEvent(input: {
+  db: ReturnType<typeof createTestService>["db"];
+  projectId: string;
+  taskId: string;
+  stablePrefixHash: string;
+  inputTokens: number;
+  cachedInputTokens: number;
+  savings: number;
+  maxHistoryChars: number;
+  returnedToolOutputBytes: number;
+}): void {
+  input.db.appendEvent({
+    id: randomUUID(),
+    taskId: input.taskId,
+    projectId: input.projectId,
+    timestamp: new Date().toISOString(),
+    agent: "coder",
+    type: "agent_runtime_telemetry",
+    status: "done",
+    payload: {
+      stablePrefixHash: input.stablePrefixHash,
+      tokenTotals: {
+        input: input.inputTokens,
+        output: 0,
+        cached: input.cachedInputTokens,
+        cacheCreation: 0
+      },
+      estimatedCachedInputSavings: input.savings,
+      maxHistoryChars: input.maxHistoryChars,
+      returnedToolOutputBytes: input.returnedToolOutputBytes
+    },
+    budgetSeconds: 30
+  });
+}
+
 describe("GET /api/metrics/:projectId/token-kpis", () => {
   test("returns planner KPI summary scoped to project", async () => {
     const { service, db, cleanup } = createTestService();
@@ -92,6 +127,61 @@ describe("GET /api/metrics/:projectId/token-kpis", () => {
       expect(body.summary.totalInputTokens).toBe(600);
       expect(body.summary.plannerRetries).toBe(1);
       expect(body.summary.plannerInputShare).toBeCloseTo(2 / 3, 5);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("GET /api/metrics/:projectId/runtime-cache-kpis", () => {
+  test("returns runtime cache KPI summary scoped to project", async () => {
+    const { service, db, cleanup } = createTestService();
+    const app = createWebServer(service, db, testEnv());
+    try {
+      appendRuntimeTelemetryEvent({
+        db,
+        projectId: "p1",
+        taskId: "t1",
+        stablePrefixHash: "prefix-a",
+        inputTokens: 100,
+        cachedInputTokens: 80,
+        savings: 0.001,
+        maxHistoryChars: 200,
+        returnedToolOutputBytes: 10
+      });
+      appendRuntimeTelemetryEvent({
+        db,
+        projectId: "p1",
+        taskId: "t2",
+        stablePrefixHash: "prefix-a",
+        inputTokens: 100,
+        cachedInputTokens: 20,
+        savings: 0.002,
+        maxHistoryChars: 300,
+        returnedToolOutputBytes: 30
+      });
+      appendRuntimeTelemetryEvent({
+        db,
+        projectId: "p2",
+        taskId: "t3",
+        stablePrefixHash: "prefix-a",
+        inputTokens: 100,
+        cachedInputTokens: 100,
+        savings: 1,
+        maxHistoryChars: 999,
+        returnedToolOutputBytes: 999
+      });
+
+      const response = await app.request("/api/metrics/p1/runtime-cache-kpis?windowDays=30");
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.projectId).toBe("p1");
+      expect(body.rows).toHaveLength(2);
+      expect(body.summary.repeatedStablePrefixCount).toBe(1);
+      expect(body.summary.cachedInputTokenRatio).toBe(0.5);
+      expect(body.summary.estimatedCachedInputSavings).toBeCloseTo(0.003);
+      expect(body.summary.maxHistoryChars).toBe(300);
+      expect(body.summary.toolOutputContributionBytes).toBe(40);
     } finally {
       cleanup();
     }

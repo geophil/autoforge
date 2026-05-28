@@ -27,6 +27,9 @@ describe("orchestrator model routing", () => {
       expect(routingEvents.some((event) => event.payload.selected_model_tier === "strong")).toBe(true);
       expect(routingEvents.some((event) => Array.isArray(event.payload.sensitive_areas) &&
         event.payload.sensitive_areas.includes("auth"))).toBe(true);
+      const runtimeEvents = db.listEvents(task.id).filter((event) => event.type === "agent_runtime_telemetry");
+      expect(runtimeEvents.some((event) => event.payload.agentType === "coder" && event.payload.routedTier === "strong"))
+        .toBe(true);
     } finally {
       cleanup();
     }
@@ -96,6 +99,10 @@ describe("orchestrator model routing", () => {
       const routingEvents = db.listEvents(task.id).filter((event) => event.type === "model_routing_decision");
       expect(routingEvents.some((event) => event.payload.escalated === true &&
         event.payload.prior_tier === "standard")).toBe(true);
+      const runtimeEvents = db.listEvents(task.id).filter((event) => event.type === "agent_runtime_telemetry");
+      expect(runtimeEvents.some((event) => event.payload.agentType === "planner" &&
+        event.payload.routedTier === "strong" &&
+        event.payload.finalStatus === "DONE")).toBe(true);
     } finally {
       cleanup();
     }

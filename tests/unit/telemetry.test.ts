@@ -41,7 +41,7 @@ describe("TelemetryLedger", () => {
       provider: "anthropic",
       model: "claude-3-5-sonnet-20241022",
       agentType: "coder",
-      tokens: { input: 1000, output: 200, cached: 750 },
+      tokens: { input: 1000, output: 200, cached: 750, cacheCreation: 125 },
       latencyMs: 10,
       timestamp: 1,
       retryAttempt: 0,
@@ -51,7 +51,9 @@ describe("TelemetryLedger", () => {
     expect(ledger.getSummary().totalTokens).toEqual({
       input: 1000,
       output: 200,
-      cached: 750
+      cached: 750,
+      cacheCreation: 125
     });
+    expect(ledger.getSummary().cacheHitRatio).toBe(0.75);
   });
 });

@@ -23,6 +23,7 @@ import type {
   ReviewFinding,
   SubtaskReportStatus,
   TaskStage,
+  TaskStatus,
   Tier
 } from "../types/core";
 import { emptyPlanningContext } from "../types/core";
@@ -57,6 +58,7 @@ import { buildAgentDispatchEnvelope } from "./dispatch-envelope";
 import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
 import { routeModel, type ModelRoutingDecision, type ModelRoutingInput } from "./model-routing";
+import { buildRuntimeTelemetrySummary } from "../executors/runtime-telemetry-summary";
 
 const QMD_TOOL_NAMES = new Set(["query", "get", "multi_get", "status"]);
 const ARTIFACT_VALIDATION_MISMATCH_THRESHOLD = 0.4;
@@ -796,6 +798,34 @@ export class OrchestratorService {
       currentTask = { ...args.task, model: currentRouting.model };
       result = await args.executor.execute(currentTask);
     }
+    const summary = buildRuntimeTelemetrySummary({
+      result,
+      agentType: args.routeInput.agentType,
+      phase: args.routeInput.phase
+    });
+    this.recordEvent({
+      taskId: args.taskId,
+      projectId: args.projectId,
+      agent: args.routeInput.agentType,
+      type: "agent_runtime_telemetry",
+      status: statusForAgentResult(result),
+      payload: {
+        ...summary,
+        executor: args.executor.name,
+        model: currentTask.model ?? null,
+        routedTier: currentRouting.tier,
+        taskTier: args.routeInput.tier,
+        filesInScope: args.routeInput.filesInScope ?? []
+      },
+      budgetSeconds: currentTask.budgetSeconds,
+      elapsedSeconds: result.metrics.elapsedSeconds,
+      tokenUsage: result.metrics.tokenInput !== undefined ? {
+        input: result.metrics.tokenInput,
+        output: result.metrics.tokenOutput ?? 0,
+        estimatedCost: result.metrics.estimatedCost
+      } : undefined,
+      executorUsed: args.executor.name
+    });
     return { result, task: currentTask, routing: currentRouting };
   }
 
@@ -4182,6 +4212,15 @@ function buildDocPrompt(description: string, subtasks: PlanSubtask[]): string {
 
 function isSuccess(status: SubtaskReportStatus | "FAILED" | "TIMEOUT"): boolean {
   return status === "DONE" || status === "DONE_WITH_CONCERNS";
+}
+
+function statusForAgentResult(result: AgentResult): TaskStatus {
+  if (result.status === "DONE") return "done";
+  if (result.status === "DONE_WITH_CONCERNS") return "done_with_concerns";
+  if (result.status === "BLOCKED") return "blocked";
+  if (result.status === "NEEDS_CONTEXT") return "needs_context";
+  if (result.status === "TIMEOUT") return "timeout";
+  return "failed";
 }
 
 function shouldEscalateModelResult(result: AgentResult, agentType: AgentType): boolean {

@@ -37,7 +37,7 @@ describe("AnthropicProvider", () => {
       model: "claude-sonnet-test",
       max_tokens: 1234,
       system: [{ type: "text", text: "system", cache_control: { type: "ephemeral" } }],
-      messages: [{ role: "user", content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] }],
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       tools: [
         {
           name: "read_file",
@@ -73,7 +73,7 @@ describe("AnthropicProvider", () => {
     expect(response.stopReason).toBe("refusal");
   });
 
-  test("only caches the first user text block", async () => {
+  test("does not cache volatile user text blocks", async () => {
     const captured: { params?: any } = {};
     const provider = new AnthropicProvider({
       apiKey: "test-key",
@@ -98,8 +98,39 @@ describe("AnthropicProvider", () => {
       tools: []
     });
 
-    expect(captured.params.messages[0].content[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(captured.params.messages[0].content[0].cache_control).toBeUndefined();
     expect(captured.params.messages[2].content[0].cache_control).toBeUndefined();
+  });
+
+  test("applies cache controls only to structured stable system blocks", async () => {
+    const captured: { params?: any } = {};
+    const provider = new AnthropicProvider({
+      apiKey: "test-key",
+      createMessage: async (params) => {
+        captured.params = params;
+        return {
+          usage: { input_tokens: 1, output_tokens: 1 },
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "done" }]
+        };
+      }
+    });
+
+    await provider.message({
+      model: "claude-sonnet-test",
+      system: [
+        { type: "text", text: "stable", cache: true },
+        { type: "text", text: "dynamic", cache: false }
+      ],
+      history: [{ role: "user", content: [{ type: "text", text: "task" }] }],
+      tools: []
+    });
+
+    expect(captured.params.system).toEqual([
+      { type: "text", text: "stable", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "dynamic" }
+    ]);
+    expect(captured.params.messages[0].content[0].cache_control).toBeUndefined();
   });
 
   test("maps Anthropic cache usage into provider usage", async () => {

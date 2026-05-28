@@ -3,6 +3,8 @@ import type { DbClient } from "../../db/client";
 import {
   buildEnvelopeReuseProjectQuery,
   buildProjectTokenUsageQuery,
+  buildRuntimeCacheKpiProjectQuery,
+  computeRuntimeCacheKpis,
   computePlannerTokenKpis
 } from "../token-kpi-utils";
 
@@ -56,6 +58,26 @@ export function createMetricsRoutes(db: DbClient): Hono {
       windowDays,
       limit,
       rows
+    });
+  });
+
+  app.get("/:projectId/runtime-cache-kpis", (ctx) => {
+    const projectId = ctx.req.param("projectId");
+    const windowDays = parsePositiveInt(ctx.req.query("windowDays"), 7, 1, 90);
+    const query = buildRuntimeCacheKpiProjectQuery(projectId, windowDays);
+    const rows = db.sqlite.query(query.sql).all(...query.params) as Array<{
+      stablePrefixHash: string | null;
+      cachedInputTokens: number;
+      inputTokens: number;
+      estimatedCachedInputSavings: number;
+      maxHistoryChars: number;
+      toolOutputContributionBytes: number;
+    }>;
+    return ctx.json({
+      projectId,
+      windowDays,
+      rows,
+      summary: computeRuntimeCacheKpis(rows)
     });
   });
 
