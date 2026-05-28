@@ -26,15 +26,28 @@ export function createExecutors(env: AppEnv): ExecutorSet {
 
   const provider = new AnthropicProvider({
     apiKey: env.ANTHROPIC_API_KEY,
-    supportedModels: [env.ANTHROPIC_MODEL]
+    supportedModels: [
+      env.ANTHROPIC_MODEL,
+      env.MODEL_TIER_CHEAP ?? env.PLANNER_MODEL_EXPRESS,
+      env.MODEL_TIER_STANDARD ?? env.ANTHROPIC_MODEL,
+      env.MODEL_TIER_STRONG ?? env.PLANNER_MODEL_COMPLEX
+    ]
   });
   const tools = createRuntimeToolRegistry();
   const harness = new HarnessExecutor({
     provider,
     tools,
-    defaultModel: env.ANTHROPIC_MODEL
+    defaultModel: env.ANTHROPIC_MODEL,
+    runtime: {
+      qmdTotalAllowanceSeconds: env.QMD_MCP_TOTAL_ALLOWANCE_SECONDS,
+      qmdCallTimeoutSeconds: env.QMD_MCP_CALL_TIMEOUT_SECONDS,
+      finalReserveSeconds: env.PLANNER_FINAL_RESERVE_SECONDS,
+      plannerSpecMaxQmdCalls: env.PLANNER_SPEC_MAX_QMD_CALLS,
+      plannerSpecMaxToolCalls: env.PLANNER_SPEC_MAX_TOOL_CALLS,
+      modelCallTimeoutSeconds: env.MODEL_CALL_TIMEOUT_SECONDS,
+      contextMaxChars: env.HARNESS_CONTEXT_MAX_CHARS
+    }
   });
 
   return { primary: harness };
 }
-

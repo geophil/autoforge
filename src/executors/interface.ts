@@ -74,6 +74,7 @@ export interface AgentResult {
     stdoutExcerpt?: string;
     command?: string | null;
     executorMode?: string | null;
+    failureSubtype?: string;
   };
   output?: unknown;
   metrics: {

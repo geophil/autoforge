@@ -4,6 +4,11 @@ import type { SkillRegistry } from "../skills/registry";
 import { STATUS_FILE } from "../executors/status-convention";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecEvent } from "./workspace";
+import {
+  isInternalToolResultPath,
+  readToolArtifact,
+  type ToolOutputMode
+} from "./tool-output-shaping";
 
 interface RuntimeToolRegistryOptions {
   skillRegistry?: SkillRegistry;
@@ -26,6 +31,9 @@ export function createRuntimeToolRegistry(options: RuntimeToolRegistryOptions = 
       statsBucket: "read",
       execute: async (input, workspace) => {
         const path = requireString(input.path, "path");
+        if (isInternalToolResultPath(path)) {
+          throw new Error("Tool result artifacts must be read with read_tool_artifact");
+        }
         return { path, content: await workspace.readFile(path) };
       }
     })
@@ -104,7 +112,16 @@ export function createRuntimeToolRegistry(options: RuntimeToolRegistryOptions = 
             items: { type: "string" },
             description: "Command arguments."
           },
-          cwd: { type: "string", description: "Optional workspace-relative working directory." }
+          cwd: { type: "string", description: "Optional workspace-relative working directory." },
+          outputMode: {
+            type: "string",
+            enum: ["summary", "excerpt", "full"],
+            description: "How much command output to return. Defaults to summary. Full requires reason."
+          },
+          reason: {
+            type: "string",
+            description: "Required when outputMode is full; explain why the full command output is needed."
+          }
         },
         required: ["cmd"]
       },
@@ -116,6 +133,41 @@ export function createRuntimeToolRegistry(options: RuntimeToolRegistryOptions = 
           timeoutSeconds: context.timeoutSeconds
         });
         return collectExec(events);
+      }
+    })
+    .register({
+      name: "read_tool_artifact",
+      description:
+        "Read a previous tool output artifact by reference. Use excerpt for targeted inspection; full requires a reason.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          artifactReference: {
+            type: "string",
+            description: "Artifact reference returned by a shaped tool result."
+          },
+          mode: {
+            type: "string",
+            enum: ["summary", "excerpt", "full"],
+            description: "How much artifact content to return."
+          },
+          reason: {
+            type: "string",
+            description: "Required when mode is full; explain why the full output is needed."
+          }
+        },
+        required: ["artifactReference"]
+      },
+      statsBucket: "read",
+      execute: async (input, workspace) => {
+        const mode = readMode(input.mode);
+        const shaped = await readToolArtifact({
+          workspace,
+          artifactReference: requireString(input.artifactReference, "artifactReference"),
+          mode,
+          reason: optionalString(input.reason, "reason")
+        });
+        return JSON.parse(shaped.content);
       }
     })
     .register({
@@ -268,6 +320,11 @@ function requireStatus(value: unknown): "DONE" | "DONE_WITH_CONCERNS" | "BLOCKED
     throw new Error(`Invalid status: ${status}`);
   }
   return status;
+}
+
+function readMode(value: unknown): ToolOutputMode {
+  if (value === "summary" || value === "excerpt" || value === "full") return value;
+  return "summary";
 }
 
 function optionalString(value: unknown, field: string): string | undefined {

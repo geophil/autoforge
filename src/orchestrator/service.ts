@@ -56,6 +56,7 @@ import { buildPlannerDispatchEnvelope } from "./planner-envelope";
 import { buildAgentDispatchEnvelope } from "./dispatch-envelope";
 import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
+import { routeModel, type ModelRoutingDecision, type ModelRoutingInput } from "./model-routing";
 
 const QMD_TOOL_NAMES = new Set(["query", "get", "multi_get", "status"]);
 const ARTIFACT_VALIDATION_MISMATCH_THRESHOLD = 0.4;
@@ -711,9 +712,91 @@ export class OrchestratorService {
     return Math.max(...rows.map((r) => r.attempt)) + 1;
   }
 
-  private plannerModel(tier: Tier): string {
-    if (tier === "EXPRESS") return this.deps.env.PLANNER_MODEL_EXPRESS;
-    return this.deps.env.PLANNER_MODEL_COMPLEX;
+  private routeModelForDispatch(args: {
+    taskId: string;
+    projectId: string;
+    agentType: AgentType;
+    phase: ModelRoutingInput["phase"];
+    tier: Tier;
+    description: string;
+    filesInScope?: string[];
+    failureCount?: number;
+    escalation?: boolean;
+    priorTier?: ModelRoutingInput["priorTier"];
+    reason?: string;
+  }): ModelRoutingDecision {
+    const decision = routeModel(this.deps.env, {
+      agentType: args.agentType,
+      phase: args.phase,
+      tier: args.tier,
+      description: args.description,
+      filesInScope: args.filesInScope,
+      failureCount: args.failureCount,
+      escalation: args.escalation,
+      priorTier: args.priorTier,
+      reason: args.reason
+    });
+    this.recordEvent({
+      taskId: args.taskId,
+      projectId: args.projectId,
+      agent: "orchestrator",
+      type: "model_routing_decision",
+      status: decision.escalated ? "done_with_concerns" : "done",
+      payload: {
+        agent_type: args.agentType,
+        phase: args.phase ?? null,
+        selected_model_tier: decision.tier,
+        selected_model: decision.model,
+        risk_level: decision.riskLevel,
+        sensitive_areas: decision.sensitiveAreas,
+        failure_count: args.failureCount ?? 0,
+        rationale: decision.rationale,
+        escalated: decision.escalated,
+        escalation_reason: decision.escalationReason,
+        prior_tier: args.priorTier ?? null,
+        candidate_tiers: decision.candidateTiers
+      },
+      budgetSeconds: 0
+    });
+    return decision;
+  }
+
+  private async executeAgentWithModelRouting(args: {
+    taskId: string;
+    projectId: string;
+    executor: AgentExecutor;
+    task: AgentTask;
+    routing: ModelRoutingDecision;
+    routeInput: {
+      agentType: AgentType;
+      phase: ModelRoutingInput["phase"];
+      tier: Tier;
+      description: string;
+      filesInScope?: string[];
+      failureCount?: number;
+    };
+  }): Promise<{ result: AgentResult; task: AgentTask; routing: ModelRoutingDecision }> {
+    let currentRouting = args.routing;
+    let currentTask: AgentTask = { ...args.task, model: currentRouting.model };
+    let result = await args.executor.execute(currentTask);
+    if (shouldEscalateModelResult(result, args.routeInput.agentType) && currentRouting.tier !== "strong") {
+      currentRouting = this.routeModelForDispatch({
+        taskId: args.taskId,
+        projectId: args.projectId,
+        agentType: args.routeInput.agentType,
+        phase: args.routeInput.phase,
+        tier: args.routeInput.tier,
+        description: args.routeInput.description,
+        filesInScope: args.routeInput.filesInScope,
+        failureCount: (args.routeInput.failureCount ?? 0) + 1,
+        escalation: true,
+        priorTier: currentRouting.tier,
+        reason: result.status === "TIMEOUT" ? "timeout" : result.blockReason ?? `agent_returned_${result.status}`
+      });
+      currentTask = { ...args.task, model: currentRouting.model };
+      result = await args.executor.execute(currentTask);
+    }
+    return { result, task: currentTask, routing: currentRouting };
   }
 
   private observedQmdTools(result: AgentResult): string[] {
@@ -745,6 +828,7 @@ export class OrchestratorService {
     plannerPersonaId: string;
     plannerSkillIds: string[];
     plannerResult: AgentResult;
+    plannerModel: string;
     observedQmdTools: string[];
   }): void {
     if (!this.deps.env.QMD_MCP_URL) return;
@@ -765,7 +849,7 @@ export class OrchestratorService {
       forensics: {
         agent: "planner",
         executor_used: args.plannerExecutorName,
-        model: this.plannerModel(currentTask.tier),
+        model: args.plannerModel,
         persona_version_id: args.plannerPersonaId,
         skill_version_ids: args.plannerSkillIds,
         tool_stats: args.plannerResult.metrics.toolStats ?? null,
@@ -848,12 +932,22 @@ export class OrchestratorService {
     // owned by the per-task lifecycle (see ensureTaskWorkspace) so no
     // finally block is needed here.
     {
+      const plannerRouting = this.routeModelForDispatch({
+        taskId,
+        projectId,
+        agentType: "planner",
+        phase: requestedPhase,
+        tier,
+        description,
+        failureCount: attempt
+      });
       const plannerEnvelope = buildPlannerDispatchEnvelope({
         taskId,
         description,
         tier,
         attempt,
-        model: this.plannerModel(tier),
+        phase: requestedPhase,
+        model: plannerRouting.model,
         systemPrompt: plannerDispatch.content,
         userPrompt,
         steeringPrompt: plannerSteering.prompt,
@@ -862,7 +956,7 @@ export class OrchestratorService {
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("planner")
       });
-      const plannerTask: AgentTask = { ...plannerEnvelope.task, workspace: plannerWorkspace };
+      let plannerTask: AgentTask = { ...plannerEnvelope.task, workspace: plannerWorkspace };
       const plannerContextEnvelopeHash = plannerEnvelope.contextEnvelopeHash;
       if (attempt > 0 && retryPromptExceedsTokenCap(plannerTask.prompt)) {
         const currentTask = this.requireTask(taskId);
@@ -880,7 +974,22 @@ export class OrchestratorService {
           }
         });
       }
-      const plannerResult = await plannerExecutor.execute(plannerTask);
+      const plannerExecution = await this.executeAgentWithModelRouting({
+        taskId,
+        projectId,
+        executor: plannerExecutor,
+        task: plannerTask,
+        routing: plannerRouting,
+        routeInput: {
+          agentType: "planner",
+          phase: requestedPhase,
+          tier,
+          description,
+          failureCount: attempt
+        }
+      });
+      plannerTask = plannerExecution.task;
+      const plannerResult = plannerExecution.result;
       this.recordSteeringConsumed({
         taskId,
         projectId,
@@ -913,7 +1022,7 @@ export class OrchestratorService {
         attempt,
         personaVersionId: plannerPersonaId,
         executorUsed: plannerExecutor.name,
-        model: this.plannerModel(tier),
+        model: plannerTask.model ?? this.deps.env.ANTHROPIC_MODEL,
         systemPrompt: transcript?.systemPrompt ?? plannerDispatch.content,
         userPrompt: transcript?.userPrompt ?? plannerTask.prompt,
         transcript: turnsJsonl,
@@ -937,7 +1046,7 @@ export class OrchestratorService {
           forensics: {
             agent: "planner",
             executor_used: plannerExecutor.name,
-            model: this.plannerModel(tier),
+            model: plannerTask.model ?? this.deps.env.ANTHROPIC_MODEL,
             ...this.failureDiagnosticsForResult({
               taskId,
               result: plannerResult,
@@ -974,6 +1083,7 @@ export class OrchestratorService {
         plannerPersonaId,
         plannerSkillIds,
         plannerResult,
+        plannerModel: plannerTask.model ?? this.deps.env.ANTHROPIC_MODEL,
         observedQmdTools
       });
       const plannerFallback =
@@ -1355,6 +1465,16 @@ export class OrchestratorService {
       const baseDocPrompt = buildDocPrompt(task.description, task.planSubtasks);
       const docWorkspace = this.requireTaskWorkspace(taskId);
       {
+        const docRouting = this.routeModelForDispatch({
+          taskId,
+          projectId: task.projectId,
+          agentType: "doc",
+          phase: "documentation",
+          tier: task.tier,
+          description: task.description,
+          filesInScope: task.planSubtasks.flatMap((subtask) => subtask.filesInScope),
+          failureCount: task.iteration
+        });
         const docEnvelope = buildAgentDispatchEnvelope({
           id: `${taskId}-doc`,
           type: "doc",
@@ -1365,11 +1485,28 @@ export class OrchestratorService {
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent("doc"),
           metadata: { taskId, description: task.description },
+          model: docRouting.model,
           lessons: docLessons.block || undefined
         });
         const docTask: AgentTask = { ...docEnvelope.task, workspace: docWorkspace };
         const docContextEnvelopeHash = docEnvelope.contextEnvelopeHash;
-        const docResult = await docExecutor.execute(docTask);
+        const docExecution = await this.executeAgentWithModelRouting({
+          taskId,
+          projectId: task.projectId,
+          executor: docExecutor,
+          task: docTask,
+          routing: docRouting,
+          routeInput: {
+            agentType: "doc",
+            phase: "documentation",
+            tier: task.tier,
+            description: task.description,
+            filesInScope: task.planSubtasks.flatMap((subtask) => subtask.filesInScope),
+            failureCount: task.iteration
+          }
+        });
+        const routedDocTask = docExecution.task;
+        const docResult = docExecution.result;
         this.recordSteeringConsumed({
           taskId,
           projectId: task.projectId,
@@ -1384,7 +1521,7 @@ export class OrchestratorService {
           projectId: task.projectId,
           agentType: "doc",
           selection: docDispatch.selection,
-          liveTask: docTask,
+          liveTask: routedDocTask,
           liveResult: docResult,
           baselineExecutorUsed: docExecutor.name,
           baselineLessonIds: docLessons.ids,
@@ -2697,6 +2834,16 @@ export class OrchestratorService {
         const coderSteering = this.steeringForDispatch(taskId);
         const baseCoderPrompt = buildCoderPrompt(description, subtask, iteration);
         const coderWorkspace = this.requireTaskWorkspace(taskId);
+        const coderRouting = this.routeModelForDispatch({
+          taskId,
+          projectId,
+          agentType: subtaskAgentType,
+          phase: "implementation",
+          tier,
+          description: `${description}\n\n${subtask.description}`,
+          filesInScope: subtask.filesInScope,
+          failureCount: iteration
+        });
         const coderEnvelope = buildAgentDispatchEnvelope({
           id: subtask.id,
           type: subtaskAgentType,
@@ -2707,6 +2854,7 @@ export class OrchestratorService {
           environment: this.agentEnvironment(),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
           metadata: { taskId, subtask, description },
+          model: coderRouting.model,
           lessons: coderLessons.block || undefined
         });
         const liveTask: AgentTask = { ...coderEnvelope.task, workspace: coderWorkspace };
@@ -2728,7 +2876,23 @@ export class OrchestratorService {
           },
           budgetSeconds: this.budgetForTier(tier, "coder")
         });
-        const coderResult = await coderExecutor.execute(liveTask);
+        const coderExecution = await this.executeAgentWithModelRouting({
+          taskId,
+          projectId,
+          executor: coderExecutor,
+          task: liveTask,
+          routing: coderRouting,
+          routeInput: {
+            agentType: subtaskAgentType,
+            phase: "implementation",
+            tier,
+            description: `${description}\n\n${subtask.description}`,
+            filesInScope: subtask.filesInScope,
+            failureCount: iteration
+          }
+        });
+        const routedLiveTask = coderExecution.task;
+        const coderResult = coderExecution.result;
         this.recordSteeringConsumed({
           taskId,
           projectId,
@@ -2743,7 +2907,7 @@ export class OrchestratorService {
           projectId,
           agentType: subtaskAgentType,
           selection: subtaskDispatch.selection,
-          liveTask,
+          liveTask: routedLiveTask,
           liveResult: coderResult,
           baselineExecutorUsed: coderExecutor.name,
           baselineLessonIds: coderLessons.ids,
@@ -2767,10 +2931,11 @@ export class OrchestratorService {
               subtask_id: subtask.id,
               subtask_description: subtask.description,
               executor_used: coderExecutor.name,
+              model: routedLiveTask.model ?? null,
               ...this.failureDiagnosticsForResult({
                 taskId,
                 result: coderResult,
-                workspace: liveTask.workspace,
+                workspace: routedLiveTask.workspace,
                 executorMode: coderExecutor.name
               }),
               persona_version_id: subtaskPersonaId,
@@ -2907,6 +3072,16 @@ export class OrchestratorService {
       const reviewerSteering = this.steeringForDispatch(taskId);
       const baseReviewerPrompt = buildReviewerPrompt(description, planSubtasks);
       const reviewerWorkspace = this.requireTaskWorkspace(taskId);
+      const reviewerRouting = this.routeModelForDispatch({
+        taskId,
+        projectId,
+        agentType: "reviewer",
+        phase: "review",
+        tier,
+        description,
+        filesInScope: planSubtasks.flatMap((subtask) => subtask.filesInScope),
+        failureCount: iteration
+      });
       const reviewerEnvelope = buildAgentDispatchEnvelope({
         id: `${taskId}-review-${iteration}`,
         type: "reviewer",
@@ -2917,11 +3092,28 @@ export class OrchestratorService {
         environment: this.agentEnvironment(),
         skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description },
+        model: reviewerRouting.model,
         lessons: reviewerLessons.block || undefined
       });
       const reviewerTask: AgentTask = { ...reviewerEnvelope.task, workspace: reviewerWorkspace };
       const reviewerContextEnvelopeHash = reviewerEnvelope.contextEnvelopeHash;
-      const reviewResult = await reviewerExecutor.execute(reviewerTask);
+      const reviewerExecution = await this.executeAgentWithModelRouting({
+        taskId,
+        projectId,
+        executor: reviewerExecutor,
+        task: reviewerTask,
+        routing: reviewerRouting,
+        routeInput: {
+          agentType: "reviewer",
+          phase: "review",
+          tier,
+          description,
+          filesInScope: planSubtasks.flatMap((subtask) => subtask.filesInScope),
+          failureCount: iteration
+        }
+      });
+      const routedReviewerTask = reviewerExecution.task;
+      const reviewResult = reviewerExecution.result;
       this.recordSteeringConsumed({
         taskId,
         projectId,
@@ -2936,7 +3128,7 @@ export class OrchestratorService {
         projectId,
         agentType: "reviewer",
         selection: reviewerDispatch.selection,
-        liveTask: reviewerTask,
+        liveTask: routedReviewerTask,
         liveResult: reviewResult,
         baselineExecutorUsed: reviewerExecutor.name,
         baselineLessonIds: reviewerLessons.ids,
@@ -2947,6 +3139,7 @@ export class OrchestratorService {
 
       const reviewerFailureForensics = {
         executor_used: reviewerExecutor.name,
+        model: routedReviewerTask.model ?? null,
         persona_version_id: reviewerPersonaId,
         skill_version_ids: reviewerSkillIds,
         tool_stats: reviewResult.metrics.toolStats ?? null
@@ -2967,7 +3160,7 @@ export class OrchestratorService {
             ...this.failureDiagnosticsForResult({
               taskId,
               result: reviewResult,
-              workspace: reviewerTask.workspace,
+              workspace: routedReviewerTask.workspace,
               executorMode: reviewerExecutor.name
             }),
             planner_fallback: planSubtasks.length === 1 &&
@@ -3332,6 +3525,7 @@ export class OrchestratorService {
       stdout_excerpt: (args.result.diagnostics?.stdoutExcerpt ?? "").trim(),
       command: args.result.diagnostics?.command ?? null,
       executor_mode: args.result.diagnostics?.executorMode ?? args.executorMode,
+      failure_subtype: args.result.diagnostics?.failureSubtype ?? null,
       workspace_id: args.workspace?.id ?? null,
       checkpoint_stage: checkpoint.checkpoint_stage,
       checkpoint_id: checkpoint.checkpoint_id
@@ -3990,6 +4184,12 @@ function isSuccess(status: SubtaskReportStatus | "FAILED" | "TIMEOUT"): boolean 
   return status === "DONE" || status === "DONE_WITH_CONCERNS";
 }
 
+function shouldEscalateModelResult(result: AgentResult, agentType: AgentType): boolean {
+  if (result.status !== "TIMEOUT" && result.status !== "FAILED") return false;
+  if (agentType === "coder" && (result.metrics.toolStats?.writeCount ?? 0) > 0) return false;
+  return true;
+}
+
 function normalizeToolStats(
   toolStats: ToolStats | Record<string, unknown> | null | undefined
 ): Record<string, unknown> | null {
@@ -4006,4 +4206,3 @@ function normalizeToolStats(
     iterations: Number(stats.iterations ?? 0)
   };
 }
-

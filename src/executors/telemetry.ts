@@ -9,6 +9,10 @@ export interface ModelCallEvent {
   timestamp: number;
   retryAttempt: number;
   estimatedCost: number;
+  modelCallTimeoutSeconds?: number;
+  historyChars?: number;
+  transcriptChars?: number;
+  failureSubtype?: string;
 }
 
 export interface ToolCallEvent {
@@ -17,7 +21,19 @@ export interface ToolCallEvent {
   latencyMs: number;
   rawOutputBytes: number;
   truncatedOutputBytes: number;
+  artifactBytes?: number;
+  summaryBytes?: number;
+  returnedToModelBytes?: number;
+  outputMode?: "summary" | "excerpt" | "full";
+  parser?: string;
+  fullOutputReason?: string;
   artifactReference?: string;
+  qmdElapsedMs?: number;
+  qmdAllowanceUsedMs?: number;
+  qmdAllowanceRemainingMs?: number;
+  historyChars?: number;
+  transcriptChars?: number;
+  failureSubtype?: string;
 }
 
 export interface TelemetrySummary {
@@ -66,7 +82,7 @@ export class TelemetryLedger {
     }
 
     for (const t of this.toolEvents) {
-      totalToolBytes += t.truncatedOutputBytes;
+      totalToolBytes += t.returnedToModelBytes ?? t.truncatedOutputBytes;
     }
 
     let mostExpensiveModel = "";
