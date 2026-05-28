@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { RuntimeControls } from "../../src/runtime/runtime-controls";
 import { McpToolAdapter, type McpClient } from "../../src/runtime/mcp-tool-adapter";
 import { guardrailToolResult, type ToolExecutionOutcome } from "../../src/runtime/tool-execution-outcome";
+import { executeToolUse, isToolTimeoutError } from "../../src/runtime/tool-execution";
+import { ToolRegistry } from "../../src/runtime/tool-registry";
 import type { AgentTask } from "../../src/executors/interface";
 
 function task(overrides: Partial<AgentTask> = {}): AgentTask {
@@ -215,9 +217,12 @@ describe("runtime components", () => {
 
   test("ToolExecutionOutcome represents guardrail blocks", () => {
     const outcome: ToolExecutionOutcome = {
+      toolName: "query",
+      input: {},
       source: "guardrail",
       status: "error",
       result: guardrailToolResult("stop", "max_tool_iterations"),
+      latencyMs: 0,
       isQmdTool: false,
       failureSubtype: "max_tool_iterations"
     };
@@ -227,5 +232,148 @@ describe("runtime components", () => {
       status: "error",
       failureSubtype: "max_tool_iterations"
     });
+  });
+
+  test("executeToolUse normalizes local success and stats bucket", async () => {
+    const controls = new RuntimeControls(task());
+    const tools = new ToolRegistry().register({
+      name: "read_note",
+      description: "Read note",
+      inputSchema: { type: "object" },
+      execute: async () => ({ ok: true })
+    });
+
+    const outcome = await executeToolUse({
+      toolUse: { name: "read_note", input: {} },
+      task: task(),
+      tools,
+      mcpAdapter: new McpToolAdapter(),
+      budget: controls.budget,
+      guardrails: controls.guardrails
+    });
+
+    expect(outcome).toMatchObject({
+      source: "local",
+      status: "success",
+      result: { ok: true },
+      isQmdTool: false,
+      statsBucket: "read"
+    });
+  });
+
+  test("executeToolUse normalizes local and unknown-tool errors as recoverable outcomes", async () => {
+    const failingControls = new RuntimeControls(task());
+    const tools = new ToolRegistry().register({
+      name: "read_note",
+      description: "Read note",
+      inputSchema: { type: "object" },
+      execute: async () => new Error("not found")
+    });
+
+    const localError = await executeToolUse({
+      toolUse: { name: "read_note", input: {} },
+      task: task(),
+      tools,
+      mcpAdapter: new McpToolAdapter(),
+      budget: failingControls.budget,
+      guardrails: failingControls.guardrails
+    });
+
+    const unknownControls = new RuntimeControls(task());
+    const unknownError = await executeToolUse({
+      toolUse: { name: "missing_tool", input: {} },
+      task: task(),
+      tools,
+      mcpAdapter: new McpToolAdapter(),
+      budget: unknownControls.budget,
+      guardrails: unknownControls.guardrails
+    });
+
+    expect(localError).toMatchObject({ source: "local", status: "error", statsBucket: "read" });
+    expect(localError.result).toBeInstanceOf(Error);
+    expect(unknownError).toMatchObject({ source: "error", status: "error", isQmdTool: false });
+    expect(unknownError.result).toBeInstanceOf(Error);
+  });
+
+  test("executeToolUse normalizes QMD success and MCP error outcomes", async () => {
+    const adapter = new McpToolAdapter(async () => ({
+      listTools: async () => ({ tools: [{ name: "get", inputSchema: { type: "object" } }] }),
+      callTool: async ({ arguments: input }) => ({
+        isError: input.fail === true,
+        content: [{ type: "text", text: input.fail === true ? "missing" : "found" }]
+      }),
+      close: async () => {}
+    }));
+    const setupControls = new RuntimeControls(task());
+    await adapter.setup("http://qmd.test", setupControls.budget.timeoutForQmdCall());
+
+    const successControls = new RuntimeControls(task());
+    const success = await executeToolUse({
+      toolUse: { name: "get", input: {} },
+      task: task(),
+      tools: new ToolRegistry(),
+      mcpAdapter: adapter,
+      budget: successControls.budget,
+      guardrails: successControls.guardrails
+    });
+
+    const errorControls = new RuntimeControls(task());
+    const error = await executeToolUse({
+      toolUse: { name: "get", input: { fail: true } },
+      task: task(),
+      tools: new ToolRegistry(),
+      mcpAdapter: adapter,
+      budget: errorControls.budget,
+      guardrails: errorControls.guardrails
+    });
+
+    expect(success).toMatchObject({ source: "qmd", status: "success", result: "found", isQmdTool: true });
+    expect(success.qmdAllowanceRemainingMs).toBeDefined();
+    expect(error).toMatchObject({ source: "qmd", status: "error", result: "missing", isQmdTool: true });
+  });
+
+  test("executeToolUse normalizes guardrail blocks and preserves timeout-like failures", async () => {
+    const blockedControls = new RuntimeControls(task(), { plannerSpecMaxToolCalls: 0 });
+    const blocked = await executeToolUse({
+      toolUse: { name: "read_note", input: {} },
+      task: task(),
+      tools: new ToolRegistry(),
+      mcpAdapter: new McpToolAdapter(),
+      budget: blockedControls.budget,
+      guardrails: blockedControls.guardrails
+    });
+
+    const timeoutTask = task({
+      type: "coder",
+      prompt: "Do work",
+      budgetSeconds: 0,
+      metadata: { phase: "implementation" }
+    });
+    const timeoutControls = new RuntimeControls(timeoutTask);
+    let timeoutError: unknown;
+    try {
+      await executeToolUse({
+        toolUse: { name: "read_note", input: {} },
+        task: timeoutTask,
+        tools: new ToolRegistry().register({
+          name: "read_note",
+          description: "Read note",
+          inputSchema: { type: "object" },
+          execute: async () => ({ ok: true })
+        }),
+        mcpAdapter: new McpToolAdapter(),
+        budget: timeoutControls.budget,
+        guardrails: timeoutControls.guardrails
+      });
+    } catch (error) {
+      timeoutError = error;
+    }
+
+    expect(blocked).toMatchObject({
+      source: "guardrail",
+      status: "error",
+      failureSubtype: "max_tool_iterations"
+    });
+    expect(isToolTimeoutError(timeoutError)).toBe(true);
   });
 });
