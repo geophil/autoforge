@@ -222,7 +222,7 @@ describe("retry preserves approved spec when execution-plan attempt fails", () =
         }
         // execution_plan
         planCalls += 1;
-        if (planCalls === 1) {
+        if (planCalls <= 2) {
           return {
             status: "FAILED",
             artifacts: [],

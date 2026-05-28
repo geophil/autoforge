@@ -185,10 +185,43 @@ describe("HarnessExecutor", () => {
     });
 
     expect(result.status).toBe("TIMEOUT");
+    expect(result.diagnostics?.failureSubtype).toBe("model_call_timeout");
     expect(result.metrics.elapsedSeconds).toBeGreaterThanOrEqual(0);
     expect(result.metrics.elapsedSeconds).toBeLessThan(5);
     expect(result.metrics.telemetry).toBeDefined();
-    expect(result.metrics.telemetry?.events.models.length).toBe(0);
+    expect(result.metrics.telemetry?.events.models[0].failureSubtype).toBe("model_call_timeout");
+  });
+
+  test("caps model calls with configured per-call timeout", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-model-timeout-cap",
+      files: { ".autoforge-status.json": JSON.stringify({ status: "DONE", artifacts: [] }) }
+    });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    await new HarnessExecutor({
+      provider,
+      tools: new ToolRegistry(),
+      defaultModel: "test-model",
+      runtime: { modelCallTimeoutSeconds: 7 }
+    }).execute({
+      id: "task-model-timeout-cap",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(provider.calls[0].timeoutSeconds).toBe(7);
   });
 
   test("treats pause_turn as a terminal model stop", async () => {
@@ -572,6 +605,314 @@ describe("HarnessExecutor", () => {
     expect(event?.truncatedOutputBytes).toBeLessThanOrEqual(MAX_TOOL_RESULT_CHARS);
   });
 
+  test("summarizes exec output and stores the raw output as an ignored artifact", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-exec-summary",
+      commands: [
+        {
+          cmd: "bun",
+          args: ["test"],
+          events: [
+            { kind: "stdout", chunk: `tests/unit/foo.test.ts:\n${"x".repeat(10_000)}\n` },
+            { kind: "stderr", chunk: "src/foo.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.\n" },
+            { kind: "exit", exitCode: 1 }
+          ]
+        }
+      ]
+    });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "exec-1", name: "exec", input: { cmd: "bun", args: ["test"] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-1", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-exec-summary",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "run tests",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    const toolResult = provider.calls[1].history.at(-1)?.content[0] as unknown as { content: string };
+    const payload = JSON.parse(toolResult.content);
+    expect(payload.outputMode).toBe("summary");
+    expect(payload.parser).toBe("typescript");
+    expect(payload.keyFindings).toContain("src/foo.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.");
+    expect(payload.artifactReference).toMatch(/^\.autoforge\/tool-results\/exec-1-/);
+    expect(await workspace.readFile(".autoforge/.gitignore")).toBe("*\n");
+    const artifact = JSON.parse(await workspace.readFile(payload.artifactReference));
+    expect(artifact.stderr).toContain("TS2322");
+
+    const event = result.metrics.telemetry?.events.tools.find((tool) => tool.toolName === "exec");
+    expect(event?.artifactReference).toBe(payload.artifactReference);
+    expect(event?.outputMode).toBe("summary");
+    expect(event?.rawOutputBytes).toBeGreaterThan(event?.returnedToModelBytes ?? 0);
+    expect(event?.returnedToModelBytes).toBe(Buffer.byteLength(toolResult.content, "utf8"));
+  });
+
+  test("returns full exec output only when a reason is supplied", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-exec-full",
+      commands: [
+        {
+          cmd: "node",
+          args: ["script.js"],
+          events: [
+            { kind: "stdout", chunk: "full stdout\n" },
+            { kind: "stderr", chunk: "full stderr\n" },
+            { kind: "exit", exitCode: 0 }
+          ]
+        }
+      ]
+    });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{
+          type: "tool_use",
+          id: "exec-full",
+          name: "exec",
+          input: { cmd: "node", args: ["script.js"], outputMode: "full", reason: "Need exact output" }
+        }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-1", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model"
+    }).execute({
+      id: "task-exec-full",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "run script",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    const toolResult = provider.calls[1].history.at(-1)?.content[0] as unknown as { content: string };
+    const payload = JSON.parse(toolResult.content);
+    expect(payload.outputMode).toBe("full");
+    expect(payload.stdout).toBe("full stdout\n");
+    expect(payload.stderr).toBe("full stderr\n");
+    expect(result.metrics.telemetry?.events.tools.find((tool) => tool.toolName === "exec")?.fullOutputReason)
+      .toBe("Need exact output");
+  });
+
+  test("summarizes large QMD tool results and records QMD allowance telemetry", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-qmd-summary" });
+    const largeQmdText = `# Domain Agent Execution\n\n${"docs/qmd/domain-agent-execution.md\n".repeat(400)}`;
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "qmd-1", name: "get", input: { path: "docs/qmd/domain-agent-execution.md" } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-1", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model",
+      runtime: { qmdTotalAllowanceSeconds: 90, qmdCallTimeoutSeconds: 20, finalReserveSeconds: 5 },
+      mcpClientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: "get",
+              description: "Get QMD doc",
+              inputSchema: { type: "object", properties: { path: { type: "string" } } }
+            }]
+          };
+        },
+        async callTool(_request, _schema, options) {
+          expect(options?.timeout).toBeLessThanOrEqual(20_000);
+          return { content: [{ type: "text", text: largeQmdText }] };
+        },
+        async close() {}
+      })
+    }).execute({
+      id: "task-qmd-summary",
+      type: "planner",
+      systemPrompt: "system",
+      prompt: "## Phase\nspec\n\n## Task\nplan",
+      workspace,
+      budgetSeconds: 60,
+      environment: { QMD_MCP_URL: "http://qmd.test/mcp" },
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    const toolResult = provider.calls[1].history.at(-1)?.content[0] as unknown as { content: string };
+    const payload = JSON.parse(toolResult.content);
+    expect(payload.toolKind).toBe("qmd");
+    expect(payload.outputMode).toBe("summary");
+    expect(payload.artifactReference).toMatch(/^\.autoforge\/tool-results\/qmd-1-/);
+    expect(payload.relevantPaths).toContain("docs/qmd/domain-agent-execution.md");
+    const artifact = JSON.parse(await workspace.readFile(payload.artifactReference));
+    expect(artifact.text).toBe(largeQmdText);
+
+    const event = result.metrics.telemetry?.events.tools.find((tool) => tool.toolName === "get");
+    expect(event?.artifactReference).toBe(payload.artifactReference);
+    expect(event?.qmdAllowanceRemainingMs).toBeDefined();
+    expect(event?.returnedToModelBytes).toBeLessThan(event?.rawOutputBytes ?? 0);
+  });
+
+  test("caps QMD setup with QMD timeout telemetry", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-qmd-setup-timeout",
+      files: { ".autoforge-status.json": JSON.stringify({ status: "DONE", artifacts: [] }) }
+    });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model",
+      runtime: { qmdTotalAllowanceSeconds: 1, qmdCallTimeoutSeconds: 0.001 },
+      mcpClientFactory: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return {
+          async listTools() {
+            return { tools: [] };
+          },
+          async callTool() {
+            return { content: [] };
+          },
+          async close() {}
+        };
+      }
+    }).execute({
+      id: "task-qmd-setup-timeout",
+      type: "planner",
+      systemPrompt: "system",
+      prompt: "## Phase\nspec\n\n## Task\nplan",
+      workspace,
+      budgetSeconds: 60,
+      environment: { QMD_MCP_URL: "http://qmd.test/mcp" },
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    const setupEvent = result.metrics.telemetry?.events.tools.find((tool) => tool.toolName === "qmd_setup");
+    expect(setupEvent?.status).toBe("error");
+    expect(setupEvent?.failureSubtype).toBe("qmd_call_timeout");
+    expect(setupEvent?.qmdAllowanceRemainingMs).toBeDefined();
+  });
+
+  test("summarizes large QMD error results as retrievable artifacts", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-qmd-error-summary" });
+    const largeErrorText = `QMD error\n${"docs/qmd/domain-task-orchestration.md failed\n".repeat(400)}`;
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "qmd-error", name: "get", input: { path: "missing-doc" } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "done-1", name: "done", input: { status: "DONE", artifacts: [] } }],
+        usage: { input: 1, output: 1 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 1, output: 1 }
+      }
+    ]);
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools: createRuntimeToolRegistry(),
+      defaultModel: "test-model",
+      runtime: { qmdTotalAllowanceSeconds: 90, qmdCallTimeoutSeconds: 20, finalReserveSeconds: 5 },
+      mcpClientFactory: async () => ({
+        async listTools() {
+          return {
+            tools: [{
+              name: "get",
+              description: "Get QMD doc",
+              inputSchema: { type: "object", properties: { path: { type: "string" } } }
+            }]
+          };
+        },
+        async callTool() {
+          return { isError: true, content: [{ type: "text", text: largeErrorText }] };
+        },
+        async close() {}
+      })
+    }).execute({
+      id: "task-qmd-error-summary",
+      type: "planner",
+      systemPrompt: "system",
+      prompt: "## Phase\nspec\n\n## Task\nplan",
+      workspace,
+      budgetSeconds: 60,
+      environment: { QMD_MCP_URL: "http://qmd.test/mcp" },
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    const toolResult = provider.calls[1].history.at(-1)?.content[0] as unknown as { content: string };
+    const payload = JSON.parse(toolResult.content);
+    expect(payload.status).toBe("error");
+    expect(payload.artifactReference).toMatch(/^\.autoforge\/tool-results\/qmd-error-/);
+    const event = result.metrics.telemetry?.events.tools.find((tool) => tool.toolName === "get");
+    expect(event?.status).toBe("error");
+    expect(event?.artifactReference).toBe(payload.artifactReference);
+    expect(event?.returnedToModelBytes).toBeLessThan(event?.rawOutputBytes ?? 0);
+  });
+
   test("records recoverable unknown tool errors as tool telemetry errors", async () => {
     const workspace = new MockWorkspace({ id: "workspace-unknown-tool-telemetry" });
     const provider = new ScriptedProvider([
@@ -737,7 +1078,7 @@ describe("HarnessExecutor", () => {
     expect(result.metrics.telemetry?.events.tools.length).toBe(1);
 
     // Workspace file check
-    const telemetryFileContent = await workspace.readFile(".autoforge-telemetry.json").catch(() => null);
+    const telemetryFileContent = await workspace.readFile(".autoforge/telemetry.json").catch(() => null);
     expect(telemetryFileContent).not.toBeNull();
     const parsed = JSON.parse(telemetryFileContent!);
     expect(parsed.totalTokens.input).toBe(40);

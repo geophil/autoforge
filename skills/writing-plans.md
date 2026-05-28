@@ -157,7 +157,51 @@ These are not soft guidance. The orchestrator records `planner_phase_mismatch` w
 - Everything `STANDARD` requires, plus:
   - `discovery.decisions` must contain ≥ 1 entry with non-empty `alternativesRejected`.
   - Prefer one focused `blockingQuestion` per attempt when real ambiguity exists, rather than guessing.
-- Subtasks: 5–15 with explicit alternatives considered. If the feature is larger, escalate via `blockingQuestion`.
+- Subtasks: 5-15 with explicit alternatives considered. If the feature is larger, escalate via `blockingQuestion`.
+
+## Refactoring tasks
+
+Treat a task as refactoring work when the request asks to refactor, clean up,
+restructure, simplify, extract, consolidate, migrate internals, reduce
+duplication, improve maintainability, or reorganize code without an explicit
+behavior change.
+
+For refactoring tasks, encode safety using the existing contract fields. Do not
+invent new JSON fields.
+
+In `discovery`:
+
+- Put the refactor type in `constraints`: mechanical, structural,
+  API-preserving design cleanup, migration-assisted, or behavior-changing
+  follow-up.
+- Put forbidden opportunistic cleanup in `nonGoals`.
+- Use `decisions` when choosing between a local cleanup and a broader design
+  change.
+
+In `spec`:
+
+- Put behavior invariants in `desiredBehavior` and `acceptanceCriteria`.
+- Put public API, data shape, event payload, route, CLI, or migration
+  compatibility expectations in `acceptanceCriteria`.
+- Put regression risks and mitigation in `risks`.
+- Put a verification rationale in `verification`: explain why the selected
+  checks prove behavior preservation, not just that "tests pass."
+
+In each refactoring subtask:
+
+- `description` must say what is being preserved as well as what is being
+  changed.
+- `filesInScope` must be narrow enough to prevent drive-by cleanup.
+- `verificationCommands` must prefer targeted checks when available, then add a
+  broader suite when risk justifies it.
+- `testCriteria` must include at least one behavior-preservation criterion.
+- `completionEvidence` must name the proof expected from the coder, such as
+  targeted test output, typecheck output, unchanged public API shape, or a note
+  that no behavior-bearing tests exist.
+
+Do not classify a behavior-changing feature as a pure refactor. If the requested
+change intentionally changes behavior, state that explicitly in the spec and
+make the changed behavior part of the acceptance criteria.
 
 ## Rules (apply across phases)
 

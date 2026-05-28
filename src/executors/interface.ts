@@ -15,11 +15,11 @@ export interface AgentTask {
   /** Per-run model override. When unset, executor uses its configured default. */
   model?: string;
   /**
-   * Optional pre-rendered lessons block to inject between the persona and the
-   * `# Skills` section (Spec B §5.4). When present and non-empty, executors
-   * splice it verbatim into the system prompt; when absent, empty, or
-   * whitespace-only, no lesson section is emitted. The orchestrator is
-   * responsible for assembly and token-budgeting via
+   * Optional pre-rendered lessons block injected as dynamic prompt context.
+   * When present and non-empty, executors splice it verbatim after stable
+   * persona/skills/status sections; when absent, empty, or whitespace-only,
+   * no lesson section is emitted. The orchestrator is responsible for
+   * assembly and token-budgeting via
    * `retrieveLessonsForDispatch`.
    */
   lessons?: string;
@@ -54,6 +54,10 @@ export interface AgentTranscript {
   userPrompt: string;
   turns: AgentTranscriptTurn[];
   loadedSkills?: string[];
+  promptEnvelope?: {
+    stablePrefixVersion: string;
+    stablePrefixHash: string;
+  };
 }
 
 export interface TelemetryMetrics extends TelemetrySummary {
@@ -74,6 +78,7 @@ export interface AgentResult {
     stdoutExcerpt?: string;
     command?: string | null;
     executorMode?: string | null;
+    failureSubtype?: string;
   };
   output?: unknown;
   metrics: {

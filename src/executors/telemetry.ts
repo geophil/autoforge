@@ -4,11 +4,17 @@ export interface ModelCallEvent {
   provider: string;
   model: string;
   agentType: AgentType;
-  tokens: { input: number; output: number; cached?: number };
+  tokens: { input: number; output: number; cached?: number; cacheCreation?: number };
   latencyMs: number;
   timestamp: number;
   retryAttempt: number;
   estimatedCost: number;
+  stablePrefixVersion?: string;
+  stablePrefixHash?: string;
+  modelCallTimeoutSeconds?: number;
+  historyChars?: number;
+  transcriptChars?: number;
+  failureSubtype?: string;
 }
 
 export interface ToolCallEvent {
@@ -17,12 +23,25 @@ export interface ToolCallEvent {
   latencyMs: number;
   rawOutputBytes: number;
   truncatedOutputBytes: number;
+  artifactBytes?: number;
+  summaryBytes?: number;
+  returnedToModelBytes?: number;
+  outputMode?: "summary" | "excerpt" | "full";
+  parser?: string;
+  fullOutputReason?: string;
   artifactReference?: string;
+  qmdElapsedMs?: number;
+  qmdAllowanceUsedMs?: number;
+  qmdAllowanceRemainingMs?: number;
+  historyChars?: number;
+  transcriptChars?: number;
+  failureSubtype?: string;
 }
 
 export interface TelemetrySummary {
   totalEstimatedCost: number;
-  totalTokens: { input: number; output: number; cached: number };
+  totalTokens: { input: number; output: number; cached: number; cacheCreation: number };
+  cacheHitRatio: number;
   retryCount: number;
   mostExpensiveModel: string;
   mostExpensivePhase: string;
@@ -47,7 +66,7 @@ export class TelemetryLedger {
 
   getSummary(): TelemetrySummary {
     let totalCost = 0;
-    const tokens = { input: 0, output: 0, cached: 0 };
+    const tokens = { input: 0, output: 0, cached: 0, cacheCreation: 0 };
     let totalToolBytes = 0;
     let retries = 0;
 
@@ -59,6 +78,7 @@ export class TelemetryLedger {
       tokens.input += m.tokens.input;
       tokens.output += m.tokens.output;
       tokens.cached += m.tokens.cached ?? 0;
+      tokens.cacheCreation += m.tokens.cacheCreation ?? 0;
       retries += m.retryAttempt;
 
       costByModel[m.model] = (costByModel[m.model] || 0) + m.estimatedCost;
@@ -66,7 +86,7 @@ export class TelemetryLedger {
     }
 
     for (const t of this.toolEvents) {
-      totalToolBytes += t.truncatedOutputBytes;
+      totalToolBytes += t.returnedToModelBytes ?? t.truncatedOutputBytes;
     }
 
     let mostExpensiveModel = "";
@@ -90,6 +110,7 @@ export class TelemetryLedger {
     return {
       totalEstimatedCost: totalCost,
       totalTokens: tokens,
+      cacheHitRatio: tokens.input > 0 ? tokens.cached / tokens.input : 0,
       retryCount: retries,
       mostExpensiveModel,
       mostExpensivePhase,

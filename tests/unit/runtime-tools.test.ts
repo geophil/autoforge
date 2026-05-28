@@ -24,6 +24,18 @@ describe("runtime tools", () => {
     expect(result).toEqual({ path: "src/example.ts", content: "hello" });
   });
 
+  test("read_file rejects internal tool-result artifacts", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-internal-artifact",
+      files: { ".autoforge/tool-results/exec-1.json": "{}" }
+    });
+    const registry = createRuntimeToolRegistry();
+
+    await expect(registry.get("read_file").execute({
+      path: ".autoforge/tool-results/exec-1.json"
+    }, workspace, context)).rejects.toThrow("read with read_tool_artifact");
+  });
+
   test("exec collects streamed stdout, stderr, exitCode, and signal", async () => {
     const workspace = new MockWorkspace({
       id: "workspace-1",
@@ -70,6 +82,96 @@ describe("runtime tools", () => {
 
     expect(observedEnv?.FROM_CONTEXT).toBe("yes");
     expect(observedTimeout).toBe(60);
+  });
+
+  test("read_tool_artifact returns excerpts and requires a reason for full output", async () => {
+    const artifactReference = ".autoforge/tool-results/exec-1.json";
+    const workspace = new MockWorkspace({
+      id: "workspace-tool-artifact",
+      files: {
+        [artifactReference]: JSON.stringify({
+          kind: "exec",
+          toolUseId: "exec-1",
+          command: "bun",
+          args: ["test"],
+          cwd: ".",
+          exitCode: 1,
+          stdout: "FAIL tests/unit/foo.test.ts\n",
+          stderr: "src/foo.ts(1,1): error TS2304: Cannot find name 'x'.\n",
+          createdAt: "2026-05-20T00:00:00.000Z"
+        })
+      }
+    });
+    const registry = createRuntimeToolRegistry();
+
+    const excerpt = await registry.get("read_tool_artifact").execute({
+      artifactReference,
+      mode: "excerpt"
+    }, workspace, context) as { outputMode: string; keyFindings: string[] };
+
+    expect(excerpt.outputMode).toBe("excerpt");
+    expect(excerpt.keyFindings).toContain("src/foo.ts(1,1): error TS2304: Cannot find name 'x'.");
+    await expect(registry.get("read_tool_artifact").execute({
+      artifactReference,
+      mode: "full"
+    }, workspace, context)).rejects.toThrow("requires a reason");
+  });
+
+  test("read_tool_artifact supports QMD artifacts", async () => {
+    const artifactReference = ".autoforge/tool-results/qmd-1.json";
+    const workspace = new MockWorkspace({
+      id: "workspace-qmd-artifact",
+      files: {
+        [artifactReference]: JSON.stringify({
+          kind: "qmd",
+          toolUseId: "qmd-1",
+          toolName: "get",
+          input: { path: "docs/qmd/domain-agent-execution.md" },
+          text: "# Agent Execution\n\nRelevant doc content in docs/qmd/domain-agent-execution.md\n",
+          isError: false,
+          createdAt: "2026-05-22T00:00:00.000Z"
+        })
+      }
+    });
+    const registry = createRuntimeToolRegistry();
+
+    const summary = await registry.get("read_tool_artifact").execute({
+      artifactReference,
+      mode: "summary"
+    }, workspace, context) as { toolKind: string; relevantPaths: string[]; excerpts: string[] };
+
+    expect(summary.toolKind).toBe("qmd");
+    expect(summary.relevantPaths).toContain("docs/qmd/domain-agent-execution.md");
+    expect(summary.excerpts[0]).toContain("Agent Execution");
+    await expect(registry.get("read_tool_artifact").execute({
+      artifactReference,
+      mode: "full"
+    }, workspace, context)).rejects.toThrow("requires a reason");
+  });
+
+  test("read_tool_artifact rejects path traversal in artifact references", async () => {
+    const workspace = new MockWorkspace({
+      id: "workspace-tool-artifact-traversal",
+      files: {
+        "etc/passwd": JSON.stringify({
+          kind: "exec",
+          toolUseId: "escaped",
+          command: "cat",
+          args: ["/etc/passwd"],
+          cwd: ".",
+          exitCode: 0,
+          stdout: "root:x:0:0:root:/root:/bin/sh\n",
+          stderr: "",
+          createdAt: "2026-05-20T00:00:00.000Z"
+        })
+      }
+    });
+    const registry = createRuntimeToolRegistry();
+
+    await expect(registry.get("read_tool_artifact").execute({
+      artifactReference: ".autoforge/tool-results/../../etc/passwd",
+      mode: "summary"
+    }, workspace, context)).rejects.toThrow("Unsupported tool artifact reference");
   });
 
   test("done writes the Autoforge status file", async () => {

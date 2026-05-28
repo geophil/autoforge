@@ -1,5 +1,12 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { ModelContentBlock, ModelMessage, ModelProvider, ModelResponse, ToolDefinition } from "./model-provider";
+import type {
+  ModelContentBlock,
+  ModelMessage,
+  ModelProvider,
+  ModelResponse,
+  ModelSystemBlock,
+  ToolDefinition
+} from "./model-provider";
 
 type MessageCreate = (
   params: Anthropic.MessageCreateParamsNonStreaming,
@@ -37,25 +44,19 @@ export class AnthropicProvider implements ModelProvider {
 
   async message(args: {
     model: string;
-    systemPrompt: string;
+    systemPrompt?: string;
+    system?: ModelSystemBlock[];
     history: ModelMessage[];
     tools: ToolDefinition[];
     maxTokens?: number;
     timeoutSeconds?: number;
   }): Promise<ModelResponse> {
     const timeout = (args.timeoutSeconds ?? 120) * 1000;
-    const cachedMessages = applyPromptCachingToMessages(args.history);
     const params: Anthropic.MessageCreateParamsNonStreaming = {
       model: args.model,
       max_tokens: args.maxTokens ?? 8192,
-      system: [
-        {
-          type: "text",
-          text: args.systemPrompt,
-          cache_control: { type: "ephemeral" }
-        }
-      ],
-      messages: cachedMessages,
+      system: toAnthropicSystem(args),
+      messages: args.history as unknown as Anthropic.MessageParam[],
       tools: args.tools.map(toAnthropicTool)
     };
 
@@ -76,17 +77,16 @@ export class AnthropicProvider implements ModelProvider {
   }
 }
 
-function applyPromptCachingToMessages(history: ModelMessage[]): Anthropic.MessageParam[] {
-  return history.map((message, messageIndex) => {
-    const content = message.content.map((block, blockIndex) => {
-      if (block.type !== "text") return block;
-      // Cache the first user text block as a stable prefix across retries.
-      if (message.role === "user" && messageIndex === 0 && blockIndex === 0) {
-        return { ...block, cache_control: { type: "ephemeral" as const } };
-      }
-      return block;
-    });
-    return { ...message, content } as unknown as Anthropic.MessageParam;
+function toAnthropicSystem(args: { systemPrompt?: string; system?: ModelSystemBlock[] }): Anthropic.TextBlockParam[] {
+  const blocks = args.system && args.system.length > 0
+    ? args.system
+    : [{ type: "text" as const, text: args.systemPrompt ?? "", cache: true }];
+  return blocks.map((block) => {
+    const out: Anthropic.TextBlockParam = { type: "text", text: block.text };
+    if (block.cache) {
+      return { ...out, cache_control: { type: "ephemeral" as const } };
+    }
+    return out;
   });
 }
 

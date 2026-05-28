@@ -11,6 +11,15 @@ export interface ToolDefinition {
   inputSchema: object;
 }
 
+export interface ModelSystemBlock {
+  type: "text";
+  text: string;
+  /** Provider adapters may map this to provider-specific prompt-cache controls. */
+  cache?: boolean;
+  name?: string;
+  stable?: boolean;
+}
+
 export interface ModelResponse {
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "pause_turn" | "refusal" | "error";
   content: ModelContentBlock[];
@@ -29,7 +38,8 @@ export interface ModelProvider {
   readonly supportedModels: string[];
   message(args: {
     model: string;
-    systemPrompt: string;
+    systemPrompt?: string;
+    system?: ModelSystemBlock[];
     history: ModelMessage[];
     tools: ToolDefinition[];
     maxTokens?: number;

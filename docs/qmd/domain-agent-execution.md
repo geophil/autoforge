@@ -159,7 +159,20 @@ Important behavior:
 - Deadline checked before each provider and tool call.
 - Timeout-like failures return `TIMEOUT`.
 - Tool failures become `tool_result` errors unless timeout-like.
+- `exec` tool results are artifact-backed: full stdout/stderr are written under ignored `.autoforge/tool-results/`, while the model receives a structured summary by default.
+- QMD MCP tool calls use a separate bounded allowance from the base agent budget, plus a per-call timeout.
+- Large QMD MCP results are artifact-backed above the configured threshold; small QMD results pass through unchanged.
+- Planner spec runs have guardrails for final reserve time, QMD call count, total tool calls, and serialized context growth.
+- Runtime failure diagnostics distinguish subtypes such as `qmd_call_timeout`, `qmd_allowance_exceeded`, `model_call_timeout`, `planner_final_reserve_exhausted`, `max_tool_iterations`, and `context_budget_exceeded`.
 - Transcript includes assistant and tool_result turns plus loaded skill attribution.
+
+## Model Routing
+
+Planner, coder, reviewer, and doc dispatches use a deterministic model router before execution. The router selects a configured tier (`cheap`, `standard`, or `strong`) from phase, task tier, failure count, description, and file-scope risk signals. V1 keeps engineering dispatches on `standard` by default and escalates to `strong` for auth/security/secrets, payments, database migrations/schema, production infrastructure, orchestrator/runtime/provider changes, and repeated failures. If a routed dispatch returns `FAILED` or `TIMEOUT`, the orchestrator retries once at the stronger tier before the existing intervention path; coder retries are skipped after file writes to avoid compounding partial mutations.
+
+Each decision emits `model_routing_decision` with selected tier/model, risk level, sensitive areas, rationale, failure count, and escalation metadata.
+
+The V2 cost-efficiency roadmap lives in `docs/qmd/model-cost-efficiency-v2.md`. V2 keeps adaptive routing behind runtime decomposition, stable prompt-prefix/cache discipline, and durable `agent_runtime_telemetry` evidence.
 
 ## Runtime Tools
 
@@ -168,6 +181,7 @@ Important behavior:
 - `read_file`
 - `write_file`
 - `exec`
+- `read_tool_artifact` (for shaped exec and QMD/MCP artifacts)
 - `done`
 - `lookup_skill` (when skill registry is provided)
 - `load_skill` (when skill registry is provided)
@@ -177,7 +191,12 @@ Important behavior:
 - `EXECUTOR_DEFAULT`: `harness | mock`
 - `ANTHROPIC_API_KEY`: required for `harness`
 - `ANTHROPIC_MODEL`: default model for harness provider calls
+- `MODEL_TIER_CHEAP` / `MODEL_TIER_STANDARD` / `MODEL_TIER_STRONG`: routed model tiers
 - `QMD_MCP_URL`: forwarded as non-secret agent environment context
+- `QMD_MCP_TOTAL_ALLOWANCE_SECONDS` / `QMD_MCP_CALL_TIMEOUT_SECONDS`: QMD MCP latency controls
+- `PLANNER_FINAL_RESERVE_SECONDS` / `PLANNER_SPEC_MAX_QMD_CALLS` / `PLANNER_SPEC_MAX_TOOL_CALLS`: planner spec guardrails
+- `MODEL_CALL_TIMEOUT_SECONDS`: optional per-provider-call timeout cap
+- `HARNESS_CONTEXT_MAX_CHARS`: serialized history growth guardrail
 
 ## Integration Points
 
@@ -450,7 +469,8 @@ When `QMD_MCP_URL` is set in `AgentTask.environment`, that agent sees QMD's MCP 
 |---|---|
 | `read_file` | Read UTF-8 content from `Workspace.readFile()` |
 | `write_file` | Write UTF-8 content through `Workspace.writeFile()` |
-| `exec` | Collect streamed `Workspace.exec()` stdout/stderr/exit status |
+| `exec` | Collect streamed `Workspace.exec()` stdout/stderr/exit status, store raw output as an internal artifact, and return a summary/excerpt/full response by requested mode |
+| `read_tool_artifact` | Read a prior exec artifact by reference; `full` mode requires a reason |
 | `done` | Write `.autoforge-status.json` with runtime status validation |
 | `lookup_skill` | Return `{ name, description }[]` from markdown skill files |
 | `load_skill` | Return full skill markdown and record `loadedSkills` attribution |

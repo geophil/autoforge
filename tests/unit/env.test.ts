@@ -22,6 +22,49 @@ describe("env defaults for planner config", () => {
     expect(env.PLANNER_MAX_ITERATIONS).toBe(5);
   });
 
+  test("model tier overrides are optional and accepted", () => {
+    const defaults = loadEnv({ NODE_ENV: "test" });
+    expect(defaults.MODEL_TIER_CHEAP).toBeUndefined();
+    const env = loadEnv({
+      NODE_ENV: "test",
+      MODEL_TIER_CHEAP: "cheap",
+      MODEL_TIER_STANDARD: "standard",
+      MODEL_TIER_STRONG: "strong"
+    });
+    expect(env.MODEL_TIER_CHEAP).toBe("cheap");
+    expect(env.MODEL_TIER_STANDARD).toBe("standard");
+    expect(env.MODEL_TIER_STRONG).toBe("strong");
+  });
+
+  test("runtime budget guardrail env values have conservative defaults and coerce overrides", () => {
+    const defaults = loadEnv({ NODE_ENV: "test" });
+    expect(defaults.QMD_MCP_TOTAL_ALLOWANCE_SECONDS).toBe(90);
+    expect(defaults.QMD_MCP_CALL_TIMEOUT_SECONDS).toBe(20);
+    expect(defaults.PLANNER_FINAL_RESERVE_SECONDS).toBe(75);
+    expect(defaults.PLANNER_SPEC_MAX_QMD_CALLS).toBe(3);
+    expect(defaults.PLANNER_SPEC_MAX_TOOL_CALLS).toBe(8);
+    expect(defaults.MODEL_CALL_TIMEOUT_SECONDS).toBeUndefined();
+    expect(defaults.HARNESS_CONTEXT_MAX_CHARS).toBe(120_000);
+
+    const env = loadEnv({
+      NODE_ENV: "test",
+      QMD_MCP_TOTAL_ALLOWANCE_SECONDS: "45",
+      QMD_MCP_CALL_TIMEOUT_SECONDS: "10",
+      PLANNER_FINAL_RESERVE_SECONDS: "30",
+      PLANNER_SPEC_MAX_QMD_CALLS: "2",
+      PLANNER_SPEC_MAX_TOOL_CALLS: "4",
+      MODEL_CALL_TIMEOUT_SECONDS: "15",
+      HARNESS_CONTEXT_MAX_CHARS: "50000"
+    });
+    expect(env.QMD_MCP_TOTAL_ALLOWANCE_SECONDS).toBe(45);
+    expect(env.QMD_MCP_CALL_TIMEOUT_SECONDS).toBe(10);
+    expect(env.PLANNER_FINAL_RESERVE_SECONDS).toBe(30);
+    expect(env.PLANNER_SPEC_MAX_QMD_CALLS).toBe(2);
+    expect(env.PLANNER_SPEC_MAX_TOOL_CALLS).toBe(4);
+    expect(env.MODEL_CALL_TIMEOUT_SECONDS).toBe(15);
+    expect(env.HARNESS_CONTEXT_MAX_CHARS).toBe(50_000);
+  });
+
   test("WORKSPACE_PROVIDER defaults to local", () => {
     const env = loadEnv({ NODE_ENV: "test" });
     expect(env.WORKSPACE_PROVIDER).toBe("local");

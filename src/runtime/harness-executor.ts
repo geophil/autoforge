@@ -6,13 +6,26 @@ import type {
   AgentTranscriptTurn,
   ToolStats
 } from "../executors/interface";
-import { buildStatusReportingPrompt, loadSkillFiles, readStatusFileFromWorkspace } from "../executors/status-convention";
-import type { ModelContentBlock, ModelMessage, ModelProvider } from "./model-provider";
+import { readStatusFileFromWorkspace } from "../executors/status-convention";
+import type { ModelContentBlock, ModelMessage, ModelProvider, ModelResponse } from "./model-provider";
 import { statsBucketForTool, ToolRegistry } from "./tool-registry";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { TelemetryLedger } from "../executors/telemetry";
 import { getModelCost } from "./pricing";
+import { isExecResult } from "./tool-output-shaping";
+import { RuntimeControls, type RuntimeControlsConfig } from "./runtime-controls";
+import {
+  isRuntimeFailureError,
+  isTimeoutLikeError,
+  RuntimeFailureError,
+  type RuntimeFailureSubtype
+} from "./runtime-failure-classifier";
+import { McpToolAdapter, type McpClient } from "./mcp-tool-adapter";
+import {
+  buildPromptEnvelopeForTask,
+  promptEnvelopeSystemBlocks,
+  renderPromptEnvelope
+} from "./prompt-envelope";
+import { guardrailToolResult, type ToolExecutionOutcome } from "./tool-execution-outcome";
 
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_TOOL_ITERATIONS = 50;
@@ -45,6 +58,8 @@ interface HarnessExecutorOptions {
   provider: ModelProvider;
   tools: ToolRegistry;
   defaultModel: string;
+  runtime?: RuntimeControlsConfig;
+  mcpClientFactory?: (url: string) => Promise<McpClient>;
 }
 
 export class HarnessExecutor implements AgentExecutor {
@@ -53,9 +68,11 @@ export class HarnessExecutor implements AgentExecutor {
   constructor(private readonly options: HarnessExecutorOptions) {}
 
   async execute(task: AgentTask): Promise<AgentResult> {
-    const start = Date.now();
-    const deadlineMs = start + task.budgetSeconds * 1000;
-    const systemPrompt = buildSystemPromptForTask(task);
+    const controls = new RuntimeControls(task, this.options.runtime);
+    const { budget, guardrails, shaper } = controls;
+    const start = budget.startedAtMs;
+    const promptEnvelope = buildPromptEnvelopeForTask(task);
+    const systemPrompt = renderPromptEnvelope(promptEnvelope);
     const history: ModelMessage[] = [{ role: "user", content: [{ type: "text", text: task.prompt }] }];
     const turns: AgentTranscriptTurn[] = [];
     const loadedSkills: string[] = [];
@@ -64,28 +81,32 @@ export class HarnessExecutor implements AgentExecutor {
     let tokenOutput = 0;
 
     const ledger = new TelemetryLedger();
-    let mcpClient: Client | null = null;
+    const mcpAdapter = new McpToolAdapter(this.options.mcpClientFactory);
     let availableTools = this.options.tools.definitions();
-    const mcpToolNames = new Set<string>();
 
     if (task.environment.QMD_MCP_URL) {
-      mcpClient = new Client({ name: "autoforge-agent", version: "0.1.0" }, { capabilities: {} });
-      try {
-        const transport = new StreamableHTTPClientTransport(new URL(task.environment.QMD_MCP_URL));
-        await mcpClient.connect(transport);
-        const { tools: mcpTools } = await mcpClient.listTools();
-        const mcpDefs = mcpTools.map(t => ({
-          name: t.name,
-          description: t.description ?? "",
-          inputSchema: t.inputSchema
-        }));
-        for (const t of mcpDefs) mcpToolNames.add(t.name);
-        availableTools = [...availableTools, ...mcpDefs];
-      } catch (err) {
-        console.warn(`[harness] Failed to connect to QMD_MCP_URL: ${err}`);
-        try { await mcpClient.close(); } catch {}
-        mcpClient = null;
+      const setupTimeout = budget.timeoutForQmdCall();
+      const setup = await mcpAdapter.setup(task.environment.QMD_MCP_URL, setupTimeout);
+      budget.observeQmdElapsed(setup.elapsedMs);
+      if (setup.status === "error") {
+        console.warn(`[harness] Failed to connect to QMD_MCP_URL: ${setup.message}`);
       }
+      availableTools = [...availableTools, ...setup.toolDefinitions];
+      const setupBytes = Buffer.byteLength(setup.message, "utf8");
+      ledger.recordToolCall({
+        toolName: "qmd_setup",
+        status: setup.status,
+        latencyMs: setup.elapsedMs,
+        rawOutputBytes: setupBytes,
+        truncatedOutputBytes: setupBytes,
+        returnedToModelBytes: 0,
+        qmdElapsedMs: setup.elapsedMs,
+        qmdAllowanceUsedMs: budget.qmdAllowanceUsedMs(),
+        qmdAllowanceRemainingMs: budget.qmdAllowanceRemainingMs(),
+        historyChars: serializedHistoryChars(history),
+        transcriptChars: 0,
+        failureSubtype: setup.failureSubtype
+      });
     }
 
     const transcript = (): AgentTranscript => ({
@@ -94,29 +115,65 @@ export class HarnessExecutor implements AgentExecutor {
       turns: loadedSkills.length > 0
         ? [...turns, { kind: "loaded_skills", skills: [...loadedSkills] }]
         : turns,
+      promptEnvelope: {
+        stablePrefixVersion: promptEnvelope.stablePrefixVersion,
+        stablePrefixHash: promptEnvelope.stablePrefixHash
+      },
       ...(loadedSkills.length > 0 ? { loadedSkills: [...loadedSkills] } : {})
     });
 
     try {
       for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-        const remainingMs = deadlineMs - Date.now();
-        if (remainingMs <= 0) {
+        if (budget.isBaseExpired()) {
           return timeoutResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger);
         }
 
+        const historyChars = serializedHistoryChars(history);
+        const contextBlock = guardrails.checkContextSize(historyChars);
+        if (contextBlock && !contextBlock.shouldContinue) {
+          return failedResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger, contextBlock.message, contextBlock.failureSubtype);
+        }
+
         const modelStart = Date.now();
-        const response = await this.options.provider.message({
-          model: task.model ?? this.options.defaultModel,
-          systemPrompt,
-          history: snapshotHistory(history),
-          tools: availableTools,
-          maxTokens: DEFAULT_MAX_TOKENS,
-          timeoutSeconds: remainingMs / 1000
-        });
+        const modelTimeout = budget.timeoutForModelCall();
+        let response: ModelResponse;
+        try {
+          response = await this.options.provider.message({
+            model: task.model ?? this.options.defaultModel,
+            systemPrompt,
+            system: promptEnvelopeSystemBlocks(promptEnvelope),
+            history: snapshotHistory(history),
+            tools: availableTools,
+            maxTokens: DEFAULT_MAX_TOKENS,
+            timeoutSeconds: modelTimeout.timeoutSeconds
+          });
+        } catch (error) {
+          if (isTimeoutLikeError(error)) {
+            ledger.recordModelCall({
+              provider: this.options.provider.name,
+              model: task.model ?? this.options.defaultModel,
+              agentType: task.type,
+              tokens: { input: 0, output: 0, cached: 0 },
+              latencyMs: Date.now() - modelStart,
+              timestamp: modelStart,
+              retryAttempt: 0,
+              estimatedCost: 0,
+              stablePrefixVersion: promptEnvelope.stablePrefixVersion,
+              stablePrefixHash: promptEnvelope.stablePrefixHash,
+              modelCallTimeoutSeconds: modelTimeout.timeoutSeconds,
+              historyChars,
+              transcriptChars: transcriptChars(transcript()),
+              failureSubtype: "model_call_timeout"
+            });
+            throw new RuntimeFailureError("model_call_timeout", error instanceof Error ? error.message : String(error));
+          }
+          throw error;
+        }
         const modelEnd = Date.now();
 
         const cost = getModelCost(this.options.provider.name, task.model ?? this.options.defaultModel);
         const cachedTokens = response.usage.cached ?? 0;
+        const cacheCreationTokens = response.usage.cacheCreation ?? 0;
         const billableInputTokens = Math.max(response.usage.input - cachedTokens, 0);
         ledger.recordModelCall({
           provider: this.options.provider.name,
@@ -125,7 +182,8 @@ export class HarnessExecutor implements AgentExecutor {
           tokens: {
             input: response.usage.input,
             output: response.usage.output,
-            cached: cachedTokens
+            cached: cachedTokens,
+            cacheCreation: cacheCreationTokens
           },
           latencyMs: modelEnd - modelStart,
           timestamp: modelStart,
@@ -134,7 +192,12 @@ export class HarnessExecutor implements AgentExecutor {
             (billableInputTokens * cost.input) +
             (cachedTokens * cost.cached) +
             (response.usage.output * cost.output)
-          ) / 1_000_000
+          ) / 1_000_000,
+          stablePrefixVersion: promptEnvelope.stablePrefixVersion,
+          stablePrefixHash: promptEnvelope.stablePrefixHash,
+          modelCallTimeoutSeconds: modelTimeout.timeoutSeconds,
+          historyChars,
+          transcriptChars: transcriptChars(transcript())
         });
 
         tokenInput += response.usage.input;
@@ -151,58 +214,113 @@ export class HarnessExecutor implements AgentExecutor {
             let result: unknown;
             const toolStart = Date.now();
             let toolStatus: "success" | "error" = "success";
+            let outcome: ToolExecutionOutcome;
             try {
-              const toolRemainingMs = deadlineMs - Date.now();
-              if (toolRemainingMs <= 0) {
-                const error = new Error("Task budget exhausted before tool execution");
-                error.name = "AbortError";
-                throw error;
-              }
-
-              if (mcpClient && mcpToolNames.has(toolUse.name)) {
-                const mcpResult = await mcpClient.callTool(
-                  { name: toolUse.name, arguments: toolUse.input as Record<string, unknown> },
-                  undefined,
-                  { timeout: toolRemainingMs }
-                );
-                const contentArray = (mcpResult.content || []) as any[];
-                const extractText = (c: any) => {
-                  if (c.type === "text") return c.text ?? "";
-                  if (c.type === "resource" && c.resource) return c.resource.text ?? "";
-                  return JSON.stringify(c);
+              const isQmdTool = mcpAdapter.hasTool(toolUse.name);
+              const guardBlock = guardrails.beforeTool({ toolName: toolUse.name, isQmd: isQmdTool, budget });
+              if (guardBlock) {
+                outcome = {
+                  source: "guardrail",
+                  status: "error",
+                  result: guardrailToolResult(guardBlock.message, guardBlock.failureSubtype),
+                  isQmdTool,
+                  failureSubtype: guardBlock.failureSubtype
                 };
-                if (mcpResult.isError) {
-                  toolStatus = "error";
-                  result = new Error(contentArray.map(extractText).join("\n"));
-                } else {
-                  result = contentArray.map(extractText).join("\n");
-                }
+              } else if (isQmdTool) {
+                guardrails.recordTool({ isQmd: true });
+                const qmdTimeout = budget.timeoutForQmdCall();
+                const call = await mcpAdapter.callTool(toolUse.name, toolUse.input as Record<string, unknown>, qmdTimeout);
+                budget.observeQmdElapsed(call.elapsedMs);
+                outcome = {
+                  source: "qmd",
+                  status: call.status,
+                  result: call.failureSubtype === "qmd_allowance_exceeded"
+                    ? guardrailToolResult(call.text, call.failureSubtype)
+                    : call.text,
+                  isQmdTool: true,
+                  qmdElapsedMs: call.elapsedMs,
+                  qmdAllowanceUsedMs: budget.qmdAllowanceUsedMs(),
+                  qmdAllowanceRemainingMs: budget.qmdAllowanceRemainingMs(),
+                  failureSubtype: call.failureSubtype
+                };
               } else {
+                guardrails.recordTool({ isQmd: false });
+                const localTimeout = budget.timeoutForLocalTool();
+                if (localTimeout.timeoutMs <= 0) {
+                  const error = new Error("Task budget exhausted before tool execution");
+                  error.name = "AbortError";
+                  throw error;
+                }
                 tool = this.options.tools.get(toolUse.name);
                 result = await tool.execute(toolUse.input, task.workspace, {
                   environment: task.environment,
-                  deadlineMs,
-                  timeoutSeconds: toolRemainingMs / 1000,
+                  deadlineMs: Date.now() + localTimeout.timeoutMs,
+                  timeoutSeconds: localTimeout.timeoutSeconds,
                   recordLoadedSkill: (name) => {
                     if (!loadedSkills.includes(name)) loadedSkills.push(name);
                   }
                 });
-                if (result instanceof Error) toolStatus = "error";
+                outcome = {
+                  source: "local",
+                  status: result instanceof Error ? "error" : "success",
+                  result,
+                  isQmdTool: false
+                };
               }
             } catch (error) {
               if (isTimeoutError(error)) throw error;
-              toolStatus = "error";
-              result = error instanceof Error ? error : new Error(String(error));
+              outcome = {
+                source: "error",
+                status: "error",
+                result: error instanceof Error ? error : new Error(String(error)),
+                isQmdTool: false
+              };
             } finally {
               if (tool) recordToolStat(toolStats, statsBucketForTool(tool));
             }
-            const serialized = serializeToolResultDetailed(result);
+            toolStatus = outcome.status;
+            result = outcome.result;
+            const shaped = toolUse.name === "exec" && isExecResult(result)
+              ? await shaper.shapeExecResult({
+                workspace: task.workspace,
+                toolUseId: toolUse.id,
+                input: toolUse.input,
+                result
+              })
+              : outcome.isQmdTool && typeof result === "string"
+                ? await shaper.shapeMcpResult({
+                  workspace: task.workspace,
+                  toolUseId: toolUse.id,
+                  toolName: toolUse.name,
+                  input: toolUse.input,
+                  text: result,
+                  isError: toolStatus === "error"
+                })
+              : null;
+            const serialized = shaped
+              ? { raw: shaped.content, bounded: shaped.content }
+              : serializeToolResultDetailed(result);
+            const currentHistoryChars = serializedHistoryChars(history);
+            const currentTranscriptChars = transcriptChars(transcript());
             ledger.recordToolCall({
               toolName: toolUse.name,
               status: toolStatus,
               latencyMs: Date.now() - toolStart,
-              rawOutputBytes: Buffer.byteLength(serialized.raw, "utf8"),
-              truncatedOutputBytes: Buffer.byteLength(serialized.bounded, "utf8")
+              rawOutputBytes: shaped?.rawOutputBytes ?? Buffer.byteLength(serialized.raw, "utf8"),
+              truncatedOutputBytes: Buffer.byteLength(serialized.bounded, "utf8"),
+              artifactBytes: shaped?.artifactBytes,
+              summaryBytes: shaped?.summaryBytes,
+              returnedToModelBytes: shaped?.returnedToModelBytes ?? Buffer.byteLength(serialized.bounded, "utf8"),
+              outputMode: shaped?.outputMode,
+              parser: shaped?.parser,
+              artifactReference: shaped?.artifactReference,
+              fullOutputReason: shaped?.fullOutputReason,
+              qmdElapsedMs: outcome.qmdElapsedMs,
+              qmdAllowanceUsedMs: outcome.qmdAllowanceUsedMs,
+              qmdAllowanceRemainingMs: outcome.qmdAllowanceRemainingMs,
+              historyChars: currentHistoryChars,
+              transcriptChars: currentTranscriptChars,
+              failureSubtype: outcome.failureSubtype
             });
             toolResults.push({
               type: "tool_result",
@@ -216,6 +334,10 @@ export class HarnessExecutor implements AgentExecutor {
             });
           }
           history.push({ role: "user", content: toolResults });
+          const contextBlock = guardrails.checkContextSize(serializedHistoryChars(history));
+          if (contextBlock && !contextBlock.shouldContinue) {
+            return failedResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger, contextBlock.message, contextBlock.failureSubtype);
+          }
           continue;
         }
 
@@ -233,6 +355,7 @@ export class HarnessExecutor implements AgentExecutor {
         status: "FAILED",
         artifacts: [],
         blockReason: `Exceeded maximum harness iterations (${MAX_TOOL_ITERATIONS})`,
+        diagnostics: { failureSubtype: "max_tool_iterations" },
         metrics: {
           ...elapsedMetrics(start, tokenInput, tokenOutput, toolStats),
           telemetry: telemetryMetrics(ledger)
@@ -240,6 +363,9 @@ export class HarnessExecutor implements AgentExecutor {
         transcript: transcript()
       };
     } catch (error) {
+      if (isRuntimeFailureError(error)) {
+        return timeoutResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger, error.failureSubtype);
+      }
       if (isTimeoutError(error)) {
         return timeoutResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger);
       }
@@ -262,25 +388,18 @@ export class HarnessExecutor implements AgentExecutor {
         transcript: transcript()
       };
     } finally {
-      if (mcpClient) {
-        try { await mcpClient.close(); } catch {}
-      }
+      try { await mcpAdapter.close(); } catch {}
     }
   }
 
   async healthCheck(): Promise<boolean> {
     return true;
   }
+
 }
 
 export function buildSystemPromptForTask(task: Pick<AgentTask, "systemPrompt" | "lessons" | "skillFiles" | "budgetSeconds">): string {
-  const sections: string[] = [];
-  if (task.systemPrompt) sections.push(task.systemPrompt);
-  if (task.lessons && task.lessons.trim().length > 0) sections.push(task.lessons.trim());
-  const skillContents = loadSkillFiles(task.skillFiles);
-  if (skillContents) sections.push(`# Skills\n\n${skillContents}`);
-  sections.push(buildStatusReportingPrompt(task.budgetSeconds));
-  return sections.join("\n\n");
+  return renderPromptEnvelope(buildPromptEnvelopeForTask(task));
 }
 
 function toolUsesIn(content: ModelContentBlock[]): Array<{ id: string; name: string; input: Record<string, unknown> }> {
@@ -402,12 +521,42 @@ function timeoutResult(
   tokenOutput: number,
   toolStats: ToolStats,
   transcript: AgentTranscript,
-  ledger: TelemetryLedger
+  ledger: TelemetryLedger,
+  failureSubtype?: RuntimeFailureSubtype
 ): AgentResult {
   flushTelemetry(workspace, ledger).catch(() => {});
   return {
     status: "TIMEOUT",
     artifacts: [],
+    diagnostics: failureSubtype ? { failureSubtype } : undefined,
+    metrics: {
+      elapsedSeconds: (Date.now() - start) / 1000,
+      tokenInput,
+      tokenOutput,
+      toolStats,
+      telemetry: telemetryMetrics(ledger)
+    },
+    transcript
+  };
+}
+
+function failedResult(
+  workspace: import("./workspace").Workspace,
+  start: number,
+  tokenInput: number,
+  tokenOutput: number,
+  toolStats: ToolStats,
+  transcript: AgentTranscript,
+  ledger: TelemetryLedger,
+  blockReason: string,
+  failureSubtype: RuntimeFailureSubtype
+): AgentResult {
+  flushTelemetry(workspace, ledger).catch(() => {});
+  return {
+    status: "FAILED",
+    artifacts: [],
+    blockReason,
+    diagnostics: { failureSubtype },
     metrics: {
       elapsedSeconds: (Date.now() - start) / 1000,
       tokenInput,
@@ -443,15 +592,16 @@ function recordToolStat(stats: ToolStats, bucket: ReturnType<typeof statsBucketF
 }
 
 function isTimeoutError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message.toLowerCase();
-  if (message.includes("must be an integer")) return false;
-  return (
-    error.name === "AbortError" ||
-    message.includes("timeout") ||
-    message.includes("timed out") ||
-    message.includes("aborted")
-  );
+  if (isRuntimeFailureError(error)) return true;
+  return isTimeoutLikeError(error);
+}
+
+function serializedHistoryChars(history: ModelMessage[]): number {
+  return JSON.stringify(history).length;
+}
+
+function transcriptChars(transcript: AgentTranscript): number {
+  return JSON.stringify(transcript.turns).length;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -465,5 +615,6 @@ async function flushTelemetry(workspace: import("./workspace").Workspace, ledger
     ...summary,
     events
   };
-  await workspace.writeFile(".autoforge-telemetry.json", JSON.stringify(payload, null, 2));
+  await workspace.writeFile(".autoforge/.gitignore", "*\n");
+  await workspace.writeFile(".autoforge/telemetry.json", JSON.stringify(payload, null, 2));
 }

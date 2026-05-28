@@ -9,6 +9,7 @@ export interface BuildPlannerDispatchEnvelopeInput {
   model: string;
   systemPrompt: string;
   userPrompt: string;
+  phase?: string;
   steeringPrompt?: string;
   lessons?: string;
   budgetSeconds: number;
@@ -28,7 +29,7 @@ export function buildPlannerDispatchEnvelope(input: BuildPlannerDispatchEnvelope
     budgetSeconds: input.budgetSeconds,
     environment: input.environment,
     skillFiles: input.skillFiles,
-    metadata: { description: input.description, tier: input.tier, attempt: input.attempt },
+    metadata: { description: input.description, tier: input.tier, attempt: input.attempt, phase: input.phase },
     model: input.model,
     lessons: input.lessons
   });

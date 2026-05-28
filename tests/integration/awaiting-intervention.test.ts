@@ -467,7 +467,7 @@ describe("retryFromIntervention", () => {
     const { service, db } = createTestService({
       planner: async (task) => {
         plannerCalls += 1;
-        if (plannerCalls === 1) {
+        if (plannerCalls <= 2) {
           return {
             status: "FAILED",
             artifacts: [],
@@ -525,13 +525,13 @@ describe("retryFromIntervention", () => {
 
     expect(retried.state).toBe("awaiting_spec_approval");
     expect(retried.specArtifacts?.spec.problem.length).toBeGreaterThan(0);
-    expect(plannerCalls).toBe(2);
+    expect(plannerCalls).toBe(3);
 
     const afterExec = await service.approveSpec(retried.id);
     expect(afterExec.state).toBe("awaiting_plan_approval");
     expect(afterExec.planSubtasks).toHaveLength(1);
     expect(afterExec.planSubtasks[0].description).toBe("Do the thing");
-    expect(plannerCalls).toBe(3);
+    expect(plannerCalls).toBe(4);
 
     const events = db.listEvents(paused.id);
     expect(events.some((e) => e.type === "retry_requested")).toBe(true);
@@ -542,7 +542,7 @@ describe("retryFromIntervention", () => {
     const { service, db } = createTestService({
       planner: async (task) => {
         plannerCalls += 1;
-        if (plannerCalls === 1) {
+        if (plannerCalls <= 2) {
           return {
             status: "FAILED",
             artifacts: [],
@@ -607,7 +607,7 @@ describe("retryFromIntervention", () => {
       operatorNote: "reset to task start"
     });
     expect(retried.state).toBe("awaiting_spec_approval");
-    expect(plannerCalls).toBe(2);
+    expect(plannerCalls).toBe(3);
 
     const rollback = db.listEvents(paused.id).find((event) => event.type === "rollback_applied");
     expect(rollback).toBeDefined();
@@ -656,7 +656,7 @@ describe("retryFromIntervention", () => {
     const { service, db } = createTestService({
       planner: async () => {
         plannerCalls += 1;
-        if (plannerCalls === 1) {
+        if (plannerCalls <= 2) {
           return {
             status: "FAILED",
             artifacts: [],
@@ -698,7 +698,7 @@ describe("retryFromIntervention", () => {
     const { service } = createTestService({
       coder: async () => {
         coderCalls += 1;
-        if (coderCalls === 1) {
+        if (coderCalls <= 2) {
           return {
             status: "TIMEOUT",
             artifacts: [],
@@ -720,7 +720,7 @@ describe("retryFromIntervention", () => {
     // EXPRESS tier skips reviewer, so a successful coder retry runs through
     // to awaiting_approval.
     expect(retried.state).toBe("awaiting_approval");
-    expect(coderCalls).toBe(2);
+    expect(coderCalls).toBe(3);
   });
 
   test("retry from executing resumes from failed subtask when feature flag is enabled", async () => {
@@ -755,7 +755,7 @@ describe("retryFromIntervention", () => {
         coder: async (task) => {
           const subtaskId = String((task.metadata?.subtask as { id?: string } | undefined)?.id ?? "unknown");
           coderCalls.push(subtaskId);
-          if (coderCalls.length === 2) {
+          if (coderCalls.length === 2 || coderCalls.length === 3) {
             return {
               status: "FAILED",
               artifacts: [],
@@ -775,11 +775,11 @@ describe("retryFromIntervention", () => {
 
     const paused = await service.submitTask("autoforge", "tiny coder task", { forceTier: "EXPRESS", reviewPlan: false });
     expect(paused.state).toBe("awaiting_intervention");
-    expect(coderCalls).toEqual(["sub-1", "sub-2"]);
+    expect(coderCalls).toEqual(["sub-1", "sub-2", "sub-2"]);
 
     const retried = await service.retryFromIntervention(paused.id, { fromStage: "executing" });
     expect(retried.state).toBe("awaiting_approval");
-    expect(coderCalls).toEqual(["sub-1", "sub-2", "sub-2"]);
+    expect(coderCalls).toEqual(["sub-1", "sub-2", "sub-2", "sub-2"]);
   });
 
   test("retry from executing can force full replay even when resume mode is enabled", async () => {
@@ -814,7 +814,7 @@ describe("retryFromIntervention", () => {
         coder: async (task) => {
           const subtaskId = String((task.metadata?.subtask as { id?: string } | undefined)?.id ?? "unknown");
           coderCalls.push(subtaskId);
-          if (coderCalls.length === 2) {
+          if (coderCalls.length === 2 || coderCalls.length === 3) {
             return {
               status: "FAILED",
               artifacts: [],
@@ -840,7 +840,7 @@ describe("retryFromIntervention", () => {
       forceFullReplay: true
     });
     expect(retried.state).toBe("awaiting_approval");
-    expect(coderCalls).toEqual(["sub-1", "sub-2", "sub-1", "sub-2"]);
+    expect(coderCalls).toEqual(["sub-1", "sub-2", "sub-2", "sub-1", "sub-2"]);
   });
 
   test("retry from planning that fails again pauses correctly (state-machine valid)", async () => {
@@ -862,12 +862,12 @@ describe("retryFromIntervention", () => {
 
     const second = await service.retryFromIntervention(first.id, { fromStage: "planning" });
     expect(second.state).toBe("awaiting_intervention");
-    expect(plannerCalls).toBe(2);
+    expect(plannerCalls).toBe(4);
 
     const events = db.listEvents(first.id);
     const failures = events.filter((e) => e.type === "failure_analysis");
     expect(failures).toHaveLength(2);
-    expect(failures[1].payload.failure_reason).toBe("planner failure #2");
+    expect(failures[1].payload.failure_reason).toBe("planner failure #4");
   });
 
   test("retry on a non-paused task throws", async () => {

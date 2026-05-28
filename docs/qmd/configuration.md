@@ -84,6 +84,66 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 - **Default**: `"claude-sonnet-4-6"`
 - **Affects**: `domain-agent-execution.md` / `HarnessExecutor` — default model ID for harness provider calls.
 
+### `MODEL_TIER_CHEAP`
+
+- **Type**: string (optional)
+- **Default**: `PLANNER_MODEL_EXPRESS`
+- **Affects**: `domain-agent-execution.md` / model routing — model ID used for bounded non-mutating work such as summaries and diagnostics.
+
+### `MODEL_TIER_STANDARD`
+
+- **Type**: string (optional)
+- **Default**: `ANTHROPIC_MODEL`
+- **Affects**: `domain-agent-execution.md` / model routing — model ID used for normal planner/coder/reviewer/doc dispatches.
+
+### `MODEL_TIER_STRONG`
+
+- **Type**: string (optional)
+- **Default**: `PLANNER_MODEL_COMPLEX`
+- **Affects**: `domain-agent-execution.md` / model routing — model ID used for sensitive areas, repeated failures, and one-step capability escalation.
+
+### `QMD_MCP_TOTAL_ALLOWANCE_SECONDS`
+
+- **Type**: positive integer seconds
+- **Default**: `90`
+- **Affects**: `domain-agent-execution.md` / harness runtime — extra bounded allowance for QMD MCP tool latency so retrieval does not consume the base agent budget.
+
+### `QMD_MCP_CALL_TIMEOUT_SECONDS`
+
+- **Type**: positive integer seconds
+- **Default**: `20`
+- **Affects**: `domain-agent-execution.md` / harness runtime — maximum timeout passed to each QMD MCP tool call.
+
+### `PLANNER_FINAL_RESERVE_SECONDS`
+
+- **Type**: positive integer seconds
+- **Default**: `75`
+- **Affects**: `domain-agent-execution.md` / planner guardrails — reserve window where planner spec runs stop exploration and write the best available status.
+
+### `PLANNER_SPEC_MAX_QMD_CALLS`
+
+- **Type**: positive integer
+- **Default**: `3`
+- **Affects**: `domain-agent-execution.md` / planner guardrails — maximum QMD calls allowed during a spec-phase planner run before the model is instructed to stop exploration.
+
+### `PLANNER_SPEC_MAX_TOOL_CALLS`
+
+- **Type**: positive integer
+- **Default**: `8`
+- **Affects**: `domain-agent-execution.md` / planner guardrails — maximum total tool calls allowed during a spec-phase planner run before the model is instructed to stop exploration.
+
+### `MODEL_CALL_TIMEOUT_SECONDS`
+
+- **Type**: positive integer seconds (optional)
+- **Default**: unset
+- **Affects**: `domain-agent-execution.md` / harness runtime — optional per-model-call timeout cap, applied as `min(remaining base budget, configured cap)`.
+
+### `HARNESS_CONTEXT_MAX_CHARS`
+
+- **Type**: positive integer
+- **Default**: `120000`
+- **Affects**: `domain-agent-execution.md` / harness runtime — serialized history guardrail used to fail early with context diagnostics instead of continuing into expensive context growth.
+
 ### `OPENAI_API_KEY`
 
 - **Type**: string (optional)
