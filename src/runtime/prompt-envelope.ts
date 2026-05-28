@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import type { AgentTask } from "../executors/interface";
-import { buildStatusReportingPrompt, loadSkillFiles } from "../executors/status-convention";
+import {
+  buildRuntimeBudgetPrompt,
+  buildStatusReportingContractPrompt,
+  loadSkillFiles
+} from "../executors/status-convention";
 import type { ModelSystemBlock } from "./model-provider";
 
-export const STABLE_PREFIX_VERSION = "prompt-prefix-v1";
+export const STABLE_PREFIX_VERSION = "prompt-prefix-v2";
 
 export interface PromptEnvelopeSection {
   name: string;
@@ -25,29 +29,27 @@ export function buildPromptEnvelopeForTask(
 ): PromptEnvelope {
   const stableSections: PromptEnvelopeSection[] = [];
   if (task.systemPrompt.trim().length > 0) {
-    stableSections.push(section("persona", task.systemPrompt, true));
+    stableSections.push(stableSection("persona", task.systemPrompt));
   }
   const skillContents = loadSkillFiles(task.skillFiles);
   if (skillContents) {
-    stableSections.push(section("skills", `# Skills\n\n${skillContents}`, true));
+    stableSections.push(stableSection("skills", `# Skills\n\n${skillContents}`));
   }
-  stableSections.push(section("status_contract", buildStatusReportingPrompt(task.budgetSeconds), true));
+  stableSections.push(stableSection("status_contract", buildStatusReportingContractPrompt()));
 
   const dynamicSections: PromptEnvelopeSection[] = [];
+  dynamicSections.push(dynamicSection("runtime_budget", buildRuntimeBudgetPrompt(task.budgetSeconds)));
   if (task.lessons && task.lessons.trim().length > 0) {
-    dynamicSections.push(section("lessons", task.lessons.trim(), false));
+    dynamicSections.push(dynamicSection("lessons", task.lessons.trim()));
   }
 
-  const stablePrefix = stableSections.map((s) => s.text).join("\n\n");
-  const dynamicContext = dynamicSections.map((s) => s.text).join("\n\n");
+  const stablePrefix = joinSectionText(stableSections);
+  const dynamicContext = joinSectionText(dynamicSections);
   return {
     stablePrefix,
     dynamicContext,
     stablePrefixVersion: STABLE_PREFIX_VERSION,
-    stablePrefixHash: hashStablePrefix({
-      version: STABLE_PREFIX_VERSION,
-      sections: stableSections.map(({ name, text }) => ({ name, text }))
-    }),
+    stablePrefixHash: hashStablePrefix(STABLE_PREFIX_VERSION, stableSections),
     sections: [...stableSections, ...dynamicSections]
   };
 }
@@ -66,10 +68,25 @@ export function promptEnvelopeSystemBlocks(envelope: PromptEnvelope): ModelSyste
   }));
 }
 
+function stableSection(name: string, text: string): PromptEnvelopeSection {
+  return section(name, text, true);
+}
+
+function dynamicSection(name: string, text: string): PromptEnvelopeSection {
+  return section(name, text, false);
+}
+
 function section(name: string, text: string, stable: boolean): PromptEnvelopeSection {
   return { name, text: text.trim(), stable, cache: stable };
 }
 
-function hashStablePrefix(input: { version: string; sections: Array<{ name: string; text: string }> }): string {
-  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+function joinSectionText(sections: PromptEnvelopeSection[]): string {
+  return sections.map((s) => s.text).join("\n\n");
+}
+
+function hashStablePrefix(version: string, sections: PromptEnvelopeSection[]): string {
+  return createHash("sha256").update(JSON.stringify({
+    version,
+    sections: sections.map(({ name, text }) => ({ name, text }))
+  })).digest("hex");
 }

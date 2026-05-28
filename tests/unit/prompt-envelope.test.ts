@@ -27,6 +27,23 @@ describe("PromptEnvelope", () => {
     expect(renderPromptEnvelope(changedDynamic)).toContain("Different task-derived lesson");
   });
 
+  test("keeps runtime budget out of the stable prefix", () => {
+    const base = buildPromptEnvelopeForTask({
+      systemPrompt: "You are coder.",
+      skillFiles: [],
+      budgetSeconds: 60
+    });
+    const changedBudget = buildPromptEnvelopeForTask({
+      systemPrompt: "You are coder.",
+      skillFiles: [],
+      budgetSeconds: 300
+    });
+
+    expect(changedBudget.stablePrefixHash).toBe(base.stablePrefixHash);
+    expect(changedBudget.stablePrefix).not.toContain("300 seconds");
+    expect(changedBudget.dynamicContext).toContain("300 seconds");
+  });
+
   test("changes stable-prefix hash when stable instructions change", () => {
     const base = buildPromptEnvelopeForTask({
       systemPrompt: "You are coder.",
@@ -56,10 +73,13 @@ describe("PromptEnvelope", () => {
 
     expect(rendered.indexOf("Persona")).toBeLessThan(rendered.indexOf("Dynamic lesson"));
     expect(rendered.indexOf("# Skills")).toBeLessThan(rendered.indexOf("Dynamic lesson"));
+    expect(rendered.indexOf("# Status Reporting")).toBeLessThan(rendered.indexOf("# Runtime Budget"));
+    expect(rendered.indexOf("# Runtime Budget")).toBeLessThan(rendered.indexOf("Dynamic lesson"));
     expect(promptEnvelopeSystemBlocks(envelope)).toEqual([
       expect.objectContaining({ text: "Persona", cache: true, stable: true }),
       expect.objectContaining({ text: "# Skills\n\nStable skill content", cache: true, stable: true }),
       expect.objectContaining({ cache: true, stable: true, name: "status_contract" }),
+      expect.objectContaining({ cache: false, stable: false, name: "runtime_budget" }),
       expect.objectContaining({ text: "Dynamic lesson", cache: false, stable: false })
     ]);
   });

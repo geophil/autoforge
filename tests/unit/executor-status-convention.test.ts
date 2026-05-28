@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   STATUS_FILE,
+  buildRuntimeBudgetPrompt,
+  buildStatusReportingContractPrompt,
   buildStatusReportingPrompt,
   loadSkillFiles,
   readStatusFile
@@ -44,5 +46,14 @@ describe("executor status convention helpers", () => {
     expect(prompt).toContain("\"DONE_WITH_CONCERNS\"");
     expect(prompt).toContain("\"BLOCKED\"");
     expect(prompt).toContain("\"NEEDS_CONTEXT\"");
+  });
+
+  test("status contract is stable while runtime budget is dynamic", () => {
+    const contract = buildStatusReportingContractPrompt();
+    const budget = buildRuntimeBudgetPrompt(123);
+
+    expect(contract).toContain(STATUS_FILE);
+    expect(contract).not.toContain("123 seconds");
+    expect(budget).toContain("123 seconds");
   });
 });
