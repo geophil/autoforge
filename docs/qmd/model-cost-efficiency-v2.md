@@ -1,44 +1,116 @@
 # Model Cost Efficiency V2
 
-## Summary
+## Purpose
 
-V2 makes cost optimization evidence-driven. The first foundation is composable runtime structure, stable prompt-prefix/cache discipline, and durable telemetry. Adaptive routing and cost policy come later, after repeated dispatches produce queryable runtime evidence.
+Model Cost Efficiency V2 makes agent cost optimization measurable before it makes routing more aggressive. The foundation is composable runtime structure, stable prompt-prefix/cache discipline, durable runtime telemetry, and queryable KPI helpers. Adaptive routing, semantic retrieval, summarization policy, dashboards, and cost caps remain later work until the foundation produces reliable evidence.
 
-## Completed Foundation From V1/V1.5
+This is the canonical roadmap. The PR-sized implementation plan lives in `docs/superpowers/plans/Cost optimization V2 PLAN.md`.
 
-- Deterministic model routing tiers exist for planner, coder, reviewer, and doc dispatches.
-- The harness records model/tool telemetry in `.autoforge/telemetry.json`.
-- Tool output shaping stores large exec and QMD outputs as internal artifacts and returns bounded summaries to the model.
-- Context-envelope hashes support reuse analytics for full dispatch prompts.
+## Foundation Principles
 
-## V2 Roadmap
+- Preserve task behavior while changing runtime internals.
+- Keep `HarnessExecutor` as the coordinator and move focused runtime behavior into composable components.
+- Treat prompt caching as an adapter-level optimization. Cache misses must not affect correctness.
+- Put long-lived prompt material before dynamic task context, and version/hash only the stable prefix.
+- Keep raw model/tool telemetry in `.autoforge/telemetry.json`; store compact dispatch summaries in durable events.
+- Use existing JSON event payload storage unless query needs prove a schema migration is worth the cost.
 
-1. Runtime component extraction
-   - Keep `HarnessExecutor` as the loop coordinator.
-   - Move runtime controls, MCP/QMD behavior, tool outcomes, prompt envelopes, and telemetry summaries into focused components.
+## Implemented Foundation
 
-2. Stable prompt-prefix/cache discipline
-   - Build prompts from stable sections followed by dynamic sections.
-   - Hash and version only the stable prefix.
-   - Apply provider cache controls only in adapters and only to stable blocks.
-   - Never cache volatile task/user text by default.
+### Runtime Composition
 
-3. Durable runtime telemetry
-   - Emit `agent_runtime_telemetry` after live planner/coder/reviewer/doc dispatches.
-   - Store compact summaries in event payload JSON.
-   - Keep raw model/tool event arrays in `.autoforge/telemetry.json`.
+The harness runtime now uses focused components:
 
-4. Reporting and KPI helpers
-   - Query repeated stable-prefix hashes, cache hit ratio, cached-token savings, max history chars, and tool-output contribution.
-   - Add dashboard/API surfaces only when the compact payloads prove useful.
+- `RuntimeControls` composes `RunBudget`, `AgentRunGuardrails`, `ToolResultShaper`, and runtime config.
+- `McpToolAdapter` owns QMD/MCP setup, tool listing, call timeout handling, result text extraction, allowance accounting inputs, and close safety.
+- `ToolExecutionOutcome` normalizes local tools, QMD tools, guardrail blocks, unknown tools, recoverable errors, and timeout-like failures.
+- `PromptEnvelope` separates stable prefix sections from dynamic context.
 
-5. Adaptive routing and cost policy
-   - Use durable evidence to decide when cheaper, stronger, or specialized models should be selected.
-   - Defer semantic retrieval, summarization policy, per-project cost caps, and automated policy changes until the foundation metrics are reliable.
+The executor loop remains responsible for orchestration: provider calls, tool turns, status finalization, telemetry writing, and timeout handling.
+
+### Stable Prompt Prefixes
+
+`PromptEnvelope` renders stable sections before dynamic sections and records:
+
+- `stablePrefixVersion`
+- `stablePrefixHash`
+- stable sections with cache hints for providers that support them
+
+Stable sections include persona content, stable skill files, harness/tool protocol, safety rules, and status/output contract. Dynamic sections include task text, steering, retrieved content, lessons, compact state, tool results, errors, diffs, timestamps, run IDs, workspace IDs, and other volatile task context.
+
+Provider adapters receive structured prompt sections and cache hints. Anthropic applies cache controls only to stable system blocks; non-cache providers ignore hints without changing rendered content.
+
+### Runtime Telemetry
+
+`buildRuntimeTelemetrySummary()` turns `AgentResult.metrics.telemetry` into compact summary fields suitable for event payloads:
+
+- model/tool counts by provider/model/name/status
+- token totals, cached tokens, cache creation tokens, cache hit ratio
+- estimated cached-input savings when model pricing is known
+- stable-prefix hash/version
+- QMD call count, elapsed time, and allowance usage
+- raw, returned-to-model, artifact, and summary tool-output bytes
+- max history/transcript chars
+- failure subtype counts
+- final status
+
+Raw telemetry events stay in `.autoforge/telemetry.json`.
+
+### Durable Dispatch Events
+
+Planner, coder, reviewer, and doc dispatches emit `agent_runtime_telemetry` after the routed execution completes. The payload combines the runtime summary with dispatch context:
+
+- executor
+- model
+- routed tier
+- task tier
+- agent type
+- phase
+- files in scope
+
+These events are stored in the existing `events.payload` JSON column. No migration is required for the V2 foundation.
+
+### Reporting Helpers
+
+Runtime cache KPI helpers read stored `agent_runtime_telemetry` payloads and compute:
+
+- repeated stable-prefix hashes
+- cached-input-token ratio
+- estimated cached-input savings
+- max history chars
+- tool-output contribution
+- per-stable-prefix aggregate rows for repeated hashes
+
+The web metrics route exposes this through `GET /api/metrics/:projectId/runtime-cache-kpis`. Dashboard UI remains optional.
+
+## Current KPI Surfaces
+
+### Runtime Cache KPI Query
+
+`buildRuntimeCacheKpiProjectQuery(projectId, windowDays)` selects compact runtime telemetry payload fields from `events`.
+
+It prefers nested `payload.toolOutputBytes.returnedToModel` and falls back to legacy `payload.returnedToolOutputBytes`, so older and newer telemetry payloads can be compared in the same report window.
+
+### Runtime Cache KPI Report
+
+`computeRuntimeCacheKpiReport(rows)` returns:
+
+- `summary`: aggregate cache and tool-output KPIs across rows
+- `stablePrefixes`: repeated stable-prefix aggregates sorted by occurrences, cache ratio, input tokens, and hash
 
 ## Success Measures
 
-- Prompt-cache hit ratio improves for repeated agent dispatches with the same persona/skills/status contract.
+- Prompt-cache hit ratio improves for repeated dispatches with the same persona, stable skills, tool protocol, and status contract.
 - Repeated input-token cost drops without reducing task success rate.
-- `agent_runtime_telemetry` events can explain token/cost totals, cache behavior, QMD usage, tool-output contribution, and failure subtype counts.
-- Adaptive routing decisions are based on durable dispatch evidence rather than ad hoc assumptions.
+- `agent_runtime_telemetry` can explain token/cost totals, cache behavior, QMD usage, tool-output contribution, and failure subtype counts.
+- Runtime cache KPI reports show repeated stable-prefix hashes and estimated cached-input savings.
+- Future routing or cost-policy changes use durable dispatch evidence instead of ad hoc assumptions.
+
+## Backlog After Foundation
+
+- Adaptive model routing based on observed telemetry, not static heuristics alone.
+- Semantic retrieval policy for choosing stable versus dynamic context.
+- Summarization policy for long histories and repeated tool output.
+- Dashboard UI for runtime cache KPIs.
+- Per-project or per-tier cost caps with intervention behavior.
+- Provider-specific cache controls beyond Anthropic if other providers expose compatible APIs.

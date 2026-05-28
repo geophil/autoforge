@@ -172,7 +172,7 @@ Planner, coder, reviewer, and doc dispatches use a deterministic model router be
 
 Each decision emits `model_routing_decision` with selected tier/model, risk level, sensitive areas, rationale, failure count, and escalation metadata.
 
-The V2 cost-efficiency roadmap lives in `docs/qmd/model-cost-efficiency-v2.md`. V2 keeps adaptive routing behind runtime decomposition, stable prompt-prefix/cache discipline, and durable `agent_runtime_telemetry` evidence.
+The V2 cost-efficiency roadmap lives in `docs/qmd/model-cost-efficiency-v2.md`. V2 keeps adaptive routing behind runtime decomposition, stable prompt-prefix/cache discipline, and durable `agent_runtime_telemetry` evidence. Runtime cache KPI reporting is exposed through `GET /api/metrics/:projectId/runtime-cache-kpis` and is based on the compact event payloads rather than raw telemetry arrays.
 
 ## Runtime Tools
 
