@@ -22,6 +22,15 @@ class ScriptedProvider implements ModelProvider {
   }
 }
 
+class ArtifactWriteFailingWorkspace extends MockWorkspace {
+  async writeFile(path: string, content: string): Promise<void> {
+    if (path.startsWith(".autoforge/history-compactions/")) {
+      throw new Error("history artifact write failed");
+    }
+    return super.writeFile(path, content);
+  }
+}
+
 describe("ConversationHistory", () => {
   test("compacts only old complete exchanges and preserves recent messages", () => {
     const history = new ConversationHistory("do work");
@@ -176,6 +185,27 @@ describe("HistoryCompactor", () => {
       status: "fallback",
       failureSubtype: "compaction_model_timeout"
     });
+  });
+
+  test("does not fail the run when raw history artifact storage fails", async () => {
+    const provider = new ScriptedProvider([]);
+    const ledger = new TelemetryLedger();
+    const history = longHistory();
+    const workspace = new ArtifactWriteFailingWorkspace({ id: "workspace-compaction-artifact-failure" });
+    const compactor = new HistoryCompactor({
+      ANTHROPIC_MODEL: "standard-model",
+      MODEL_TIER_CHEAP: "cheap-model",
+      contextMaxChars: 500,
+      compactionTriggerRatio: 0.1,
+      compactionRetainRecentMessages: 2
+    }, new UtilityModelCaller(provider, ledger, "coder"), ledger);
+
+    const result = await compactor.compactIfNeeded({ history, workspace, taskGoal: "do work" });
+
+    expect(result.compacted).toBe(false);
+    expect(provider.calls).toHaveLength(0);
+    expect(ledger.getEvents().compactions).toHaveLength(0);
+    expect(JSON.stringify(history.snapshot())).not.toContain("Compact Prior Context");
   });
 });
 

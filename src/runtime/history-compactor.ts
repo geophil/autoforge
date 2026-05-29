@@ -49,6 +49,18 @@ export class HistoryCompactor {
     workspace: Workspace;
     taskGoal: string;
   }): Promise<HistoryCompactionResult> {
+    try {
+      return await this.compact(args);
+    } catch {
+      return { compacted: false };
+    }
+  }
+
+  private async compact(args: {
+    history: ConversationHistory;
+    workspace: Workspace;
+    taskGoal: string;
+  }): Promise<HistoryCompactionResult> {
     const preHistoryChars = args.history.serializedChars();
     const maxChars = this.config.contextMaxChars ?? 120_000;
     const triggerRatio = this.config.compactionTriggerRatio ?? DEFAULT_TRIGGER_RATIO;
