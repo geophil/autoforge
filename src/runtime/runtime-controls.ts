@@ -2,13 +2,16 @@ import type { AgentTask } from "../executors/interface";
 import { AgentRunGuardrails, type AgentRunGuardrailConfig } from "./agent-run-guardrails";
 import { RunBudget } from "./run-budget";
 import { ToolResultShaper } from "./tool-output-shaping";
+import type { ModelSelectionConfig } from "./model-selection";
 
 export type RuntimeControlsConfig = AgentRunGuardrailConfig & {
   qmdTotalAllowanceSeconds?: number;
   qmdCallTimeoutSeconds?: number;
   modelCallTimeoutSeconds?: number;
   finalReserveSeconds?: number;
-};
+  compactionTriggerRatio?: number;
+  compactionRetainRecentMessages?: number;
+} & Partial<ModelSelectionConfig>;
 
 export class RuntimeControls {
   readonly budget: RunBudget;

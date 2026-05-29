@@ -172,6 +172,8 @@ Planner, coder, reviewer, and doc dispatches use a deterministic model router be
 
 Each decision emits `model_routing_decision` with selected tier/model, risk level, sensitive areas, rationale, failure count, and escalation metadata.
 
+`src/runtime/model-selection.ts` is the shared model-selection boundary. Agent dispatches still use the risk-sensitive router above, while bounded utility calls use `ModelUseCase = "utility"` and default to the cheap tier. Utility purposes currently include `compaction`, `summarization`, `classification`, and `extraction`; purpose-specific overrides take precedence over `MODEL_TIER_CHEAP`, which falls back to `claude-3-haiku-20240307`.
+
 The V2 cost-efficiency roadmap lives in `docs/qmd/model-cost-efficiency-v2.md`. V2 keeps adaptive routing behind runtime decomposition, stable prompt-prefix/cache discipline, and durable `agent_runtime_telemetry` evidence. Runtime cache KPI reporting is exposed through `GET /api/metrics/:projectId/runtime-cache-kpis` and is based on the compact event payloads rather than raw telemetry arrays.
 
 ## Runtime Tools
@@ -197,6 +199,9 @@ The V2 cost-efficiency roadmap lives in `docs/qmd/model-cost-efficiency-v2.md`. 
 - `PLANNER_FINAL_RESERVE_SECONDS` / `PLANNER_SPEC_MAX_QMD_CALLS` / `PLANNER_SPEC_MAX_TOOL_CALLS`: planner spec guardrails
 - `MODEL_CALL_TIMEOUT_SECONDS`: optional per-provider-call timeout cap
 - `HARNESS_CONTEXT_MAX_CHARS`: serialized history growth guardrail
+- `HARNESS_COMPACTION_MODEL` / `HARNESS_SUMMARIZATION_MODEL` / `HARNESS_CLASSIFICATION_MODEL` / `HARNESS_EXTRACTION_MODEL`: purpose-specific utility model overrides
+- `HARNESS_COMPACTION_TIMEOUT_SECONDS` / `HARNESS_SUMMARIZATION_TIMEOUT_SECONDS` / `HARNESS_CLASSIFICATION_TIMEOUT_SECONDS` / `HARNESS_EXTRACTION_TIMEOUT_SECONDS`: utility model call timeout budgets
+- `HARNESS_COMPACTION_MAX_TOKENS` / `HARNESS_SUMMARIZATION_MAX_TOKENS` / `HARNESS_CLASSIFICATION_MAX_TOKENS` / `HARNESS_EXTRACTION_MAX_TOKENS`: utility model output budgets
 
 ## Integration Points
 
@@ -214,6 +219,10 @@ The V2 cost-efficiency roadmap lives in `docs/qmd/model-cost-efficiency-v2.md`. 
 | `src/executors/mock.ts` | Deterministic executor for tests |
 | `src/runtime/harness-executor.ts` | Production executor loop |
 | `src/runtime/anthropic-provider.ts` | Anthropic model provider adapter |
+| `src/runtime/model-selection.ts` | Shared model tier and utility-purpose selection |
+| `src/runtime/utility-model-caller.ts` | Bounded no-tool utility LLM calls through `ModelProvider` |
+| `src/runtime/conversation-history.ts` | History append/snapshot/compaction replacement helper |
+| `src/runtime/history-compactor.ts` | Cheap LLM-assisted history compaction with deterministic fallback |
 | `src/runtime/model-provider.ts` | Provider abstraction |
 | `src/runtime/tool-registry.ts` | Tool registry and execution context |
 | `src/runtime/tools.ts` | Runtime tool implementations |
@@ -437,14 +446,14 @@ If the planner output does not include usable QMD evidence (`status: "used"` wit
 
 `HarnessExecutor` is the single production runtime. It runs an agentic tool-use loop against `ModelProvider` (today `AnthropicProvider`) using the `RuntimeToolRegistry`.
 
-1. **System prompt**: Persona (`task.systemPrompt`) + skills metadata + status-reporting instructions, sent via `ModelProvider.message`. The prefix is cached at the provider boundary so subsequent loop iterations hit the prompt cache.
-2. **User message**: `task.prompt` — the task-specific content.
+1. **Prompt envelope**: `PromptEnvelope` renders stable persona/skill/tool/status sections before dynamic task context. Provider adapters may cache only stable blocks.
+2. **History**: `ConversationHistory` starts with `task.prompt` and appends assistant/tool-result turns.
 3. **MCP wiring** (optional): When `QMD_MCP_URL` is set in `task.environment`, the harness opens a Streamable HTTP MCP client to QMD, lists its tools, and merges them with the local tool registry. The MCP client lifetime is scoped to the `execute()` call: opened up front, closed in `finally` (even on early return).
 4. **Tool loop**: `ModelProvider.message` is called repeatedly. Tool calls are dispatched against the registry (`read_file`, `write_file`, `exec`, `done`, `lookup_skill`, `load_skill`) or routed to MCP by name.
 5. **Deadline check**: The deadline is enforced before each provider call and before each tool call. Long-running `exec` tools receive a concrete timeout.
 6. **Status read**: `.autoforge-status.json` is read from the workspace; if absent → `DONE_WITH_CONCERNS`.
 7. **Token tracking**: input + output tokens are accumulated across iterations and returned on `AgentResult.metrics`. Context-envelope hashes flow through the orchestrator's prompt-hash telemetry.
-8. **Context compaction**: when projected input approaches the model's budget threshold, older tool-use/tool-result exchange groups are compacted into a structured memory block. Compaction preserves API pairing validity (drop/retain full exchange groups only), uses a pinned summarization model by default, and falls back to bounded extractive memory when summarization fails.
+8. **Context compaction**: when serialized history reaches 75% of `HARNESS_CONTEXT_MAX_CHARS`, `HistoryCompactor` replaces older complete assistant/tool-result exchange groups with a structured memory block and preserves the latest six history messages verbatim. Compaction runs through `UtilityModelCaller` with `UtilityModelPurpose = "compaction"`, sends no tools, selects the cheap utility model, stores dropped raw history under `.autoforge/history-compactions/`, and falls back to deterministic extractive memory on provider errors, timeouts, or invalid JSON.
 
 The harness uses **client-side MCP** (in-process `@modelcontextprotocol/sdk`) rather than Anthropic's remote MCP connector — the QMD server is not publicly reachable (it lives on the docker / k8s service network).
 
@@ -453,11 +462,13 @@ Available local tools (same set regardless of MCP) live in the **Harness Runtime
 Compaction telemetry is stored in transcript turns (`kind: "compaction"`) with:
 - `droppedTurns`
 - `retainedRecentTurns`
-- `triggerInputTokens`
+- `preHistoryChars`
+- `postHistoryChars`
 - `summaryInputCharCount`
 - `summaryOutputCharCount`
-- `summaryModel` (or `null` on fallback)
+- `summaryModel`
 - `usedFallback`
+- `rawHistoryArtifact`
 
 When `QMD_MCP_URL` is set in `AgentTask.environment`, that agent sees QMD's MCP tools (`query`, `get`, `multi_get`, `status`) alongside the local set; their names are reserved so they don't collide.
 

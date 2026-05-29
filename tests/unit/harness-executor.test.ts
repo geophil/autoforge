@@ -14,14 +14,22 @@ import { createRuntimeToolRegistry } from "../../src/runtime/tools";
 class ScriptedProvider implements ModelProvider {
   readonly name: string = "scripted";
   readonly supportedModels = ["test-model"];
-  readonly calls: Array<{ history: ModelMessage[]; tools: string[]; timeoutSeconds?: number }> = [];
+  readonly calls: Array<{
+    model: string;
+    history: ModelMessage[];
+    tools: string[];
+    maxTokens?: number;
+    timeoutSeconds?: number;
+  }> = [];
 
   constructor(private readonly responses: ModelResponse[]) {}
 
   async message(args: Parameters<ModelProvider["message"]>[0]): Promise<ModelResponse> {
     this.calls.push({
+      model: args.model,
       history: args.history,
       tools: args.tools.map((tool) => tool.name),
+      maxTokens: args.maxTokens,
       timeoutSeconds: args.timeoutSeconds
     });
     const response = this.responses.shift();
@@ -1122,6 +1130,103 @@ describe("HarnessExecutor", () => {
     expect(telemetryFileContent).not.toBeNull();
     const parsed = JSON.parse(telemetryFileContent!);
     expect(parsed.totalTokens.input).toBe(40);
+  });
+
+  test("compacts long history before the context guardrail fails", async () => {
+    const workspace = new MockWorkspace({ id: "workspace-history-compaction" });
+    const provider = new ScriptedProvider([
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "big-1", name: "big_output", input: { index: 1 } }],
+        usage: { input: 10, output: 5 }
+      },
+      {
+        stopReason: "tool_use",
+        content: [{ type: "tool_use", id: "big-2", name: "big_output", input: { index: 2 } }],
+        usage: { input: 11, output: 6 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            taskGoal: "do work",
+            constraints: ["preserve latest exchange"],
+            keyDecisions: ["large tool output was compacted"],
+            filesInspected: [],
+            filesChanged: [".autoforge-status.json"],
+            commandsRun: [],
+            failedAttempts: [],
+            knownErrors: [],
+            unresolvedQuestions: [],
+            artifactRefs: [],
+            recommendedNextAction: "finish the task"
+          })
+        }],
+        usage: { input: 40, output: 12 }
+      },
+      {
+        stopReason: "end_turn",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 12, output: 7 }
+      }
+    ]);
+    let toolRuns = 0;
+    const tools = new ToolRegistry().register({
+      name: "big_output",
+      description: "Return a large output and eventually finish.",
+      inputSchema: { type: "object", properties: { index: { type: "number" } }, required: ["index"] },
+      execute: async (_input, toolWorkspace: Workspace) => {
+        toolRuns++;
+        if (toolRuns === 2) {
+          await toolWorkspace.writeFile(".autoforge-status.json", JSON.stringify({ status: "DONE", artifacts: [] }));
+        }
+        return `large-result-${toolRuns}\n${"x".repeat(1_250)}`;
+      }
+    });
+
+    const result = await new HarnessExecutor({
+      provider,
+      tools,
+      defaultModel: "test-model",
+      runtime: {
+        contextMaxChars: 2_800,
+        compactionTriggerRatio: 0.5,
+        compactionRetainRecentMessages: 2,
+        MODEL_TIER_CHEAP: "cheap-model",
+        HARNESS_COMPACTION_MAX_TOKENS: 500,
+        HARNESS_COMPACTION_TIMEOUT_SECONDS: 9
+      }
+    }).execute({
+      id: "task-history-compaction",
+      type: "coder",
+      systemPrompt: "system",
+      prompt: "do work",
+      workspace,
+      budgetSeconds: 60,
+      environment: {},
+      skillFiles: []
+    });
+
+    expect(result.status).toBe("DONE");
+    expect(result.diagnostics?.failureSubtype).not.toBe("context_budget_exceeded");
+    expect(result.transcript?.turns.some((turn) => turn.kind === "compaction")).toBe(true);
+    expect(result.metrics.telemetry?.compactionCount).toBe(1);
+    expect(result.metrics.telemetry?.compactionFallbackCount).toBe(0);
+    expect(result.metrics.telemetry?.events.compactions?.[0]).toMatchObject({
+      model: "cheap-model",
+      usedFallback: false
+    });
+    expect(provider.calls[2]).toMatchObject({
+      model: "cheap-model",
+      tools: [],
+      maxTokens: 500,
+      timeoutSeconds: 9
+    });
+    expect(provider.calls[3].model).toBe("test-model");
+    const artifactPath = result.metrics.telemetry?.events.compactions?.[0]?.rawHistoryArtifact;
+    expect(artifactPath).toStartWith(".autoforge/history-compactions/");
+    expect(await workspace.readFile(artifactPath!)).toContain("large-result-1");
   });
 });
 
