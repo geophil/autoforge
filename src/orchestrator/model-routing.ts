@@ -1,7 +1,7 @@
 import type { AppEnv } from "../config/env";
+import { modelForTier, type ModelTier } from "../runtime/model-selection";
 import type { AgentType, PlannerRequestedPhase, Tier } from "../types/core";
 
-export type ModelTier = "cheap" | "standard" | "strong";
 export type ModelRiskLevel = "low" | "medium" | "high";
 
 export interface ModelRoutingInput {
@@ -92,12 +92,6 @@ export function nextStrongerTier(tier: ModelTier): ModelTier | null {
   if (tier === "cheap") return "standard";
   if (tier === "standard") return "strong";
   return null;
-}
-
-export function modelForTier(env: AppEnv, tier: ModelTier): string {
-  if (tier === "cheap") return env.MODEL_TIER_CHEAP ?? env.PLANNER_MODEL_EXPRESS ?? env.ANTHROPIC_MODEL;
-  if (tier === "standard") return env.MODEL_TIER_STANDARD ?? env.ANTHROPIC_MODEL;
-  return env.MODEL_TIER_STRONG ?? env.PLANNER_MODEL_COMPLEX ?? env.ANTHROPIC_MODEL;
 }
 
 function classifySensitiveAreas(input: ModelRoutingInput): string[] {

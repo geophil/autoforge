@@ -45,6 +45,10 @@ describe("env defaults for planner config", () => {
     expect(defaults.PLANNER_SPEC_MAX_TOOL_CALLS).toBe(8);
     expect(defaults.MODEL_CALL_TIMEOUT_SECONDS).toBeUndefined();
     expect(defaults.HARNESS_CONTEXT_MAX_CHARS).toBe(120_000);
+    expect(defaults.HARNESS_COMPACTION_TIMEOUT_SECONDS).toBe(30);
+    expect(defaults.HARNESS_COMPACTION_MAX_TOKENS).toBe(1200);
+    expect(defaults.HARNESS_CLASSIFICATION_TIMEOUT_SECONDS).toBe(15);
+    expect(defaults.HARNESS_CLASSIFICATION_MAX_TOKENS).toBe(400);
 
     const env = loadEnv({
       NODE_ENV: "test",
@@ -54,7 +58,9 @@ describe("env defaults for planner config", () => {
       PLANNER_SPEC_MAX_QMD_CALLS: "2",
       PLANNER_SPEC_MAX_TOOL_CALLS: "4",
       MODEL_CALL_TIMEOUT_SECONDS: "15",
-      HARNESS_CONTEXT_MAX_CHARS: "50000"
+      HARNESS_CONTEXT_MAX_CHARS: "50000",
+      HARNESS_COMPACTION_TIMEOUT_SECONDS: "11",
+      HARNESS_COMPACTION_MAX_TOKENS: "900"
     });
     expect(env.QMD_MCP_TOTAL_ALLOWANCE_SECONDS).toBe(45);
     expect(env.QMD_MCP_CALL_TIMEOUT_SECONDS).toBe(10);
@@ -63,6 +69,8 @@ describe("env defaults for planner config", () => {
     expect(env.PLANNER_SPEC_MAX_TOOL_CALLS).toBe(4);
     expect(env.MODEL_CALL_TIMEOUT_SECONDS).toBe(15);
     expect(env.HARNESS_CONTEXT_MAX_CHARS).toBe(50_000);
+    expect(env.HARNESS_COMPACTION_TIMEOUT_SECONDS).toBe(11);
+    expect(env.HARNESS_COMPACTION_MAX_TOKENS).toBe(900);
   });
 
   test("WORKSPACE_PROVIDER defaults to local", () => {

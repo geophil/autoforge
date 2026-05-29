@@ -1,9 +1,12 @@
 import type { AgentType } from "../types/core";
 
+export type ModelCallPurpose = "agent_turn" | "compaction" | "summarization" | "classification" | "extraction";
+
 export interface ModelCallEvent {
   provider: string;
   model: string;
   agentType: AgentType;
+  purpose?: ModelCallPurpose;
   tokens: { input: number; output: number; cached?: number; cacheCreation?: number };
   latencyMs: number;
   timestamp: number;
@@ -14,6 +17,27 @@ export interface ModelCallEvent {
   modelCallTimeoutSeconds?: number;
   historyChars?: number;
   transcriptChars?: number;
+  failureSubtype?: string;
+}
+
+export interface CompactionEvent {
+  purpose: "compaction";
+  provider: string;
+  model: string | null;
+  status: "success" | "fallback";
+  latencyMs: number;
+  timestamp: number;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCost: number;
+  preHistoryChars: number;
+  postHistoryChars: number;
+  droppedTurns: number;
+  retainedRecentTurns: number;
+  summaryInputCharCount: number;
+  summaryOutputCharCount: number;
+  rawHistoryArtifact: string;
+  usedFallback: boolean;
   failureSubtype?: string;
 }
 
@@ -46,11 +70,21 @@ export interface TelemetrySummary {
   mostExpensiveModel: string;
   mostExpensivePhase: string;
   toolOutputContributionBytes: number;
+  utilityCallCount?: number;
+  utilityEstimatedCost?: number;
+  compactionCount?: number;
+  compactionFallbackCount?: number;
+  compactionInputTokens?: number;
+  compactionOutputTokens?: number;
+  compactionEstimatedCost?: number;
+  maxPreCompactionHistoryChars?: number;
+  maxPostCompactionHistoryChars?: number;
 }
 
 export class TelemetryLedger {
   private modelEvents: ModelCallEvent[] = [];
   private toolEvents: ToolCallEvent[] = [];
+  private compactionEvents: CompactionEvent[] = [];
 
   recordModelCall(event: ModelCallEvent) {
     this.modelEvents.push(event);
@@ -60,8 +94,16 @@ export class TelemetryLedger {
     this.toolEvents.push(event);
   }
 
+  recordCompaction(event: CompactionEvent) {
+    this.compactionEvents.push(event);
+  }
+
   getEvents() {
-    return { models: [...this.modelEvents], tools: [...this.toolEvents] };
+    return {
+      models: [...this.modelEvents],
+      tools: [...this.toolEvents],
+      compactions: [...this.compactionEvents]
+    };
   }
 
   getSummary(): TelemetrySummary {
@@ -69,6 +111,8 @@ export class TelemetryLedger {
     const tokens = { input: 0, output: 0, cached: 0, cacheCreation: 0 };
     let totalToolBytes = 0;
     let retries = 0;
+    let utilityCallCount = 0;
+    let utilityEstimatedCost = 0;
 
     const costByModel: Record<string, number> = {};
     const costByPhase: Record<string, number> = {};
@@ -80,6 +124,10 @@ export class TelemetryLedger {
       tokens.cached += m.tokens.cached ?? 0;
       tokens.cacheCreation += m.tokens.cacheCreation ?? 0;
       retries += m.retryAttempt;
+      if (m.purpose && m.purpose !== "agent_turn") {
+        utilityCallCount += 1;
+        utilityEstimatedCost += m.estimatedCost;
+      }
 
       costByModel[m.model] = (costByModel[m.model] || 0) + m.estimatedCost;
       costByPhase[m.agentType] = (costByPhase[m.agentType] || 0) + m.estimatedCost;
@@ -107,6 +155,13 @@ export class TelemetryLedger {
       }
     }
 
+    const compactionTokens = this.compactionEvents.reduce((sum, event) => {
+      sum.input += event.inputTokens;
+      sum.output += event.outputTokens;
+      sum.cost += event.estimatedCost;
+      return sum;
+    }, { input: 0, output: 0, cost: 0 });
+
     return {
       totalEstimatedCost: totalCost,
       totalTokens: tokens,
@@ -114,7 +169,16 @@ export class TelemetryLedger {
       retryCount: retries,
       mostExpensiveModel,
       mostExpensivePhase,
-      toolOutputContributionBytes: totalToolBytes
+      toolOutputContributionBytes: totalToolBytes,
+      utilityCallCount,
+      utilityEstimatedCost,
+      compactionCount: this.compactionEvents.length,
+      compactionFallbackCount: this.compactionEvents.filter((event) => event.usedFallback).length,
+      compactionInputTokens: compactionTokens.input,
+      compactionOutputTokens: compactionTokens.output,
+      compactionEstimatedCost: compactionTokens.cost,
+      maxPreCompactionHistoryChars: Math.max(0, ...this.compactionEvents.map((event) => event.preHistoryChars)),
+      maxPostCompactionHistoryChars: Math.max(0, ...this.compactionEvents.map((event) => event.postHistoryChars))
     };
   }
 }

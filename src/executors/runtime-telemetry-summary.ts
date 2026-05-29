@@ -49,6 +49,17 @@ export interface RuntimeTelemetrySummary {
   };
   maxHistoryChars: number;
   maxTranscriptChars: number;
+  utilityCallCount: number;
+  utilityEstimatedCost: number;
+  compaction: {
+    count: number;
+    fallbackCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCost: number;
+    maxPreHistoryChars: number;
+    maxPostHistoryChars: number;
+  };
   failureSubtypeCounts: Record<string, number>;
 }
 
@@ -60,6 +71,7 @@ export function buildRuntimeTelemetrySummary(args: {
   const telemetry = args.result.metrics.telemetry;
   const modelEvents = telemetry?.events.models ?? [];
   const toolEvents = telemetry?.events.tools ?? [];
+  const compactionEvents = telemetry?.events.compactions ?? [];
   const tokenTotals = {
     input: telemetry?.totalTokens.input ?? args.result.metrics.tokenInput ?? 0,
     output: telemetry?.totalTokens.output ?? args.result.metrics.tokenOutput ?? 0,
@@ -67,7 +79,7 @@ export function buildRuntimeTelemetrySummary(args: {
     cacheCreation: telemetry?.totalTokens.cacheCreation ?? 0
   };
   const failureSubtypeCounts: Record<string, number> = {};
-  for (const event of [...modelEvents, ...toolEvents]) {
+  for (const event of [...modelEvents, ...toolEvents, ...compactionEvents]) {
     if (!event.failureSubtype) continue;
     failureSubtypeCounts[event.failureSubtype] = (failureSubtypeCounts[event.failureSubtype] ?? 0) + 1;
   }
@@ -126,6 +138,19 @@ export function buildRuntimeTelemetrySummary(args: {
     },
     maxHistoryChars: Math.max(0, ...modelEvents.map((event) => event.historyChars ?? 0), ...toolEvents.map((event) => event.historyChars ?? 0)),
     maxTranscriptChars: Math.max(0, ...modelEvents.map((event) => event.transcriptChars ?? 0), ...toolEvents.map((event) => event.transcriptChars ?? 0)),
+    utilityCallCount: telemetry?.utilityCallCount ?? modelEvents.filter((event) => event.purpose && event.purpose !== "agent_turn").length,
+    utilityEstimatedCost: telemetry?.utilityEstimatedCost ?? modelEvents
+      .filter((event) => event.purpose && event.purpose !== "agent_turn")
+      .reduce((sum, event) => sum + event.estimatedCost, 0),
+    compaction: {
+      count: telemetry?.compactionCount ?? compactionEvents.length,
+      fallbackCount: telemetry?.compactionFallbackCount ?? compactionEvents.filter((event) => event.usedFallback).length,
+      inputTokens: telemetry?.compactionInputTokens ?? compactionEvents.reduce((sum, event) => sum + event.inputTokens, 0),
+      outputTokens: telemetry?.compactionOutputTokens ?? compactionEvents.reduce((sum, event) => sum + event.outputTokens, 0),
+      estimatedCost: telemetry?.compactionEstimatedCost ?? compactionEvents.reduce((sum, event) => sum + event.estimatedCost, 0),
+      maxPreHistoryChars: telemetry?.maxPreCompactionHistoryChars ?? Math.max(0, ...compactionEvents.map((event) => event.preHistoryChars)),
+      maxPostHistoryChars: telemetry?.maxPostCompactionHistoryChars ?? Math.max(0, ...compactionEvents.map((event) => event.postHistoryChars))
+    },
     failureSubtypeCounts
   };
 }

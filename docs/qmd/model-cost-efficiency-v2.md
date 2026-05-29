@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Model Cost Efficiency V2 makes agent cost optimization measurable before it makes routing more aggressive. The foundation is composable runtime structure, stable prompt-prefix/cache discipline, durable runtime telemetry, and queryable KPI helpers. Adaptive routing, semantic retrieval, summarization policy, dashboards, and cost caps remain later work until the foundation produces reliable evidence.
+Model Cost Efficiency V2 makes agent cost optimization measurable before it makes routing more aggressive. The foundation is composable runtime structure, stable prompt-prefix/cache discipline, shared model selection, low-cost utility LLM calls, durable runtime telemetry, and queryable KPI helpers. Adaptive routing, semantic retrieval, phase-triggered compaction, dashboards, and cost caps remain later work until the foundation produces reliable evidence.
 
 This is the canonical roadmap. The PR-sized implementation plan lives in `docs/superpowers/plans/Cost optimization V2 PLAN.md`.
 
@@ -11,6 +11,7 @@ This is the canonical roadmap. The PR-sized implementation plan lives in `docs/s
 - Preserve task behavior while changing runtime internals.
 - Keep `HarnessExecutor` as the coordinator and move focused runtime behavior into composable components.
 - Treat prompt caching as an adapter-level optimization. Cache misses must not affect correctness.
+- Treat utility LLM calls as bounded, non-mutating work that defaults to the cheapest configured model.
 - Put long-lived prompt material before dynamic task context, and version/hash only the stable prefix.
 - Keep raw model/tool telemetry in `.autoforge/telemetry.json`; store compact dispatch summaries in durable events.
 - Use existing JSON event payload storage unless query needs prove a schema migration is worth the cost.
@@ -25,6 +26,9 @@ The harness runtime now uses focused components:
 - `McpToolAdapter` owns QMD/MCP setup, tool listing, call timeout handling, result text extraction, allowance accounting inputs, and close safety.
 - `ToolExecutionOutcome` normalizes local tools, QMD tools, guardrail blocks, unknown tools, recoverable errors, and timeout-like failures.
 - `PromptEnvelope` separates stable prefix sections from dynamic context.
+- `model-selection` centralizes tier lookup for agent dispatches and cheap-first utility purpose selection.
+- `UtilityModelCaller` reuses `ModelProvider` for no-tool utility calls such as compaction.
+- `ConversationHistory` and `HistoryCompactor` keep long sessions under context guardrails by compacting older complete exchange groups.
 
 The executor loop remains responsible for orchestration: provider calls, tool turns, status finalization, telemetry writing, and timeout handling.
 
@@ -40,6 +44,18 @@ Stable sections include persona content, stable skill files, harness/tool protoc
 
 Provider adapters receive structured prompt sections and cache hints. Anthropic applies cache controls only to stable system blocks; non-cache providers ignore hints without changing rendered content.
 
+### Shared Model Selection And Utility Calls
+
+Agent dispatch routing remains risk-sensitive: planner, coder, reviewer, and doc work use `standard` by default and escalate to `strong` for sensitive areas or repeated failures. Utility calls are selected separately by use case and purpose, default to `cheap`, and never receive tools.
+
+Utility purpose overrides are supported through `HARNESS_COMPACTION_MODEL`, `HARNESS_SUMMARIZATION_MODEL`, `HARNESS_CLASSIFICATION_MODEL`, and `HARNESS_EXTRACTION_MODEL`. Fallback order is purpose override, then `MODEL_TIER_CHEAP`, then `claude-3-haiku-20240307`. Purpose-specific timeout and max-token budgets keep these calls bounded.
+
+### Threshold History Compaction
+
+The harness compacts conversation history when serialized history reaches 75% of `HARNESS_CONTEXT_MAX_CHARS`. It preserves the latest six history messages verbatim, compacts only older complete assistant/tool-result exchange groups, stores dropped raw history under `.autoforge/history-compactions/`, and inserts a structured compact memory block into the remaining history.
+
+LLM-assisted compaction uses `UtilityModelPurpose = "compaction"` and the selected cheap utility model. If the provider errors, times out, or returns invalid JSON, the runtime falls back to deterministic extractive memory and continues the agent run.
+
 ### Runtime Telemetry
 
 `buildRuntimeTelemetrySummary()` turns `AgentResult.metrics.telemetry` into compact summary fields suitable for event payloads:
@@ -51,6 +67,7 @@ Provider adapters receive structured prompt sections and cache hints. Anthropic 
 - QMD call count, elapsed time, and allowance usage
 - raw, returned-to-model, artifact, and summary tool-output bytes
 - max history/transcript chars
+- utility and compaction counts, fallback count, compaction tokens/cost, and before/after history chars
 - failure subtype counts
 - final status
 
@@ -110,7 +127,7 @@ It prefers nested `payload.toolOutputBytes.returnedToModel` and falls back to le
 
 - Adaptive model routing based on observed telemetry, not static heuristics alone.
 - Semantic retrieval policy for choosing stable versus dynamic context.
-- Summarization policy for long histories and repeated tool output.
+- Phase-triggered compaction and richer summarization policy for repeated tool output.
 - Dashboard UI for runtime cache KPIs.
 - Per-project or per-tier cost caps with intervention behavior.
 - Provider-specific cache controls beyond Anthropic if other providers expose compatible APIs.

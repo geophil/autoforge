@@ -7,7 +7,7 @@ import type {
   ToolStats
 } from "../executors/interface";
 import { readStatusFileFromWorkspace } from "../executors/status-convention";
-import type { ModelContentBlock, ModelMessage, ModelProvider, ModelResponse } from "./model-provider";
+import type { ModelContentBlock, ModelProvider, ModelResponse } from "./model-provider";
 import { ToolRegistry, type ToolStatsBucket } from "./tool-registry";
 import { TelemetryLedger } from "../executors/telemetry";
 import { getModelCost } from "./pricing";
@@ -26,6 +26,9 @@ import {
   renderPromptEnvelope
 } from "./prompt-envelope";
 import { executeToolUse } from "./tool-execution";
+import { ConversationHistory } from "./conversation-history";
+import { UtilityModelCaller } from "./utility-model-caller";
+import { HistoryCompactor } from "./history-compactor";
 
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_TOOL_ITERATIONS = 50;
@@ -73,7 +76,7 @@ export class HarnessExecutor implements AgentExecutor {
     const start = budget.startedAtMs;
     const promptEnvelope = buildPromptEnvelopeForTask(task);
     const systemPrompt = renderPromptEnvelope(promptEnvelope);
-    const history: ModelMessage[] = [{ role: "user", content: [{ type: "text", text: task.prompt }] }];
+    const history = new ConversationHistory(task.prompt);
     const turns: AgentTranscriptTurn[] = [];
     const loadedSkills: string[] = [];
     const toolStats: ToolStats = { readCount: 0, writeCount: 0, bashCount: 0, searchCount: 0, iterations: 0 };
@@ -81,6 +84,11 @@ export class HarnessExecutor implements AgentExecutor {
     let tokenOutput = 0;
 
     const ledger = new TelemetryLedger();
+    const utilityCaller = new UtilityModelCaller(this.options.provider, ledger, task.type);
+    const compactor = new HistoryCompactor({
+      ANTHROPIC_MODEL: this.options.defaultModel,
+      ...this.options.runtime
+    }, utilityCaller, ledger);
     const mcpAdapter = new McpToolAdapter(this.options.mcpClientFactory);
     let availableTools = this.options.tools.definitions();
 
@@ -103,7 +111,7 @@ export class HarnessExecutor implements AgentExecutor {
         qmdElapsedMs: setup.elapsedMs,
         qmdAllowanceUsedMs: budget.qmdAllowanceUsedMs(),
         qmdAllowanceRemainingMs: budget.qmdAllowanceRemainingMs(),
-        historyChars: serializedHistoryChars(history),
+        historyChars: history.serializedChars(),
         transcriptChars: 0,
         failureSubtype: setup.failureSubtype
       });
@@ -128,7 +136,16 @@ export class HarnessExecutor implements AgentExecutor {
           return timeoutResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger);
         }
 
-        const historyChars = serializedHistoryChars(history);
+        const compaction = await compactor.compactIfNeeded({
+          history,
+          workspace: task.workspace,
+          taskGoal: task.prompt
+        });
+        if (compaction.transcriptTurn) {
+          turns.push(compaction.transcriptTurn);
+        }
+
+        const historyChars = history.serializedChars();
         const contextBlock = guardrails.checkContextSize(historyChars);
         if (contextBlock && !contextBlock.shouldContinue) {
           return failedResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger, contextBlock.message, contextBlock.failureSubtype);
@@ -142,7 +159,7 @@ export class HarnessExecutor implements AgentExecutor {
             model: task.model ?? this.options.defaultModel,
             systemPrompt,
             system: promptEnvelopeSystemBlocks(promptEnvelope),
-            history: snapshotHistory(history),
+            history: history.snapshot(),
             tools: availableTools,
             maxTokens: DEFAULT_MAX_TOKENS,
             timeoutSeconds: modelTimeout.timeoutSeconds
@@ -153,6 +170,7 @@ export class HarnessExecutor implements AgentExecutor {
               provider: this.options.provider.name,
               model: task.model ?? this.options.defaultModel,
               agentType: task.type,
+              purpose: "agent_turn",
               tokens: { input: 0, output: 0, cached: 0 },
               latencyMs: Date.now() - modelStart,
               timestamp: modelStart,
@@ -179,6 +197,7 @@ export class HarnessExecutor implements AgentExecutor {
           provider: this.options.provider.name,
           model: task.model ?? this.options.defaultModel,
           agentType: task.type,
+          purpose: "agent_turn",
           tokens: {
             input: response.usage.input,
             output: response.usage.output,
@@ -204,7 +223,7 @@ export class HarnessExecutor implements AgentExecutor {
         tokenOutput += response.usage.output;
         toolStats.iterations += 1;
         const responseContent = snapshotContent(response.content);
-        history.push({ role: "assistant", content: responseContent });
+        history.appendAssistant(responseContent);
         turns.push({ kind: "assistant", content: snapshotContent(responseContent) });
 
         if (response.stopReason === "tool_use") {
@@ -242,7 +261,7 @@ export class HarnessExecutor implements AgentExecutor {
             const serialized = shaped
               ? { raw: shaped.content, bounded: shaped.content }
               : serializeToolResultDetailed(outcome.result);
-            const currentHistoryChars = serializedHistoryChars(history);
+            const currentHistoryChars = history.serializedChars();
             const currentTranscriptChars = transcriptChars(transcript());
             ledger.recordToolCall({
               toolName: outcome.toolName,
@@ -275,8 +294,16 @@ export class HarnessExecutor implements AgentExecutor {
               content: serialized.bounded
             });
           }
-          history.push({ role: "user", content: toolResults });
-          const contextBlock = guardrails.checkContextSize(serializedHistoryChars(history));
+          history.appendToolResults(toolResults);
+          const postToolCompaction = await compactor.compactIfNeeded({
+            history,
+            workspace: task.workspace,
+            taskGoal: task.prompt
+          });
+          if (postToolCompaction.transcriptTurn) {
+            turns.push(postToolCompaction.transcriptTurn);
+          }
+          const contextBlock = guardrails.checkContextSize(history.serializedChars());
           if (contextBlock && !contextBlock.shouldContinue) {
             return failedResult(task.workspace, start, tokenInput, tokenOutput, toolStats, transcript(), ledger, contextBlock.message, contextBlock.failureSubtype);
           }
@@ -356,13 +383,6 @@ function toolUsesIn(content: ModelContentBlock[]): Array<{ id: string; name: str
       input: isRecord(block.input) ? block.input : {}
     }];
   });
-}
-
-function snapshotHistory(history: ModelMessage[]): ModelMessage[] {
-  return history.map((message) => ({
-    role: message.role,
-    content: snapshotContent(message.content)
-  }));
 }
 
 interface SerializedToolResult {
@@ -536,10 +556,6 @@ function recordToolStat(stats: ToolStats, bucket: ToolStatsBucket | null | undef
 function isTimeoutError(error: unknown): boolean {
   if (isRuntimeFailureError(error)) return true;
   return isTimeoutLikeError(error);
-}
-
-function serializedHistoryChars(history: ModelMessage[]): number {
-  return JSON.stringify(history).length;
 }
 
 function transcriptChars(transcript: AgentTranscript): number {

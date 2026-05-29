@@ -256,19 +256,21 @@ export function pendingWorkspaceDestroyPayloads(events, reason): WorkspaceDestro
 
 `sweepStaleTasks()` reuses the same cleanup path after terminalizing stale work. Running the sweeper repeatedly does not duplicate `workspace_destroyed`.
 
-### SDK Compaction Transcript Fields
+### Harness Compaction Transcript Fields
 
-When the Anthropic SDK executor compacts its message history to stay under the model context budget, it appends a `compaction` turn to the executor transcript. The transcript itself is not an event-log message, but the fields are recorded alongside per-task transcripts and are useful for downstream observability:
+When `HarnessExecutor` compacts its message history to stay under the configured context guardrail, it appends a `compaction` turn to the executor transcript. The transcript itself is not an event-log message, but the fields are recorded alongside per-task transcripts and are useful for downstream observability:
 
 | Field | Meaning |
 |---|---|
 | `droppedTurns` | Number of historical assistant/tool-result turns replaced by the memory block. |
 | `retainedRecentTurns` | Number of most-recent turns preserved verbatim (always ≥ 1). |
-| `triggerInputTokens` | Projected next-call input tokens that crossed the compaction threshold. |
+| `preHistoryChars` | Serialized history characters before compaction. |
+| `postHistoryChars` | Serialized history characters after compaction. |
 | `summaryInputCharCount` | Character size of the slice fed to the summarizer. |
-| `summaryOutputCharCount` | Character size of the produced memory block (capped at 8 KiB on fallback). |
-| `summaryModel` | Pinned summarization model name, or `null` if the deterministic fallback was used. |
-| `usedFallback` | True when the LLM summarizer failed and the bounded extractive fallback ran. |
+| `summaryOutputCharCount` | Character size of the produced structured memory block. |
+| `summaryModel` | Selected cheap utility model used for LLM-assisted compaction. |
+| `usedFallback` | True when the LLM compactor failed and the bounded extractive fallback ran. |
+| `rawHistoryArtifact` | Internal `.autoforge/history-compactions/` artifact containing the dropped raw history. |
 
 All fields except `droppedTurns` are optional in the type union for backward compatibility with older transcripts.
 

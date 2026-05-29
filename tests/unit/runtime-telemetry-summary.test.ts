@@ -121,6 +121,17 @@ describe("buildRuntimeTelemetrySummary", () => {
       toolOutputBytes: { raw: 0, returnedToModel: 0, artifact: 0, summary: 0 },
       maxHistoryChars: 0,
       maxTranscriptChars: 0,
+      utilityCallCount: 0,
+      utilityEstimatedCost: 0,
+      compaction: {
+        count: 0,
+        fallbackCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        estimatedCost: 0,
+        maxPreHistoryChars: 0,
+        maxPostHistoryChars: 0
+      },
       failureSubtypeCounts: {}
     });
   });
@@ -246,5 +257,82 @@ describe("buildRuntimeTelemetrySummary", () => {
     expect(summary.estimatedCachedInputSavings).toBeCloseTo(0.00216);
     expect(summary.stablePrefixVersion).toBe("prompt-prefix-v2");
     expect(summary.stablePrefixHash).toBe("hash-cache");
+  });
+
+  test("summarizes utility compaction telemetry", () => {
+    const result: AgentResult = {
+      status: "DONE",
+      artifacts: [],
+      metrics: {
+        elapsedSeconds: 2,
+        telemetry: {
+          totalEstimatedCost: 0.001,
+          totalTokens: { input: 120, output: 30, cached: 0, cacheCreation: 0 },
+          cacheHitRatio: 0,
+          retryCount: 0,
+          mostExpensiveModel: "claude-3-haiku-20240307",
+          mostExpensivePhase: "coder",
+          toolOutputContributionBytes: 0,
+          utilityCallCount: 1,
+          utilityEstimatedCost: 0.0001,
+          compactionCount: 1,
+          compactionFallbackCount: 1,
+          compactionInputTokens: 20,
+          compactionOutputTokens: 5,
+          compactionEstimatedCost: 0.0001,
+          maxPreCompactionHistoryChars: 1000,
+          maxPostCompactionHistoryChars: 300,
+          events: {
+            models: [{
+              provider: "anthropic",
+              model: "claude-3-haiku-20240307",
+              agentType: "coder",
+              purpose: "compaction",
+              tokens: { input: 20, output: 5 },
+              latencyMs: 30,
+              timestamp: 1,
+              retryAttempt: 0,
+              estimatedCost: 0.0001
+            }],
+            tools: [],
+            compactions: [{
+              purpose: "compaction",
+              provider: "anthropic",
+              model: "claude-3-haiku-20240307",
+              status: "fallback",
+              latencyMs: 30,
+              timestamp: 1,
+              inputTokens: 20,
+              outputTokens: 5,
+              estimatedCost: 0.0001,
+              preHistoryChars: 1000,
+              postHistoryChars: 300,
+              droppedTurns: 4,
+              retainedRecentTurns: 6,
+              summaryInputCharCount: 800,
+              summaryOutputCharCount: 200,
+              rawHistoryArtifact: ".autoforge/history-compactions/test.json",
+              usedFallback: true,
+              failureSubtype: "compaction_invalid_json"
+            }]
+          }
+        }
+      }
+    };
+
+    const summary = buildRuntimeTelemetrySummary({ result, agentType: "coder" });
+
+    expect(summary.utilityCallCount).toBe(1);
+    expect(summary.utilityEstimatedCost).toBe(0.0001);
+    expect(summary.compaction).toEqual({
+      count: 1,
+      fallbackCount: 1,
+      inputTokens: 20,
+      outputTokens: 5,
+      estimatedCost: 0.0001,
+      maxPreHistoryChars: 1000,
+      maxPostHistoryChars: 300
+    });
+    expect(summary.failureSubtypeCounts).toEqual({ compaction_invalid_json: 1 });
   });
 });

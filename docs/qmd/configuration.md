@@ -142,7 +142,28 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 - **Type**: positive integer
 - **Default**: `120000`
-- **Affects**: `domain-agent-execution.md` / harness runtime — serialized history guardrail used to fail early with context diagnostics instead of continuing into expensive context growth.
+- **Affects**: `domain-agent-execution.md` / harness runtime — serialized history guardrail. History compaction starts at 75% of this value; if history still exceeds the guardrail after compaction, the harness fails early with context diagnostics.
+
+### Utility Model Overrides
+
+- **Variables**: `HARNESS_COMPACTION_MODEL`, `HARNESS_SUMMARIZATION_MODEL`, `HARNESS_CLASSIFICATION_MODEL`, `HARNESS_EXTRACTION_MODEL`
+- **Type**: string (optional)
+- **Default**: purpose override unset; utility selection falls back to `MODEL_TIER_CHEAP`, then `claude-3-haiku-20240307`
+- **Affects**: `domain-agent-execution.md` / shared model selection — purpose-specific model IDs for bounded no-tool utility LLM calls. Agent dispatch routing remains separate and risk-sensitive.
+
+### Utility Model Timeouts
+
+- **Variables**: `HARNESS_COMPACTION_TIMEOUT_SECONDS`, `HARNESS_SUMMARIZATION_TIMEOUT_SECONDS`, `HARNESS_CLASSIFICATION_TIMEOUT_SECONDS`, `HARNESS_EXTRACTION_TIMEOUT_SECONDS`
+- **Type**: positive integer seconds
+- **Defaults**: compaction `30`, summarization `30`, classification `15`, extraction `20`
+- **Affects**: `domain-agent-execution.md` / utility model calls — per-purpose timeout budgets.
+
+### Utility Model Output Budgets
+
+- **Variables**: `HARNESS_COMPACTION_MAX_TOKENS`, `HARNESS_SUMMARIZATION_MAX_TOKENS`, `HARNESS_CLASSIFICATION_MAX_TOKENS`, `HARNESS_EXTRACTION_MAX_TOKENS`
+- **Type**: positive integer tokens
+- **Defaults**: compaction `1200`, summarization `1200`, classification `400`, extraction `800`
+- **Affects**: `domain-agent-execution.md` / utility model calls — per-purpose output caps.
 
 ### `OPENAI_API_KEY`
 
@@ -251,6 +272,23 @@ const EnvSchema = z.object({
   SKILLS_DIR:               z.string().default("./skills"),
   ANTHROPIC_API_KEY:        z.string().optional(),
   ANTHROPIC_MODEL:          z.string().default("claude-sonnet-4-6"),
+  MODEL_TIER_CHEAP:         z.string().optional(),
+  MODEL_TIER_STANDARD:      z.string().optional(),
+  MODEL_TIER_STRONG:        z.string().optional(),
+  MODEL_CALL_TIMEOUT_SECONDS: z.coerce.number().int().positive().optional(),
+  HARNESS_CONTEXT_MAX_CHARS: z.coerce.number().int().positive().default(120_000),
+  HARNESS_COMPACTION_MODEL: z.string().optional(),
+  HARNESS_SUMMARIZATION_MODEL: z.string().optional(),
+  HARNESS_CLASSIFICATION_MODEL: z.string().optional(),
+  HARNESS_EXTRACTION_MODEL: z.string().optional(),
+  HARNESS_COMPACTION_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(30),
+  HARNESS_SUMMARIZATION_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(30),
+  HARNESS_CLASSIFICATION_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(15),
+  HARNESS_EXTRACTION_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(20),
+  HARNESS_COMPACTION_MAX_TOKENS: z.coerce.number().int().positive().default(1200),
+  HARNESS_SUMMARIZATION_MAX_TOKENS: z.coerce.number().int().positive().default(1200),
+  HARNESS_CLASSIFICATION_MAX_TOKENS: z.coerce.number().int().positive().default(400),
+  HARNESS_EXTRACTION_MAX_TOKENS: z.coerce.number().int().positive().default(800),
   OPENAI_API_KEY:           z.string().optional(),
   EMBEDDING_PROVIDER:       z.enum(["deterministic", "openai"]).default("deterministic"),
   EMBEDDING_MODEL:          z.string().default("text-embedding-3-small"),

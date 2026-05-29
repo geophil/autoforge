@@ -1,6 +1,6 @@
 import type { AgentType, SubtaskReportStatus } from "../types/core";
 import type { Workspace } from "../runtime/workspace";
-import type { ModelCallEvent, TelemetrySummary, ToolCallEvent } from "./telemetry";
+import type { CompactionEvent, ModelCallEvent, TelemetrySummary, ToolCallEvent } from "./telemetry";
 
 export interface AgentTask {
   id: string;
@@ -46,6 +46,9 @@ export type AgentTranscriptTurn =
       summaryOutputCharCount?: number;
       summaryModel?: string | null;
       usedFallback?: boolean;
+      preHistoryChars?: number;
+      postHistoryChars?: number;
+      rawHistoryArtifact?: string;
     }
   | { kind: "error"; name: string; message: string; stack?: string };
 
@@ -64,6 +67,7 @@ export interface TelemetryMetrics extends TelemetrySummary {
   events: {
     models: ModelCallEvent[];
     tools: ToolCallEvent[];
+    compactions?: CompactionEvent[];
   };
 }
 
@@ -89,7 +93,7 @@ export interface AgentResult {
     toolStats?: ToolStats;
     telemetry?: TelemetryMetrics;
   };
-  /** Captured by SDK executor. Claude Code returns undefined. */
+  /** Captured by the harness runtime. Mock/legacy executors may omit it. */
   transcript?: AgentTranscript;
 }
 
