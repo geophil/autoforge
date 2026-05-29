@@ -39,9 +39,9 @@ describe("env defaults for planner config", () => {
   test("runtime budget guardrail env values have conservative defaults and coerce overrides", () => {
     const defaults = loadEnv({ NODE_ENV: "test" });
     expect(defaults.QMD_MCP_TOTAL_ALLOWANCE_SECONDS).toBe(90);
-    expect(defaults.QMD_MCP_CALL_TIMEOUT_SECONDS).toBe(20);
+    expect(defaults.QMD_MCP_CALL_TIMEOUT_SECONDS).toBe(60);
     expect(defaults.PLANNER_FINAL_RESERVE_SECONDS).toBe(75);
-    expect(defaults.PLANNER_SPEC_MAX_QMD_CALLS).toBe(3);
+    expect(defaults.PLANNER_SPEC_MAX_QMD_CALLS).toBe(6);
     expect(defaults.PLANNER_SPEC_MAX_TOOL_CALLS).toBe(8);
     expect(defaults.MODEL_CALL_TIMEOUT_SECONDS).toBeUndefined();
     expect(defaults.HARNESS_CONTEXT_MAX_CHARS).toBe(120_000);

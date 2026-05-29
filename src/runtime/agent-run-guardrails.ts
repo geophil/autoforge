@@ -14,7 +14,7 @@ export interface GuardrailBlock {
   shouldContinue: boolean;
 }
 
-const DEFAULT_PLANNER_SPEC_MAX_QMD_CALLS = 3;
+const DEFAULT_PLANNER_SPEC_MAX_QMD_CALLS = 6;
 const DEFAULT_PLANNER_SPEC_MAX_TOOL_CALLS = 8;
 const DEFAULT_CONTEXT_MAX_CHARS = 120_000;
 
@@ -49,7 +49,7 @@ export class AgentRunGuardrails {
     }
 
     const nextTotal = this.totalToolCalls + 1;
-    const nextQmd = this.qmdToolCalls + (args.isQmd ? 1 : 0);
+    const nextQmd = this.qmdToolCalls + (isMeteredQmdCall(args.toolName, args.isQmd) ? 1 : 0);
     if (nextQmd > this.plannerSpecMaxQmdCalls) {
       return {
         failureSubtype: "planner_qmd_call_cap_exceeded",
@@ -67,9 +67,9 @@ export class AgentRunGuardrails {
     return null;
   }
 
-  recordTool(args: { isQmd: boolean }): void {
+  recordTool(args: { isQmd: boolean; toolName?: string }): void {
     this.totalToolCalls += 1;
-    if (args.isQmd) this.qmdToolCalls += 1;
+    if (isMeteredQmdCall(args.toolName, args.isQmd)) this.qmdToolCalls += 1;
   }
 
   checkContextSize(chars: number): GuardrailBlock | null {
@@ -88,6 +88,13 @@ export class AgentRunGuardrails {
 
 function isCompletionTool(toolName: string): boolean {
   return toolName === "done" || toolName === "write_file";
+}
+
+function isMeteredQmdCall(toolName: string | undefined, isQmd: boolean): boolean {
+  if (!isQmd) return false;
+  // QMD status is a readiness probe. Counting it against the retrieval cap
+  // makes one cheap health check consume budget needed for actual evidence.
+  return toolName !== "status";
 }
 
 function plannerPhase(task: Pick<AgentTask, "prompt" | "metadata">): string | null {

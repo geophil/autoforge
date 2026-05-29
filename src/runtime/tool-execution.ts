@@ -44,7 +44,7 @@ export async function executeToolUse(args: ExecuteToolUseArgs): Promise<ToolExec
     }
 
     if (isQmdTool) {
-      guardrails.recordTool({ isQmd: true });
+      guardrails.recordTool({ isQmd: true, toolName: toolUse.name });
       const qmdTimeout = budget.timeoutForQmdCall();
       const call = await mcpAdapter.callTool(toolUse.name, toolUse.input, qmdTimeout);
       budget.observeQmdElapsed(call.elapsedMs);
@@ -65,7 +65,7 @@ export async function executeToolUse(args: ExecuteToolUseArgs): Promise<ToolExec
       };
     }
 
-    guardrails.recordTool({ isQmd: false });
+    guardrails.recordTool({ isQmd: false, toolName: toolUse.name });
     const localTimeout = budget.timeoutForLocalTool();
     if (localTimeout.timeoutMs <= 0) {
       const error = new Error("Task budget exhausted before tool execution");

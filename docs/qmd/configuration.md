@@ -111,7 +111,7 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 ### `QMD_MCP_CALL_TIMEOUT_SECONDS`
 
 - **Type**: positive integer seconds
-- **Default**: `20`
+- **Default**: `60`
 - **Affects**: `domain-agent-execution.md` / harness runtime — maximum timeout passed to each QMD MCP tool call.
 
 ### `PLANNER_FINAL_RESERVE_SECONDS`
@@ -123,8 +123,8 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 ### `PLANNER_SPEC_MAX_QMD_CALLS`
 
 - **Type**: positive integer
-- **Default**: `3`
-- **Affects**: `domain-agent-execution.md` / planner guardrails — maximum QMD calls allowed during a spec-phase planner run before the model is instructed to stop exploration.
+- **Default**: `6`
+- **Affects**: `domain-agent-execution.md` / planner guardrails — maximum QMD retrieval calls allowed during a spec-phase planner run before the model is instructed to stop exploration. QMD `status` probes are readiness checks and do not count against this retrieval cap.
 
 ### `PLANNER_SPEC_MAX_TOOL_CALLS`
 

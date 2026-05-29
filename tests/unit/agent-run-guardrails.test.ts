@@ -48,6 +48,21 @@ describe("AgentRunGuardrails", () => {
       .toBe("max_tool_iterations");
   });
 
+  test("does not count QMD status probes against planner retrieval cap", () => {
+    const budget = new RunBudget({ budgetSeconds: 100 });
+    const guardrails = new AgentRunGuardrails(plannerSpecTask, {
+      plannerSpecMaxQmdCalls: 1,
+      plannerSpecMaxToolCalls: 5
+    });
+
+    expect(guardrails.beforeTool({ toolName: "status", isQmd: true, budget })).toBeNull();
+    guardrails.recordTool({ toolName: "status", isQmd: true });
+    expect(guardrails.beforeTool({ toolName: "query", isQmd: true, budget })).toBeNull();
+    guardrails.recordTool({ toolName: "query", isQmd: true });
+    expect(guardrails.beforeTool({ toolName: "get", isQmd: true, budget })?.failureSubtype)
+      .toBe("planner_qmd_call_cap_exceeded");
+  });
+
   test("reports context budget overages", () => {
     const guardrails = new AgentRunGuardrails(plannerSpecTask, { contextMaxChars: 10 });
 

@@ -16,7 +16,7 @@ export interface TimeoutDecision {
 }
 
 const DEFAULT_QMD_ALLOWANCE_SECONDS = 90;
-const DEFAULT_QMD_CALL_TIMEOUT_SECONDS = 20;
+const DEFAULT_QMD_CALL_TIMEOUT_SECONDS = 60;
 const DEFAULT_FINAL_RESERVE_SECONDS = 75;
 
 export class RunBudget {
