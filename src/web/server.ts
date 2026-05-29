@@ -1,6 +1,8 @@
 import { streamSSE } from "hono/streaming";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createTaskRoutes } from "./routes/tasks";
 import { createApprovalRoutes } from "./routes/approvals";
 import { createMetricsRoutes } from "./routes/metrics";
@@ -16,11 +18,13 @@ import { loadEnv, type AppEnv } from "../config/env";
 import { buildDockerPreflightChecks } from "../runtime/container-diagnostics";
 import { spawnAsExecEvents } from "../runtime/spawn-streaming";
 import type { ExecEvent } from "../runtime/workspace";
+import type { NatsClient } from "../nats/client";
 
 export function createWebServer(
   service: OrchestratorService,
   db: DbClient,
-  env: AppEnv = loadEnv()
+  env: AppEnv = loadEnv(),
+  runtimeDeps: { nats?: NatsClient } = {}
 ): Hono {
   const app = new Hono();
   const events = new LiveEventHub();
@@ -46,12 +50,14 @@ export function createWebServer(
   });
 
   app.get("/api/runtime", async (ctx) => {
-    const [qmd, docker] = await Promise.all([
+    const [qmd, nats, docker] = await Promise.all([
       probeQmdMcp(env.QMD_MCP_URL),
+      probeNats(runtimeDeps.nats, env.NATS_URL),
       inspectDockerWorkspace(env)
     ]);
     return ctx.json({
       qmd,
+      nats,
       workspace: {
         provider: env.WORKSPACE_PROVIDER,
         taskExecutionMode: env.WORKSPACE_PROVIDER === "docker" ? "docker_container" : "local_worktree",
@@ -88,29 +94,28 @@ async function probeQmdMcp(url: string | undefined): Promise<{
   available: boolean;
   status: "not_configured" | "available" | "unreachable";
   url: string | null;
-  httpStatus?: number;
+  toolCount?: number;
+  tools?: string[];
   error?: string;
 }> {
   if (!url) {
     return { configured: false, available: false, status: "not_configured", url: null };
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1_500);
+  const client = new Client({ name: "autoforge-runtime-probe", version: "0.1.0" }, { capabilities: {} });
+  const transport = new StreamableHTTPClientTransport(new URL(url));
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: { accept: "application/json, text/event-stream, */*" },
-      signal: controller.signal
-    });
-    const available = response.status < 500 && response.status !== 404;
+    const tools = await withTimeout((async () => {
+      await client.connect(transport);
+      return (await client.listTools()).tools;
+    })(), 3_000, "MCP tools/list timed out");
     return {
       configured: true,
-      available,
-      status: available ? "available" : "unreachable",
+      available: true,
+      status: "available",
       url,
-      httpStatus: response.status,
-      ...(available ? {} : { error: `HTTP ${response.status}` })
+      toolCount: tools.length,
+      tools: tools.map((tool) => tool.name).sort()
     };
   } catch (error) {
     return {
@@ -121,8 +126,35 @@ async function probeQmdMcp(url: string | undefined): Promise<{
       error: error instanceof Error ? error.message : String(error)
     };
   } finally {
-    clearTimeout(timer);
+    await client.close().catch(() => {});
   }
+}
+
+async function probeNats(nats: NatsClient | undefined, url: string): Promise<{
+  configured: boolean;
+  available: boolean;
+  status: "available" | "unavailable" | "not_attached";
+  url: string;
+  error?: string;
+}> {
+  if (!nats) {
+    return {
+      configured: true,
+      available: false,
+      status: "not_attached",
+      url,
+      error: "NATS client was not attached to the web runtime probe"
+    };
+  }
+
+  const result = await nats.healthCheck();
+  return {
+    configured: true,
+    available: result.ok,
+    status: result.ok ? "available" : "unavailable",
+    url: nats.url,
+    ...(result.ok ? {} : { error: result.error ?? "health check failed" })
+  };
 }
 
 async function inspectDockerWorkspace(env: AppEnv): Promise<{
@@ -186,4 +218,18 @@ async function collectExec(events: AsyncIterable<ExecEvent>): Promise<{
     if (event.kind === "exit") exitCode = event.exitCode;
   }
   return { stdout, stderr, exitCode };
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

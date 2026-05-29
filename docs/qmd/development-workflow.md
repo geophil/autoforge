@@ -30,9 +30,17 @@ bun run dev
 # → QMD: not available (planner falls back to filesystem exploration)
 
 # Start with NATS + QMD knowledge base via Docker Compose (recommended)
-docker-compose up
+bun run dev:stack
 # → QMD embeds docs/qmd/ on first boot, re-indexes every 3 hours
 # → QMD_MCP_URL=http://qmd:8181/mcp passed to task-facing agents automatically
+```
+
+If you prefer to run the app on the host but keep dependencies in Docker, start
+the dependency services first:
+
+```bash
+bun run dev:deps
+bun run dev
 ```
 
 The dashboard is available at `http://localhost:3000`. Submit tasks via:

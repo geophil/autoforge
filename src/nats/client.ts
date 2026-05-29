@@ -31,6 +31,24 @@ export class NatsClient {
     return this.js !== undefined;
   }
 
+  get url(): string {
+    return this.serverUrl;
+  }
+
+  async healthCheck(): Promise<{ ok: boolean; error?: string }> {
+    if (!this.connection || !this.js) {
+      return { ok: false, error: "not connected" };
+    }
+
+    try {
+      const jsm = await this.connection.jetstreamManager();
+      await jsm.streams.info("TASKS");
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   async close(): Promise<void> {
     if (this.connection) {
       await this.connection.drain();

@@ -125,6 +125,7 @@ function renderRuntimeStatus() {
   if (!runtimeGrid || !runtimeStatus) return;
   runtimeGrid.innerHTML = [
     renderQmdRuntimeTile(runtimeStatus.qmd),
+    renderNatsRuntimeTile(runtimeStatus.nats),
     renderWorkspaceRuntimeTile(runtimeStatus.workspace)
   ].join("");
 }
@@ -138,6 +139,15 @@ function renderQmdRuntimeTile(qmd) {
       ? `${qmd.url} · ${qmd.error || "probe failed"}`
       : "Set QMD_MCP_URL to enable knowledgebase grounding.";
   return runtimeTile("QMD MCP", value, detail, state);
+}
+
+function renderNatsRuntimeTile(nats) {
+  const state = nats?.available ? "ok" : "warn";
+  const value = nats?.available ? "JetStream ready" : "SQLite-only";
+  const detail = nats?.available
+    ? `${nats.url} · TASKS stream ready`
+    : `${nats?.url || "NATS_URL unset"} · ${nats?.error || "not connected"}`;
+  return runtimeTile("NATS", value, detail, state);
 }
 
 function renderWorkspaceRuntimeTile(workspace) {

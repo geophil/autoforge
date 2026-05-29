@@ -49,15 +49,32 @@ describe("GET /api/runtime", () => {
     expect(body.workspace.docker.status).toBe("not_enabled");
   });
 
-  test("probes configured QMD MCP URL", async () => {
+  test("reports configured QMD MCP URL unreachable when MCP handshake fails", async () => {
     const app = createWebServer(stubService, stubDb, testEnv({ QMD_MCP_URL: "data:text/plain,ok" }));
     const res = await app.request("/api/runtime");
     const body = await res.json();
 
     expect(body.qmd.configured).toBe(true);
-    expect(body.qmd.available).toBe(true);
-    expect(body.qmd.status).toBe("available");
-    expect(body.qmd.httpStatus).toBe(200);
+    expect(body.qmd.available).toBe(false);
+    expect(body.qmd.status).toBe("unreachable");
+    expect(typeof body.qmd.error).toBe("string");
+  });
+
+  test("reports NATS readiness from attached runtime dependency", async () => {
+    const nats = {
+      url: "nats://test:4222",
+      healthCheck: async () => ({ ok: true })
+    } as any;
+    const app = createWebServer(stubService, stubDb, testEnv(), { nats });
+    const res = await app.request("/api/runtime");
+    const body = await res.json();
+
+    expect(body.nats).toMatchObject({
+      configured: true,
+      available: true,
+      status: "available",
+      url: "nats://test:4222"
+    });
   });
 
   test("reports docker workspace config without preflight when disabled", async () => {

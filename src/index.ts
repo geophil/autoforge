@@ -63,7 +63,7 @@ service.startDiagnosticScheduler();
 // previous run or a timed-out executor) as failed with a failure_analysis event.
 await service.sweepStaleTasks();
 
-const app = createWebServer(service, db, env);
+const app = createWebServer(service, db, env, { nats });
 
 serve(
   {
