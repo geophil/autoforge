@@ -4,7 +4,7 @@ import type { AgentTask } from "../../src/executors/interface";
 import type { PlanSubtask } from "../../src/types/core";
 
 describe("orchestrator task policy", () => {
-  test("emits task policy decision and scopes QMD environment by phase", async () => {
+  test("emits task policy decision and omits QMD for low-risk tasks", async () => {
     const plannerEnvs: Array<Record<string, string>> = [];
     const coderEnvs: Array<Record<string, string>> = [];
     const { service, db, cleanup } = createTestService({
@@ -44,9 +44,12 @@ describe("orchestrator task policy", () => {
       expect(policyEvent?.payload).toMatchObject({
         task_type: "documentation",
         risk_level: "low",
-        tier: "EXPRESS"
+        tier: "EXPRESS",
+        tool_policy: {
+          qmd: "none"
+        }
       });
-      expect(plannerEnvs.some((env) => env.QMD_MCP_URL === "http://localhost:8181/mcp")).toBe(true);
+      expect(plannerEnvs.every((env) => env.QMD_MCP_URL === undefined)).toBe(true);
       expect(coderEnvs.length).toBeGreaterThan(0);
       expect(coderEnvs.every((env) => env.QMD_MCP_URL === undefined)).toBe(true);
     } finally {

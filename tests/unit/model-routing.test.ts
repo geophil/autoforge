@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { loadEnv } from "../../src/config/env";
 import { routeModel } from "../../src/orchestrator/model-routing";
+import { deterministicTaskPolicy } from "../../src/orchestrator/task-policy";
 
 const env = loadEnv({
   NODE_ENV: "test",
@@ -36,6 +37,36 @@ describe("model routing", () => {
     expect(decision.tier).toBe("strong");
     expect(decision.model).toBe("strong-model");
     expect(decision.sensitiveAreas).toEqual(expect.arrayContaining(["auth", "database"]));
+  });
+
+  test("does not escalate medium customer-facing policy to strong by itself", () => {
+    const policy = deterministicTaskPolicy({ description: "Add a dashboard API filter" });
+    const decision = routeModel(env, {
+      agentType: "coder",
+      phase: "implementation",
+      tier: policy.tier,
+      description: "Add a dashboard API filter",
+      policy
+    });
+
+    expect(policy.riskLevel).toBe("medium");
+    expect(policy.sensitiveAreas).toContain("customer_facing");
+    expect(decision.tier).toBe("standard");
+    expect(decision.rationale).toBe("policy_model_floor");
+  });
+
+  test("honors high-risk policy with strong model even without a runtime keyword", () => {
+    const policy = deterministicTaskPolicy({ description: "Critical production outage in checkout" });
+    const decision = routeModel(env, {
+      agentType: "planner",
+      phase: "execution_plan",
+      tier: policy.tier,
+      description: "Fix checkout stability",
+      policy
+    });
+
+    expect(decision.tier).toBe("strong");
+    expect(decision.rationale).toBe("strong_for_high_risk_policy");
   });
 
   test("escalates repeated failures to strong", () => {

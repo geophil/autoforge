@@ -107,7 +107,7 @@ export interface DeterministicPolicyScan {
 const SENSITIVE_AREA_PATTERNS: Array<{ area: TaskPolicySensitiveArea; patterns: RegExp[]; hardHighRisk?: boolean }> = [
   { area: "auth", patterns: [/\bauth\b/i, /login/i, /oauth/i, /\bjwt\b/i, /session/i], hardHighRisk: true },
   { area: "permissions", patterns: [/permission/i, /\brbac\b/i, /access control/i], hardHighRisk: true },
-  { area: "security", patterns: [/security/i, /encryption/i, /csrf/i, /xss/i], hardHighRisk: true },
+  { area: "security", patterns: [/security/i, /encryption/i, /csrf/i, /xss/i, /vulnerability/i, /exploit/i, /critical/i, /outage/i, /\bprod(?:uction)?\b/i], hardHighRisk: true },
   { area: "secrets", patterns: [/secret/i, /credential/i, /\btoken\b/i, /api key/i], hardHighRisk: true },
   { area: "payments", patterns: [/payment/i, /billing/i, /stripe/i, /invoice/i, /subscription/i], hardHighRisk: true },
   { area: "database", patterns: [/migration/i, /schema/i, /\bsql\b/i, /\bdb\b/i, /sqlite/i, /postgres/i], hardHighRisk: true },
@@ -160,6 +160,7 @@ export function withTierOverride(policy: TaskPolicyDecision, tier: Tier): TaskPo
   return {
     ...policy,
     tier,
+    requiredGates: gatesForTier(tier),
     assessment: {
       ...policy.assessment,
       rationale: `${policy.assessment.rationale} Tier overridden to ${tier}.`
@@ -289,10 +290,7 @@ function buildPolicyDecision(
   const allowedBundles: ToolBundle[] = merged.riskLevel === "low"
     ? ["core_read", "core_write", "exec", "artifact"]
     : ["core_read", "core_write", "exec", "artifact", "skills"];
-  const qmd: TaskPolicyDecision["toolPolicy"]["qmd"] =
-    merged.taskType === "documentation" || merged.sensitiveAreas.includes("orchestrator_runtime")
-    ? "planner_and_doc"
-    : "planner";
+  const qmd = qmdPolicyFor(merged);
 
   return {
     taskType: merged.taskType,
@@ -303,15 +301,13 @@ function buildPolicyDecision(
     budgetClass: merged.riskLevel === "high" ? "high" : merged.riskLevel === "low" ? "small" : "normal",
     tier,
     modelFloor: merged.riskLevel === "high" ? "strong" : "standard",
-    requiredGates: {
-      planReview: tier !== "EXPRESS",
-      modelReview: tier !== "EXPRESS",
-      prGate: true
-    },
+    requiredGates: gatesForTier(tier),
     toolPolicy: {
-      allowedBundles: [...allowedBundles, "qmd"],
+      allowedBundles: qmd === "none" ? allowedBundles : [...allowedBundles, "qmd"],
       qmd,
-      reasons: qmd === "planner_and_doc"
+      reasons: qmd === "none"
+        ? []
+        : qmd === "planner_and_doc"
         ? ["planner_grounding", "documentation_grounding"]
         : ["planner_grounding"]
     },
@@ -433,6 +429,25 @@ function tierForRisk(risk: TaskPolicyRiskLevel): Tier {
   if (risk === "high") return "THOROUGH";
   if (risk === "medium") return "STANDARD";
   return "EXPRESS";
+}
+
+function gatesForTier(tier: Tier): TaskPolicyDecision["requiredGates"] {
+  return {
+    planReview: tier !== "EXPRESS",
+    modelReview: tier !== "EXPRESS",
+    prGate: true
+  };
+}
+
+function qmdPolicyFor(merged: {
+  riskLevel: TaskPolicyRiskLevel;
+  taskType: TaskPolicyTaskType;
+  sensitiveAreas: TaskPolicySensitiveArea[];
+}): TaskPolicyDecision["toolPolicy"]["qmd"] {
+  if (merged.sensitiveAreas.includes("orchestrator_runtime")) return "planner_and_doc";
+  if (merged.taskType === "documentation" && merged.riskLevel !== "low") return "planner_and_doc";
+  if (merged.riskLevel === "low") return "none";
+  return "planner";
 }
 
 function riskRank(risk: TaskPolicyRiskLevel): number {

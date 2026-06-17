@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   decideTaskPolicy,
   deterministicTaskPolicy,
+  withTierOverride,
   type LlmPolicyClassification,
   type TaskPolicyLlmClassifier
 } from "../../src/orchestrator/task-policy";
@@ -14,6 +15,27 @@ describe("task policy", () => {
     expect(policy.riskLevel).toBe("low");
     expect(policy.tier).toBe("EXPRESS");
     expect(policy.assessment.novelty).toBe("low");
+    expect(policy.toolPolicy.qmd).toBe("none");
+    expect(policy.toolPolicy.allowedBundles).not.toContain("qmd");
+  });
+
+  test("keeps operational severity language high risk", () => {
+    const policy = deterministicTaskPolicy({ description: "Critical production outage in checkout" });
+
+    expect(policy.riskLevel).toBe("high");
+    expect(policy.tier).toBe("THOROUGH");
+    expect(policy.modelFloor).toBe("strong");
+    expect(policy.sensitiveAreas).toContain("security");
+  });
+
+  test("recomputes review gates when tier is explicitly overridden", () => {
+    const basePolicy = deterministicTaskPolicy({ description: "Add a small helper" });
+    const forcedExpress = withTierOverride(basePolicy, "EXPRESS");
+
+    expect(basePolicy.requiredGates.planReview).toBe(true);
+    expect(forcedExpress.requiredGates.planReview).toBe(false);
+    expect(forcedExpress.requiredGates.modelReview).toBe(false);
+    expect(forcedExpress.requiredGates.prGate).toBe(true);
   });
 
   test("does not allow LLM to downgrade deterministic high-risk signals", async () => {

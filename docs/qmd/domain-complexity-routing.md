@@ -70,7 +70,8 @@ override in the policy source metadata.
 QMD access is no longer exposed to every task-facing agent just because
 `QMD_MCP_URL` is configured.
 
-- Planner receives QMD for task scoping and evidence.
+- Planner receives QMD for task scoping and evidence when the policy requires
+  grounding. Low-risk tasks can set QMD to `none`.
 - Doc/doc-review receives QMD only for documentation or architecture-grounding
   policies.
 - Coder and reviewer do not receive QMD by default.

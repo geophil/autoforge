@@ -121,7 +121,7 @@ It prefers nested `payload.toolOutputBytes.returnedToModel` and falls back to le
 - Repeated input-token cost drops without reducing task success rate.
 - `agent_runtime_telemetry` can explain token/cost totals, cache behavior, QMD usage, tool-output contribution, and failure subtype counts.
 - Runtime cache KPI reports show repeated stable-prefix hashes and estimated cached-input savings.
-- Future routing or cost-policy changes use durable dispatch evidence instead of ad hoc assumptions.
+- Cost-policy decisions drive model floors, QMD exposure, review gates, and retry limits from one recorded decision, then runtime telemetry shows where escalation was still needed.
 
 ## Backlog After Foundation
 

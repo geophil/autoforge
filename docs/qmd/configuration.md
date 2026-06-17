@@ -187,7 +187,7 @@ Environment variables that control Autoforge's runtime behavior. Validated at st
 
 - **Type**: string (optional)
 - **Default**: unset
-- **Affects**: `domain-agent-execution.md` — when set, `OrchestratorService.agentEnvironment()` forwards this non-secret URL only to agents allowed by the task policy. Planner receives QMD for scoping/evidence; doc/doc-review receives it only for documentation or architecture-grounding policies; coder and reviewer do not receive QMD by default. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
+- **Affects**: `domain-agent-execution.md` — when set, `OrchestratorService.agentEnvironment()` forwards this non-secret URL only to agents allowed by the task policy. Planner receives QMD only when the policy requires grounding; low-risk tasks can skip QMD entirely. Doc/doc-review receives it only for documentation or architecture-grounding policies; coder and reviewer do not receive QMD by default. Set automatically to `http://qmd:8181/mcp` when running via Docker Compose.
 - **Dashboard visibility**: `/api/runtime` probes this URL and the dashboard Runtime panel reports whether QMD MCP is configured and reachable. For host-local dev with the Compose QMD service, set `QMD_MCP_URL=http://127.0.0.1:8181/mcp` before `bun run dev`.
 
 ### `WORKSPACE_PROVIDER`

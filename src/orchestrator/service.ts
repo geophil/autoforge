@@ -485,7 +485,7 @@ export class OrchestratorService {
     // dispatches (planner / coder.subtask / reviewer-N / doc) share one
     // container instead of paying create+destroy cost per dispatch.
     await this.ensureTaskWorkspace(worktree.path, taskId, projectId);
-    const pauseReview = this.pausePolicySubmit(tier, opts.reviewPlan);
+    const pauseReview = this.pausePolicySubmit(taskPolicy, opts.reviewPlan);
 
     this.recordEvent({
       taskId,
@@ -710,13 +710,13 @@ export class OrchestratorService {
   private effectivePauseReview(task: PipelineTask): boolean {
     if (task.reviewPlan === true) return true;
     if (task.reviewPlan === false) return false;
-    return task.tier === "STANDARD" || task.tier === "THOROUGH";
+    return this.policyForTask(task.id, task.description).requiredGates.planReview;
   }
 
   /** Submit-time review preference before `PipelineTask` projection exists. */
-  private pausePolicySubmit(tier: Tier, reviewPlan?: boolean): boolean {
+  private pausePolicySubmit(policy: TaskPolicyDecision, reviewPlan?: boolean): boolean {
     if (reviewPlan !== undefined) return reviewPlan;
-    return tier === "STANDARD" || tier === "THOROUGH";
+    return policy.requiredGates.planReview;
   }
 
   private recordTaskPolicyDecision(
@@ -925,8 +925,9 @@ export class OrchestratorService {
     plannerResult: AgentResult;
     plannerModel: string;
     observedQmdTools: string[];
+    policy: TaskPolicyDecision;
   }): { status: "not_required" | "used" | "degraded"; failureCategory?: string } {
-    if (!this.deps.env.QMD_MCP_URL) return { status: "not_required" };
+    if (!this.deps.env.QMD_MCP_URL || args.policy.toolPolicy.qmd === "none") return { status: "not_required" };
     const qmdContext = args.parsed.planningContext.qmdContext ?? null;
     const qmdEvidenceStatus = qmdContext?.status ?? "missing";
     const hasEvidence =
@@ -1195,7 +1196,8 @@ export class OrchestratorService {
         plannerSkillIds,
         plannerResult,
         plannerModel: plannerTask.model ?? this.deps.env.ANTHROPIC_MODEL,
-        observedQmdTools
+        observedQmdTools,
+        policy: plannerPolicy
       });
       const plannerFallback =
         (parsed.phase === "execution_plan" || parsed.phase === "legacy_subtasks") &&
@@ -3385,13 +3387,14 @@ export class OrchestratorService {
       }
 
       iteration += 1;
-      if (iteration > 3) {
+      const reworkLimit = reviewerPolicy.retryPolicy.reworkIterations;
+      if (iteration > reworkLimit) {
         this.pauseForIntervention({
           taskId,
           projectId,
           fromStage: "reviewing",
           failureCategory: "rework_limit",
-          failureReason: "Exceeded rework iteration limit (3 rounds of CRITICAL/MAJOR findings)",
+          failureReason: `Exceeded rework iteration limit (${reworkLimit} rounds of CRITICAL/MAJOR findings)`,
           forensics: {
             executor_used: reviewerExecutor.name,
             persona_version_id: reviewerPersonaId,
@@ -3401,6 +3404,7 @@ export class OrchestratorService {
               planSubtasks[0]?.description === "Implement requested behavior with tests-first workflow.",
             budget_seconds: this.budgetForTier(tier, "coder"),
             unresolved_findings: unresolvedFindings.length,
+            rework_limit: reworkLimit,
             iteration
           }
         });

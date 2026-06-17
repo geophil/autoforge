@@ -47,9 +47,21 @@ const PATH_AREA_PATTERNS: Array<{ area: string; patterns: RegExp[] }> = [
   { area: "payments", patterns: [/payment/i, /billing/i, /stripe/i] }
 ];
 
+const STRONG_MODEL_SENSITIVE_AREAS = new Set([
+  "auth",
+  "database",
+  "orchestrator_runtime",
+  "payments",
+  "permissions",
+  "production_infra",
+  "secrets",
+  "security"
+]);
+
 export function routeModel(env: AppEnv, input: ModelRoutingInput): ModelRoutingDecision {
   const sensitiveAreas = classifySensitiveAreas(input);
   const failureCount = input.failureCount ?? 0;
+  const strongSensitiveAreas = sensitiveAreas.filter((area) => STRONG_MODEL_SENSITIVE_AREAS.has(area));
   const candidateTiers: ModelTier[] = ["cheap", "standard", "strong"];
   let selectedTier: ModelTier = input.policy?.modelFloor ?? "standard";
   let rationale = input.policy ? "policy_model_floor" : "standard_default_for_agent_dispatch";
@@ -62,14 +74,17 @@ export function routeModel(env: AppEnv, input: ModelRoutingInput): ModelRoutingD
   if (
     input.escalation ||
     failureCount >= 2 ||
-    sensitiveAreas.length > 0
+    input.policy?.riskLevel === "high" ||
+    strongSensitiveAreas.length > 0
   ) {
     selectedTier = "strong";
     rationale = input.escalation
       ? "strong_after_model_capability_escalation"
       : failureCount >= 2
         ? "strong_after_repeated_failures"
-        : "strong_for_sensitive_area";
+        : input.policy?.riskLevel === "high"
+          ? "strong_for_high_risk_policy"
+          : "strong_for_sensitive_area";
   }
 
   // V1 never routes mutating engineering agents to cheap models.
@@ -81,7 +96,7 @@ export function routeModel(env: AppEnv, input: ModelRoutingInput): ModelRoutingD
   return {
     tier: selectedTier,
     model: modelForTier(env, selectedTier),
-    riskLevel: input.policy?.riskLevel ?? riskLevelFor(sensitiveAreas, failureCount, input.tier),
+    riskLevel: maxRiskLevel(input.policy?.riskLevel, riskLevelFor(sensitiveAreas, failureCount, input.tier)),
     sensitiveAreas,
     rationale,
     escalated: input.escalation === true,
@@ -111,8 +126,14 @@ function classifySensitiveAreas(input: ModelRoutingInput): string[] {
 }
 
 function riskLevelFor(sensitiveAreas: string[], failureCount: number, tier: Tier): ModelRiskLevel {
-  if (sensitiveAreas.length > 0 || failureCount >= 2) return "high";
+  if (sensitiveAreas.some((area) => STRONG_MODEL_SENSITIVE_AREAS.has(area)) || failureCount >= 2) return "high";
   if (failureCount === 1 || tier === "STANDARD" || tier === "THOROUGH") return "medium";
+  return "low";
+}
+
+function maxRiskLevel(policyRisk: ModelRiskLevel | undefined, runtimeRisk: ModelRiskLevel): ModelRiskLevel {
+  if (policyRisk === "high" || runtimeRisk === "high") return "high";
+  if (policyRisk === "medium" || runtimeRisk === "medium") return "medium";
   return "low";
 }
 
