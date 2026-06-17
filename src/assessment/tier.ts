@@ -1,29 +1,8 @@
 import type { ComplexityAssessment, Tier } from "../types/core";
+import { deterministicTaskPolicy } from "../orchestrator/task-policy";
 
 export function assessComplexity(description: string): ComplexityAssessment {
-  const normalized = description.toLowerCase();
-  const highRiskKeywords = ["security", "payment", "auth", "migration", "critical"];
-  const mediumKeywords = ["dashboard", "workflow", "pipeline", "integration", "api"];
-  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
-
-  const risk = highRiskKeywords.some((key) => normalized.includes(key))
-    ? "high"
-    : mediumKeywords.some((key) => normalized.includes(key))
-      ? "medium"
-      : "low";
-
-  const scope = wordCount > 40 ? "large" : wordCount > 12 ? "medium" : "small";
-  const novelty = normalized.includes("new") ? "high" : "medium";
-  const coupling = normalized.includes("across") || normalized.includes("multiple") ? "high" : "low";
-
-  return {
-    scope,
-    novelty,
-    risk,
-    coupling,
-    rationale: "Heuristic assessment from request keywords and size.",
-    similarPastTasks: []
-  };
+  return deterministicTaskPolicy({ description }).assessment;
 }
 
 export function routeTier(assessment: ComplexityAssessment): Tier {

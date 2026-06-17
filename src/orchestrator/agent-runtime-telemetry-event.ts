@@ -2,6 +2,7 @@ import type { AgentResult, AgentTask } from "../executors/interface";
 import { buildRuntimeTelemetrySummary } from "../executors/runtime-telemetry-summary";
 import type { AgentType, TaskStatus, Tier } from "../types/core";
 import type { ModelRoutingDecision, ModelRoutingInput } from "./model-routing";
+import type { TaskPolicyDecision } from "./task-policy";
 
 export interface AgentRuntimeTelemetryEvent {
   agent: AgentType;
@@ -23,6 +24,7 @@ export function buildAgentRuntimeTelemetryEvent(args: {
   phase: ModelRoutingInput["phase"];
   taskTier: Tier;
   filesInScope?: string[];
+  policy?: TaskPolicyDecision;
 }): AgentRuntimeTelemetryEvent {
   const summary = buildRuntimeTelemetrySummary({
     result: args.result,
@@ -40,7 +42,15 @@ export function buildAgentRuntimeTelemetryEvent(args: {
       model: args.task.model ?? null,
       routedTier: args.routing.tier,
       taskTier: args.taskTier,
-      filesInScope: args.filesInScope ?? []
+      filesInScope: args.filesInScope ?? [],
+      policy: args.policy ? {
+        taskType: args.policy.taskType,
+        riskLevel: args.policy.riskLevel,
+        sensitiveAreas: args.policy.sensitiveAreas,
+        budgetClass: args.policy.budgetClass,
+        modelFloor: args.policy.modelFloor,
+        toolPolicy: args.policy.toolPolicy
+      } : null
     },
     budgetSeconds: args.task.budgetSeconds,
     elapsedSeconds: args.result.metrics.elapsedSeconds,

@@ -22,6 +22,7 @@ type WizardModule = {
   ) => Array<{ level: string; message: string }>;
   renderPlanSubtaskCards: (subtasks: Array<Record<string, unknown>>) => string;
   renderSpecReviewPanel: (task: Record<string, unknown>, options?: Record<string, unknown>) => string;
+  renderPlanReviewPanel: (task: Record<string, unknown>, options?: Record<string, unknown>) => string;
 };
 
 function loadPlanningWizardModule(): WizardModule {
@@ -234,5 +235,58 @@ describe("planning wizard helpers", () => {
     expect(warnings.some((w) => w.level === "blocking" && w.message.includes("behavior"))).toBe(true);
     expect(warnings.some((w) => w.level === "advisory" && w.message.includes("Scope is broad"))).toBe(true);
     expect(warnings.some((w) => w.level === "advisory" && w.message.includes("THOROUGH"))).toBe(true);
+  });
+
+  test("warns from contract provenance instead of synthesized behavior display", () => {
+    const warnings = wizard.buildContractWarnings({
+      description: "Wire endpoint",
+      behavior: "Wire endpoint",
+      filesInScope: ["src/endpoint.ts"],
+      verificationCommands: ["bun test"],
+      testCriteria: ["passes"],
+      completionEvidence: ["tests pass"],
+      contractProvided: {
+        behavior: false,
+        filesInScope: true,
+        verificationCommands: true,
+        testCriteria: true,
+        completionEvidence: true
+      }
+    });
+
+    expect(warnings).toContainEqual({
+      level: "blocking",
+      message: "Behavior contract is repairable from description before execution."
+    });
+  });
+
+  test("renders computed plan contract status in plan review", () => {
+    const html = wizard.renderPlanReviewPanel(
+      {
+        id: "task-1",
+        state: "awaiting_plan_approval",
+        tier: "STANDARD",
+        planSubtasks: [],
+        planContract: {
+          status: "repaired",
+          invalidSubtasks: [],
+          repairs: [
+            {
+              subtaskId: "subtask-1",
+              field: "behavior",
+              source: "description",
+              status: "available",
+              value: "Wire endpoint"
+            }
+          ],
+          warnings: []
+        }
+      },
+      { maxAttempts: 4 }
+    );
+
+    expect(html).toContain("Plan Contract");
+    expect(html).toContain("repaired");
+    expect(html).toContain("available: behavior from description on subtask-1");
   });
 });

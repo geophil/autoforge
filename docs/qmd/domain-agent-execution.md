@@ -438,7 +438,7 @@ private agentEnvironment(): Record<string, string> {
 
 Planner prompts receive `QMD_MCP_URL` through `agentEnvironment()` and the planner skill (`skills/writing-plans.md`) requires QMD-first context gathering. The orchestrator now enforces that planner outputs include `planningContext.qmdContext` evidence when `QMD_MCP_URL` is present.
 
-If the planner output does not include usable QMD evidence (`status: "used"` with at least one query or retrieved document), orchestration pauses in `awaiting_intervention` with `failure_category=planner_missing_qmd_context`.
+If the planner output includes usable QMD evidence (`status: "used"` with at least one query or retrieved document), orchestration proceeds normally. If QMD was attempted but degraded (`status: "fallback"` with queries/documents or observed QMD tools and a fallback reason), orchestration proceeds with `done_with_concerns` so review can treat the evidence as weaker without forcing an expensive planner retry. If QMD is configured but ignored or unavailable with no auditable fallback evidence, orchestration pauses in `awaiting_intervention` with `failure_category=planner_ignored_qmd` or `qmd_unavailable`.
 
 ## Core Flows
 

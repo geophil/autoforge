@@ -1,6 +1,7 @@
 import type { AppEnv } from "../config/env";
 import { modelForTier, type ModelTier } from "../runtime/model-selection";
 import type { AgentType, PlannerRequestedPhase, Tier } from "../types/core";
+import type { TaskPolicyDecision } from "./task-policy";
 
 export type ModelRiskLevel = "low" | "medium" | "high";
 
@@ -14,6 +15,7 @@ export interface ModelRoutingInput {
   escalation?: boolean;
   priorTier?: ModelTier;
   reason?: string;
+  policy?: TaskPolicyDecision;
 }
 
 export interface ModelRoutingDecision {
@@ -49,8 +51,8 @@ export function routeModel(env: AppEnv, input: ModelRoutingInput): ModelRoutingD
   const sensitiveAreas = classifySensitiveAreas(input);
   const failureCount = input.failureCount ?? 0;
   const candidateTiers: ModelTier[] = ["cheap", "standard", "strong"];
-  let selectedTier: ModelTier = "standard";
-  let rationale = "standard_default_for_agent_dispatch";
+  let selectedTier: ModelTier = input.policy?.modelFloor ?? "standard";
+  let rationale = input.policy ? "policy_model_floor" : "standard_default_for_agent_dispatch";
 
   if (input.phase === "summarization" || input.agentType === "diagnostician") {
     selectedTier = "cheap";
@@ -79,7 +81,7 @@ export function routeModel(env: AppEnv, input: ModelRoutingInput): ModelRoutingD
   return {
     tier: selectedTier,
     model: modelForTier(env, selectedTier),
-    riskLevel: riskLevelFor(sensitiveAreas, failureCount, input.tier),
+    riskLevel: input.policy?.riskLevel ?? riskLevelFor(sensitiveAreas, failureCount, input.tier),
     sensitiveAreas,
     rationale,
     escalated: input.escalation === true,
@@ -96,7 +98,7 @@ export function nextStrongerTier(tier: ModelTier): ModelTier | null {
 
 function classifySensitiveAreas(input: ModelRoutingInput): string[] {
   const text = [input.description, input.phase, input.agentType, input.tier].filter(Boolean).join("\n");
-  const areas = new Set<string>();
+  const areas = new Set<string>(input.policy?.sensitiveAreas ?? []);
   for (const row of AREA_PATTERNS) {
     if (row.patterns.some((pattern) => pattern.test(text))) areas.add(row.area);
   }

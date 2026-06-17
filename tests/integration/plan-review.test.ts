@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { createTestService } from "../helpers/create-service";
 import { fullPlanSubtask } from "../helpers/plan-subtask";
+import type { DbClient } from "../../src/db/client";
+import type { AutoforgeMessage } from "../../src/nats/messages";
+
+function recordTestEvent(db: DbClient, message: AutoforgeMessage): void {
+  db.appendEvent(message);
+  db.applyEvent(message);
+}
 
 describe("plan-review pause", () => {
   test("STANDARD task pauses at awaiting_spec_approval after planner", async () => {
@@ -41,6 +49,185 @@ describe("approvePlan", () => {
     const task = await service.submitTask("autoforge", "x", { reviewPlan: false });
     expect(task.state).toBe("awaiting_approval");
     await expect(service.approvePlan(task.id)).rejects.toThrow();
+  });
+
+  test("approving a repairable plan accepts deterministic repairs before execution", async () => {
+    const { service, db } = createTestService({
+      planner: async (task) => {
+        const phaseMatch = /\n## Phase\n(spec|execution_plan|combined)\n/.exec("\n" + task.prompt);
+        const phase = phaseMatch?.[1];
+        if (phase === "spec") {
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: {
+              discovery: {
+                intent: "Add endpoint",
+                constraints: [],
+                assumptions: [],
+                decisions: [],
+                nonGoals: [],
+                openQuestions: []
+              },
+              spec: {
+                problem: "Need endpoint",
+                desiredBehavior: ["Endpoint works"],
+                acceptanceCriteria: ["Returns 200"],
+                verification: ["Run tests"],
+                risks: []
+              }
+            },
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+        return {
+          status: "DONE",
+          artifacts: [],
+          output: {
+            subtasks: [
+              {
+                id: "repairable-contract-1",
+                sequence: 1,
+                description: "Implement endpoint",
+                filesInScope: ["src/endpoint.ts"],
+                dependencies: [],
+                verificationCommands: ["bun test"],
+                testCriteria: ["Returns 200"],
+                completionEvidence: ["Test output shows endpoint tests passing"]
+              }
+            ]
+          },
+          metrics: { elapsedSeconds: 0.1 }
+        };
+      }
+    });
+
+    const task = await service.submitTask("autoforge", "Add endpoint");
+    await service.approveSpec(task.id);
+    const atReview = service.getTask(task.id)!;
+    expect(atReview.state).toBe("awaiting_plan_approval");
+    expect(atReview.planContract?.status).toBe("repaired");
+    expect(atReview.planContract?.repairs[0]).toMatchObject({
+      field: "behavior",
+      source: "description",
+      status: "available"
+    });
+
+    const approved = await service.approvePlan(task.id);
+    expect(approved.state).toBe("awaiting_approval");
+
+    const reloaded = service.getTask(task.id)!;
+    expect(reloaded.planSubtasks[0].contractProvided?.behavior).toBe(true);
+    expect(reloaded.planContract?.repairs[0]).toMatchObject({
+      field: "behavior",
+      source: "description",
+      status: "applied"
+    });
+    const repairEvent = db.listEvents(task.id).find((event) => event.type === "plan_contract_repaired");
+    expect(repairEvent?.payload.repair_reason).toBe("approval_repair_before_execution");
+  });
+
+  test("repairs a paused planner contract and returns it to plan review", async () => {
+    const { service, db } = createTestService({
+      planner: async (task) => {
+        const phaseMatch = /\n## Phase\n(spec|execution_plan|combined)\n/.exec("\n" + task.prompt);
+        const phase = phaseMatch?.[1];
+        if (phase === "spec") {
+          return {
+            status: "DONE",
+            artifacts: [],
+            output: {
+              discovery: {
+                intent: "Add endpoint",
+                constraints: [],
+                assumptions: [],
+                decisions: [],
+                nonGoals: [],
+                openQuestions: []
+              },
+              spec: {
+                problem: "Need endpoint",
+                desiredBehavior: ["Endpoint works"],
+                acceptanceCriteria: ["Returns 200"],
+                verification: ["Run tests"],
+                risks: []
+              }
+            },
+            metrics: { elapsedSeconds: 0.1 }
+          };
+        }
+        return {
+          status: "DONE",
+          artifacts: [],
+          output: {
+            subtasks: [
+              {
+                id: "paused-repair-contract-1",
+                sequence: 1,
+                description: "Implement endpoint",
+                filesInScope: ["src/endpoint.ts"],
+                dependencies: [],
+                verificationCommands: ["bun test"],
+                testCriteria: ["Returns 200"],
+                completionEvidence: ["Test output shows endpoint tests passing"]
+              }
+            ]
+          },
+          metrics: { elapsedSeconds: 0.1 }
+        };
+      }
+    });
+
+    const task = await service.submitTask("autoforge", "Add endpoint");
+    await service.approveSpec(task.id);
+    const atReview = service.getTask(task.id)!;
+    expect(atReview.state).toBe("awaiting_plan_approval");
+
+    const failure: AutoforgeMessage = {
+      id: randomUUID(),
+      taskId: task.id,
+      projectId: task.projectId,
+      timestamp: new Date().toISOString(),
+      agent: "orchestrator",
+      type: "failure_analysis",
+      status: "failed",
+      payload: {
+        failure_category: "planner_contract_incomplete",
+        failure_reason: "execution plan is missing required behavior",
+        awaiting_intervention: true
+      },
+      budgetSeconds: 60
+    };
+    recordTestEvent(db, failure);
+    recordTestEvent(db, {
+      id: randomUUID(),
+      taskId: task.id,
+      projectId: task.projectId,
+      timestamp: new Date().toISOString(),
+      agent: "orchestrator",
+      type: "state.awaiting_intervention",
+      status: "in_progress",
+      payload: {
+        state: "awaiting_intervention",
+        stage_failed: "executing",
+        failure_category: "planner_contract_incomplete"
+      },
+      budgetSeconds: 60
+    });
+
+    const repaired = service.repairPlanContract(task.id);
+    expect(repaired.state).toBe("awaiting_plan_approval");
+    const reloaded = service.getTask(task.id)!;
+    expect(reloaded.planContract?.status).toBe("repaired");
+    expect(reloaded.planContract?.repairs[0]).toMatchObject({
+      field: "behavior",
+      source: "description",
+      status: "applied"
+    });
+    expect(reloaded.planSubtasks[0].contractProvided?.behavior).toBe(true);
+
+    const repairEvent = db.listEvents(task.id).find((event) => event.type === "plan_contract_repaired");
+    expect(repairEvent?.payload.repair_reason).toBe("operator_repair_from_intervention");
   });
 
   test("queued steering is consumed on next coder dispatch", async () => {

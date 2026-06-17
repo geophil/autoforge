@@ -124,7 +124,9 @@ POST /api/tasks
 
 `submitTask` runs the full pipeline synchronously — the HTTP response is not returned until the task reaches `awaiting_approval` or fails.
 
-When QMD is configured (`QMD_MCP_URL` present), planner attempts that omit required `planningContext.qmdContext` evidence pause the task in `awaiting_intervention` with `failure_category=planner_missing_qmd_context`. The API returns that paused task so operators can inspect forensics and retry.
+When QMD is configured (`QMD_MCP_URL` present), planner attempts return an assessed QMD evidence state. Usable `planningContext.qmdContext` proceeds normally. Auditable fallback evidence (`status: "fallback"` with queries/documents or observed QMD tool calls plus a fallback reason) proceeds with `done_with_concerns` and is surfaced in the task's computed `planContract`. Missing or ignored QMD evidence pauses the task in `awaiting_intervention` with `failure_category=planner_ignored_qmd` or `qmd_unavailable`.
+
+Task API responses include a computed `planContract` summary for plan review and interventions. `POST /api/tasks/:id/repair-plan-contract` can repair deterministic contract aliases, such as `description` to `behavior`, without rerunning the planner when the task is paused for a planner contract intervention.
 
 ### Approval Flow
 

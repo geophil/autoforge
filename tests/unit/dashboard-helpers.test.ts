@@ -150,6 +150,12 @@ describe("dashboard helpers", () => {
     expect(recommendation.focus).toBe("pr_gate");
   });
 
+  test("maps hardened planning categories to QMD and contract guidance", () => {
+    expect(helpers.interventionRecommendation("planner_ignored_qmd").focus).toBe("qmd");
+    expect(helpers.interventionRecommendation("qmd_unavailable").focus).toBe("qmd");
+    expect(helpers.interventionRecommendation("planner_contract_invalid").focus).toBe("contract");
+  });
+
   test("computes adjacent transcript deltas by stage", () => {
     const diffs = helpers.transcriptAttemptDiffs([
       { stage: "planner:spec", attempt: 0, tokenInput: 100, tokenOutput: 20, userPrompt: "a", output: { x: 1 } },

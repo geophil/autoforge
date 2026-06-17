@@ -15,3 +15,41 @@ Capturing verifiability data points during this phase is also important.
 
 I also want to compare this approach with what we already have in place for planning. I know its super minimal, but our goal is to make this our standard skill to start a new task/project.
 Also, Do you have any other recommendation, considering other planning skill or agent examples that are popular and considered proven good practice, with the goal of creating a balanced well rounded robust planning phase? 
+
+** QMD evidence gate is too brittle
+    -
+Recent planner retries for the dashboard refactor repeatedly paused with
+`planner output missing required QMD knowledgebase evidence` even though the
+planner did attempt QMD. The observed cases included:
+
+- `qmd_evidence_status: fallback`
+- observed QMD tools such as `status`, `query`, and sometimes `get`
+- fallback reasons involving QMD query timeout, QMD allowance exhaustion, or the
+  planner QMD call cap
+
+This suggests the current enforcement collapses several different situations
+into one hard failure:
+
+- no QMD configured/visible to the agent
+- QMD configured but unreachable
+- QMD reachable but slow
+- QMD attempted and partially successful, but retrieval evidence is weak
+- planner ignored QMD entirely
+
+We should redesign this as evidence-quality policy rather than a binary
+`status === "used"` gate. A better rule might be:
+
+- hard-fail only when QMD is configured and the planner did not attempt QMD at
+  all, or omitted `planningContext.qmdContext`
+- treat `fallback` with observed QMD calls, queries/documents, and explicit
+  fallbackReason as `done_with_concerns` or `awaiting_review`, not immediate
+  `awaiting_intervention`
+- distinguish `qmd_unreachable`, `qmd_slow_or_busy`, `qmd_allowance_exhausted`,
+  `qmd_call_cap_exceeded`, and `planner_ignored_qmd`
+- prefer an idle/progress watchdog over short wall-clock timeouts; slow QMD
+  should not be equivalent to failed QMD
+- apply the same policy to later phases (coder/reviewer/doc) so QMD flakiness
+  does not repeatedly stop otherwise valid work
+
+The runtime panel should also show the same distinction: ready, slow/busy,
+degraded fallback, unavailable.

@@ -71,7 +71,32 @@ export interface PlanSubtask {
     testCriteria: boolean;
     completionEvidence: boolean;
   };
+  contractRepairs?: Array<{
+    field: "behavior" | "filesInScope" | "verificationCommands" | "testCriteria" | "completionEvidence";
+    source: string;
+  }>;
   agentType?: AgentType;
+}
+
+export interface PlanContractRepair {
+  subtaskId: string;
+  field: "behavior" | "filesInScope" | "verificationCommands" | "testCriteria" | "completionEvidence";
+  source: string;
+  status: "available" | "applied";
+  value: string;
+}
+
+export interface PlanContractWarning {
+  level: "advisory" | "degraded";
+  code: string;
+  message: string;
+}
+
+export interface PlanContractSummary {
+  status: "valid" | "repaired" | "degraded" | "invalid";
+  invalidSubtasks: Array<{ id: string; missing: string[] }>;
+  repairs: PlanContractRepair[];
+  warnings: PlanContractWarning[];
 }
 
 /** Parser-facing planner phases (excludes legacy bucket used only in ParsedPlannerOutput). */
@@ -185,4 +210,5 @@ export interface PipelineTask {
   specArtifacts?: PlannerSpecArtifacts | null;
   planningContext?: PlanningContext | null;
   currentBlockingQuestion?: string | null;
+  planContract?: PlanContractSummary;
 }

@@ -473,6 +473,12 @@ function renderTaskDetail(task) {
     if (canRetryFromExecuting) {
       retryButtons.push(`<button class="btn btn-secondary" onclick="retryTask('${task.id}', 'executing', this)">Retry from Execution</button>`);
     }
+    const planRepairs = Array.isArray(task.planContract?.repairs)
+      ? task.planContract.repairs.filter((repair) => repair.status === "available")
+      : [];
+    if ((category === "planner_contract_incomplete" || category === "planner_contract_invalid") && planRepairs.length > 0) {
+      retryButtons.unshift(`<button class="btn btn-approve" onclick="repairPlanContract('${task.id}', this)">Repair Plan Contract</button>`);
+    }
 
     actionsHtml = `
       <div class="task-detail-actions intervention">
@@ -1974,6 +1980,19 @@ async function retryTask(taskId, fromStage, btnEl) {
   });
 }
 
+async function repairPlanContract(taskId, btnEl) {
+  await runAction(btnEl, "Repairing…", btnEl?.closest(".intervention-buttons"), async () => {
+    const res = await fetch(`${API}/api/tasks/${taskId}/repair-plan-contract`, { method: "POST" });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(body?.message || body?.error || `HTTP ${res.status}`);
+    }
+    toast("Plan contract repaired. Review and approve the plan again.", "success");
+    await refreshTasks();
+    await refreshTaskDetail(taskId);
+  });
+}
+
 async function submitSteering(taskId, btnEl) {
   const input = document.getElementById("steering-input");
   const message = input?.value?.trim();
@@ -2060,6 +2079,7 @@ window.approveSpec = approveSpec;
 window.critiquePlan = critiquePlan;
 window.critiqueSpec = critiqueSpec;
 window.retryTask = retryTask;
+window.repairPlanContract = repairPlanContract;
 window.submitSteering = submitSteering;
 window.archiveTask = archiveTask;
 window.unarchiveTask = unarchiveTask;

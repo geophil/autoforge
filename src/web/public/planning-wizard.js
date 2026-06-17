@@ -350,7 +350,9 @@ function buildContractWarnings(subtask, options = {}) {
   const tests = toArray(subtask?.testCriteria).map((x) => oneLine(x)).filter(Boolean);
   const warnings = [];
 
-  if (!oneLine(subtask?.behavior)) {
+  if (subtask?.contractProvided?.behavior === false && oneLine(subtask?.description)) {
+    warnings.push({ level: "blocking", message: "Behavior contract is repairable from description before execution." });
+  } else if (!oneLine(subtask?.behavior)) {
     warnings.push({ level: "blocking", message: "Missing behavior contract." });
   }
   if (!files.length) {
@@ -427,6 +429,46 @@ function renderContractWarnings(warnings) {
         </div>
       `).join("")}
     </div>
+  `;
+}
+
+function renderPlanContractSummary(task) {
+  const contract = task?.planContract;
+  if (!contract || typeof contract !== "object") return "";
+  const invalid = toArray(contract.invalidSubtasks);
+  const repairs = toArray(contract.repairs);
+  const warnings = toArray(contract.warnings);
+  const status = oneLine(contract.status) || "unknown";
+  const statusLabel = status === "invalid"
+    ? "blocking"
+    : status === "repaired"
+      ? "repaired"
+      : status === "degraded"
+        ? "degraded"
+        : "valid";
+  const rows = [
+    ...invalid.map((row) => {
+      const missing = toArray(row?.missing).map((x) => oneLine(x)).filter(Boolean);
+      return `Subtask ${oneLine(row?.id) || "unknown"} missing ${missing.join(", ") || "required fields"}`;
+    }),
+    ...repairs.map((repair) => {
+      const state = repair?.status === "applied" ? "applied" : "available";
+      return `${state}: ${oneLine(repair?.field)} from ${oneLine(repair?.source)} on ${oneLine(repair?.subtaskId)}`;
+    }),
+    ...warnings.map((warning) => `${oneLine(warning?.level)}: ${oneLine(warning?.message)}`)
+  ].filter(Boolean);
+
+  return `
+    <details class="wizard-review-section wizard-contract-summary wizard-contract-summary-${escHtml(statusLabel)}" open>
+      <summary>
+        <span class="wizard-review-title">Plan Contract</span>
+        <span class="wizard-review-count">${escHtml(statusLabel)}</span>
+        ${renderCommentButton("Plan Contract", rows.join("; ") || statusLabel)}
+      </summary>
+      ${rows.length
+        ? `<ul>${rows.map((row) => `<li class="wizard-review-item">${escHtml(row)}</li>`).join("")}</ul>`
+        : `<div class="wizard-contract-ok">Contract is ready for execution.</div>`}
+    </details>
   `;
 }
 
@@ -660,6 +702,7 @@ function renderPlanReviewPanel(task, options) {
         ? `<div class="wizard-pending-note"><strong>Submitted:</strong> ${escHtml(pendingSubmission.text)}</div>`
         : ""}
       ${renderSharedUnderstanding(task)}
+      ${renderPlanContractSummary(task)}
       <section class="wizard-card wizard-plan-card">
         <h4>Execution subtasks</h4>
         <div class="wizard-subtask-grid">

@@ -134,10 +134,16 @@ describe("happy path pipeline", () => {
     expect(task.state).toBe("awaiting_intervention");
 
     const failure = [...db.listEvents(task.id)].reverse().find((event) => event.type === "failure_analysis");
-    expect(failure?.payload.failure_category).toBe("planner_contract_incomplete");
+    expect(failure?.payload.failure_category).toBe("planner_contract_invalid");
     const invalidSubtasks = failure?.payload.invalid_subtasks as Array<{ missing: string[] }> | undefined;
-    expect(invalidSubtasks?.[0]?.missing).toContain("behavior");
+    expect(invalidSubtasks?.[0]?.missing).not.toContain("behavior");
     expect(invalidSubtasks?.[0]?.missing).toContain("verificationCommands");
     expect(invalidSubtasks?.[0]?.missing).toContain("completionEvidence");
+    const repairs = failure?.payload.repairs as Array<Record<string, unknown>> | undefined;
+    expect(repairs?.[0]).toMatchObject({
+      field: "behavior",
+      source: "description",
+      status: "available"
+    });
   });
 });

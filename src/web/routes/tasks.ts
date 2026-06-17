@@ -32,7 +32,7 @@ export function createTaskRoutes(service: OrchestratorService, events: LiveEvent
       forceTier: body.forceTier
     });
     events.publish({ type: "task.updated", data: task });
-    return ctx.json(task, 201);
+    return ctx.json(service.getTask(task.id) ?? task, 201);
   });
 
   app.get("/", (ctx) => {

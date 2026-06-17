@@ -24,6 +24,7 @@ const allowedTransitions: Record<TaskStage, TaskStage[]> = {
   // retry logic in one place rather than special-casing each caller.
   awaiting_intervention: [
     "failed",
+    "awaiting_plan_approval",
     "planning",
     "replanning",
     "executing",

@@ -1,118 +1,96 @@
-# Complexity Assessment and Tier Routing
+# Complexity And Policy Routing
 
-This domain is responsible for classifying incoming task descriptions along four complexity dimensions and mapping that classification to an execution tier (EXPRESS / STANDARD / THOROUGH). The tier controls which agents run, how much time they get, and whether review is required. All logic is purely heuristic — keyword and word-count matching with no external calls.
+This domain classifies incoming tasks once and turns that decision into tier,
+model, tool, retry, and review policy. The policy layer is intentionally
+auditable: the deterministic scan, optional low-cost LLM classification, and
+final merged decision are recorded in `task_policy_decision` events.
 
-## Business Rules and Invariants
+## Business Rules And Invariants
 
-### Tier Determines Agent Budget and Whether Review Runs
+### One Task Policy Decision Owns Routing
 
-EXPRESS skips the reviewer entirely. STANDARD and THOROUGH both run the reviewer, but with different time budgets. See `domain-task-orchestration.md` > Business Rules for the full budget table.
+`decideTaskPolicy()` returns a `TaskPolicyDecision` with:
 
-```typescript
-// src/assessment/tier.ts
-export function routeTier(assessment: ComplexityAssessment): Tier {
-  if (
-    assessment.scope === "large"   ||
-    assessment.novelty === "high"  ||
-    assessment.risk === "high"     ||
-    assessment.coupling === "high"
-  ) return "THOROUGH";
+- task type (`bugfix`, `feature`, `refactor`, `migration`, `infrastructure`,
+  `security`, `documentation`, or `unknown`)
+- risk level (`low`, `medium`, `high`)
+- sensitive areas
+- confidence and input signals
+- budget class
+- tier (`EXPRESS`, `STANDARD`, `THOROUGH`)
+- model floor
+- required gates
+- tool policy
+- retry policy
 
-  if (
-    assessment.scope === "medium"   ||
-    assessment.novelty === "medium" ||
-    assessment.risk === "medium"    ||
-    assessment.coupling === "medium"
-  ) return "STANDARD";
+Legacy `assessComplexity()` remains as a compatibility wrapper over the
+deterministic task policy so existing task rows and API shapes keep their
+`ComplexityAssessment` payload.
 
-  return "EXPRESS";
-}
-```
+### Deterministic Guardrails Have Veto Power
 
-**Rule**: a single "high" dimension on any axis forces THOROUGH. A single "medium" forces STANDARD. Only all-low → EXPRESS.
+The deterministic scanner checks task text and file scope for sensitive areas
+such as auth, permissions, secrets, payments, database schema/migrations,
+production infrastructure, security, customer-facing behavior, and
+orchestrator/runtime code.
 
-**Enforced in**: `src/assessment/tier.ts:29`
+Hard high-risk signals force high risk. The LLM classifier can upgrade risk,
+but it cannot downgrade deterministic high-risk signals.
 
-### Risk Is Keyword-Driven
+### Low-Cost LLM Classification Is Advisory
 
-Words like "security", "payment", "auth", "migration", "critical" trigger `high` risk. "dashboard", "workflow", "pipeline", "integration", "api" trigger `medium`.
+When configured for a real harness runtime, Autoforge uses a no-tool utility
+model call with purpose `classification` to classify task type, risk, sensitive
+areas, confidence, rationale, and signals. It uses the same utility-model
+selection knobs as other bounded helper calls:
 
-```typescript
-// src/assessment/tier.ts
-const highRiskKeywords = ["security", "payment", "auth", "migration", "critical"];
-const mediumKeywords   = ["dashboard", "workflow", "pipeline", "integration", "api"];
+- `HARNESS_CLASSIFICATION_MODEL`
+- `HARNESS_CLASSIFICATION_TIMEOUT_SECONDS`
+- `HARNESS_CLASSIFICATION_MAX_TOKENS`
+- `MODEL_TIER_CHEAP`
 
-const risk = highRiskKeywords.some((key) => normalized.includes(key))
-  ? "high"
-  : mediumKeywords.some((key) => normalized.includes(key))
-    ? "medium"
-    : "low";
-```
+If the classifier errors, times out, or returns invalid JSON, Autoforge falls
+back to deterministic-only policy and records the fallback in the policy event.
 
-**Enforced in**: `src/assessment/tier.ts:6`
+### Tier Mapping
 
-### Scope Is Word-Count-Driven
+The final merged risk level maps to task tier:
 
-```typescript
-// src/assessment/tier.ts
-const wordCount = normalized.split(/\s+/).filter(Boolean).length;
-const scope = wordCount > 40 ? "large" : wordCount > 12 ? "medium" : "small";
-```
+| Risk | Tier |
+|---|---|
+| `low` | `EXPRESS` |
+| `medium` | `STANDARD` |
+| `high` | `THOROUGH` |
 
-Descriptions over 40 words → `large`. 13–40 words → `medium`. ≤12 words → `small`.
+Operator `forceTier` still overrides the final tier and is recorded as a tier
+override in the policy source metadata.
 
-### Novelty and Coupling Are Simple Keyword Checks
+### Tool Policy Scopes QMD
 
-```typescript
-// src/assessment/tier.ts
-const novelty  = normalized.includes("new") ? "high" : "medium";
-const coupling = normalized.includes("across") || normalized.includes("multiple") ? "high" : "low";
-```
+QMD access is no longer exposed to every task-facing agent just because
+`QMD_MCP_URL` is configured.
 
-Note: novelty defaults to `"medium"` (never `"low"`), so even the simplest request gets at least STANDARD tier unless scope and risk are also low.
-
-## Decision Points
-
-### Full Assessment → Tier Mapping
-
-```
-scope=small + novelty=medium + risk=low + coupling=low  → EXPRESS
-scope=medium (any) OR risk=medium (any)                  → STANDARD
-scope=large OR novelty=high OR risk=high OR coupling=high → THOROUGH
-```
-
-Because novelty can never be `"low"`, a request with no keywords and ≤12 words produces:
-`{ scope: "small", novelty: "medium", risk: "low", coupling: "low" }` → **STANDARD** (novelty=medium triggers it).
-
-A completely empty description would still be STANDARD.
-
-## Data Entities
-
-```typescript
-// src/types/core.ts
-export type Tier = "EXPRESS" | "STANDARD" | "THOROUGH";
-
-export interface ComplexityAssessment {
-  scope:    "small" | "medium" | "large";
-  novelty:  "low"   | "medium" | "high";
-  risk:     "low"   | "medium" | "high";
-  coupling: "low"   | "medium" | "high";
-  rationale: string;
-  similarPastTasks: string[];
-}
-```
-
-`similarPastTasks` is populated by the heuristic as an empty array; the field is reserved for future meta-loop calibration data. See `domain-event-sourcing.md` > `routing_calibration` table.
+- Planner receives QMD for task scoping and evidence.
+- Doc/doc-review receives QMD only for documentation or architecture-grounding
+  policies.
+- Coder and reviewer do not receive QMD by default.
 
 ## Integration Points
 
-- **Task Orchestration**: `assessComplexity` and `routeTier` are called immediately in `submitTask`. Result is stored in the `created` event payload and persisted to the `tasks` table as the `assessment` column (JSON).
-- **Meta-Loop (future)**: The `routing_calibration` table records hindsight assessment — whether the assigned tier was appropriate — enabling the meta-loop to improve routing over time.
+- **Task Orchestration**: `submitTask()` creates and records the policy before
+  planning proceeds.
+- **Model Routing**: `routeModel()` consumes `TaskPolicyDecision` as the model
+  floor and sensitive-area source, while still allowing file-scope escalation.
+- **Agent Environment**: `agentEnvironment()` exposes QMD according to
+  `policy.toolPolicy`.
+- **Telemetry**: `agent_runtime_telemetry` includes compact policy context so
+  cost and success can be evaluated by task type, risk, and tool policy.
 
 ## File Map
 
 | File | Purpose |
 |------|---------|
-| `src/assessment/tier.ts` | `assessComplexity()` and `routeTier()` — all heuristic logic |
-| `src/types/core.ts` | `Tier` and `ComplexityAssessment` type definitions |
-| `src/db/schema.sql` | `routing_calibration` table for hindsight tier feedback |
+| `src/orchestrator/task-policy.ts` | Hybrid deterministic + utility-LLM policy decision |
+| `src/assessment/tier.ts` | Compatibility wrapper for legacy complexity assessment |
+| `src/orchestrator/model-routing.ts` | Model-tier projection from policy and failures |
+| `src/orchestrator/service.ts` | Policy event emission and policy-scoped environment |

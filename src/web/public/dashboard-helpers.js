@@ -207,9 +207,27 @@ function interventionRecommendation(failureCategory, failureReason) {
       primaryStage: "planning",
       focus: "qmd"
     },
+    planner_ignored_qmd: {
+      title: "Retry planning after checking QMD evidence",
+      body: "QMD is configured, but the planner did not emit auditable QMD evidence.",
+      primaryStage: "planning",
+      focus: "qmd"
+    },
+    qmd_unavailable: {
+      title: "Check QMD health before retrying planning",
+      body: "The planner attempted QMD, but did not produce usable or degraded fallback evidence.",
+      primaryStage: "planning",
+      focus: "qmd"
+    },
     planner_contract_incomplete: {
       title: "Fix the execution contract through planning",
       body: "Use the plan contract warnings to steer or retry planning before execution resumes.",
+      primaryStage: "planning",
+      focus: "contract"
+    },
+    planner_contract_invalid: {
+      title: "Fix the execution contract before execution",
+      body: "Use deterministic repair when available; otherwise steer or retry planning for missing verification evidence.",
       primaryStage: "planning",
       focus: "contract"
     },

@@ -44,9 +44,9 @@ Stable sections include persona content, stable skill files, harness/tool protoc
 
 Provider adapters receive structured prompt sections and cache hints. Anthropic applies cache controls only to stable system blocks; non-cache providers ignore hints without changing rendered content.
 
-### Shared Model Selection And Utility Calls
+### Shared Model Selection, Task Policy, And Utility Calls
 
-Agent dispatch routing remains risk-sensitive: planner, coder, reviewer, and doc work use `standard` by default and escalate to `strong` for sensitive areas or repeated failures. Utility calls are selected separately by use case and purpose, default to `cheap`, and never receive tools.
+Agent dispatch routing is driven by a single `TaskPolicyDecision` that records task type, risk level, sensitive areas, budget class, model floor, gates, tool policy, and retry policy. The policy combines deterministic guardrails with an optional low-cost utility LLM classification call; deterministic high-risk signals cannot be downgraded. Planner, coder, reviewer, and doc work use the policy model floor and still escalate to `strong` for sensitive areas or repeated failures. Utility calls are selected separately by use case and purpose, default to `cheap`, and never receive tools.
 
 Utility purpose overrides are supported through `HARNESS_COMPACTION_MODEL`, `HARNESS_SUMMARIZATION_MODEL`, `HARNESS_CLASSIFICATION_MODEL`, and `HARNESS_EXTRACTION_MODEL`. Fallback order is purpose override, then `MODEL_TIER_CHEAP`, then `claude-3-haiku-20240307`. Purpose-specific timeout and max-token budgets keep these calls bounded.
 

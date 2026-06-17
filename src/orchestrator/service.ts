@@ -7,7 +7,6 @@ import {
   runCheapPreReviewChecks
 } from "./pre-review-checks";
 import type { AppEnv } from "../config/env";
-import { assessComplexity, routeTier } from "../assessment/tier";
 import { type AutoforgeMessage } from "../nats/messages";
 import type { AgentExecutor, AgentResult, AgentTask, ToolStats } from "../executors/interface";
 import type { DbClient } from "../db/client";
@@ -58,6 +57,20 @@ import type { AgentTranscriptMeta } from "../types/transcripts";
 import { pendingWorkspaceDestroyPayloads, workspaceCreatedPayload } from "../runtime/workspace-cleanup";
 import { routeModel, type ModelRoutingDecision, type ModelRoutingInput } from "./model-routing";
 import { buildAgentRuntimeTelemetryEvent } from "./agent-runtime-telemetry-event";
+import {
+  createTaskPolicyLlmClassifier,
+  decideTaskPolicy,
+  deterministicTaskPolicy,
+  withTierOverride,
+  type TaskPolicyDecision,
+  type TaskPolicyLlmClassifier
+} from "./task-policy";
+import {
+  buildExecutionContract as buildPlanExecutionContract,
+  buildPlanContract,
+  repairPlanSubtasks,
+  type ExecutionContract
+} from "./plan-contract";
 
 const QMD_TOOL_NAMES = new Set(["query", "get", "multi_get", "status"]);
 const ARTIFACT_VALIDATION_MISMATCH_THRESHOLD = 0.4;
@@ -88,6 +101,7 @@ interface ServiceDeps {
     timeoutSeconds: number;
   }) => Promise<LifecycleHooksResult> | LifecycleHooksResult;
   workspaceFactory?: Pick<WorkspaceFactory, "create">;
+  taskPolicyClassifier?: TaskPolicyLlmClassifier | null;
 }
 
 /**
@@ -121,6 +135,8 @@ export class OrchestratorService {
   private readonly dispatcher: ReturnType<typeof createDispatcher>;
   private readonly embeddingProvider: EmbeddingProvider;
   private readonly workspaceFactory: Pick<WorkspaceFactory, "create">;
+  private readonly taskPolicyClassifier: TaskPolicyLlmClassifier | null;
+  private readonly taskPolicies = new Map<string, TaskPolicyDecision>();
   // One Workspace per task id. Created right after the worktree is set up
   // and torn down in cleanupWorktree. Every dispatch (planner, coder
   // subtasks, reviewer iterations, doc, meta) reads the same handle from
@@ -153,6 +169,9 @@ export class OrchestratorService {
     this.workspaceFactory = deps.workspaceFactory ?? new WorkspaceFactory(deps.env, {
       worktreeManager: deps.worktrees
     });
+    this.taskPolicyClassifier = deps.taskPolicyClassifier === undefined
+      ? createTaskPolicyLlmClassifier(deps.env)
+      : deps.taskPolicyClassifier;
   }
 
   /**
@@ -336,11 +355,12 @@ export class OrchestratorService {
   }
 
   listTasks(opts?: { includeArchived?: boolean; onlyArchived?: boolean }): PipelineTask[] {
-    return this.deps.db.listTasks(opts);
+    return this.deps.db.listTasks(opts).map((task) => this.withPlanContract(task));
   }
 
   getTask(taskId: string): PipelineTask | null {
-    return this.deps.db.getTask(taskId);
+    const task = this.deps.db.getTask(taskId);
+    return task ? this.withPlanContract(task) : null;
   }
 
   addSteeringMessage(
@@ -450,8 +470,11 @@ export class OrchestratorService {
     opts: { reviewPlan?: boolean; forceTier?: Tier } = {}
   ): Promise<PipelineTask> {
     const taskId = randomUUID();
-    const assessment = assessComplexity(description);
-    const tier = opts.forceTier ?? routeTier(assessment);
+    const basePolicy = await decideTaskPolicy({ description }, { llmClassifier: this.taskPolicyClassifier });
+    const taskPolicy = opts.forceTier ? withTierOverride(basePolicy, opts.forceTier) : basePolicy;
+    this.taskPolicies.set(taskId, taskPolicy);
+    const assessment = taskPolicy.assessment;
+    const tier = taskPolicy.tier;
     const worktree = this.deps.worktrees.create(taskId);
     // Install dependencies on the host — the documented trust boundary,
     // see docs/qmd/domain-agent-execution.md. Run this before the per-task
@@ -481,6 +504,7 @@ export class OrchestratorService {
       },
       budgetSeconds: 60
     });
+    this.recordTaskPolicyDecision(taskId, projectId, taskPolicy);
     this.recordCheckpoint({
       taskId,
       projectId,
@@ -695,6 +719,56 @@ export class OrchestratorService {
     return tier === "STANDARD" || tier === "THOROUGH";
   }
 
+  private recordTaskPolicyDecision(
+    taskId: string,
+    projectId: string,
+    policy: TaskPolicyDecision
+  ): void {
+    this.recordEvent({
+      taskId,
+      projectId,
+      agent: "orchestrator",
+      type: "task_policy_decision",
+      status: policy.sources.llm.status === "fallback" ? "done_with_concerns" : "done",
+      payload: {
+        task_type: policy.taskType,
+        risk_level: policy.riskLevel,
+        sensitive_areas: policy.sensitiveAreas,
+        confidence: policy.confidence,
+        signals: policy.signals,
+        budget_class: policy.budgetClass,
+        tier: policy.tier,
+        model_floor: policy.modelFloor,
+        required_gates: policy.requiredGates,
+        tool_policy: policy.toolPolicy,
+        retry_policy: policy.retryPolicy,
+        assessment: policy.assessment,
+        sources: policy.sources
+      },
+      budgetSeconds: 0
+    });
+  }
+
+  private policyForTask(taskId: string, description: string): TaskPolicyDecision {
+    const cached = this.taskPolicies.get(taskId);
+    if (cached) return cached;
+
+    const latest = [...this.deps.db.listEvents(taskId)]
+      .reverse()
+      .find((event) => event.type === "task_policy_decision");
+    if (latest) {
+      const policy = policyFromEventPayload(latest.payload);
+      if (policy) {
+        this.taskPolicies.set(taskId, policy);
+        return policy;
+      }
+    }
+
+    const fallback = deterministicTaskPolicy({ description });
+    this.taskPolicies.set(taskId, fallback);
+    return fallback;
+  }
+
   private latestRollbackEventId(taskId: string): string | null {
     const events = this.deps.db.listEvents(taskId);
     const rev = [...events].reverse().find((e) => e.type === "rollback_applied");
@@ -725,6 +799,7 @@ export class OrchestratorService {
     escalation?: boolean;
     priorTier?: ModelRoutingInput["priorTier"];
     reason?: string;
+    policy?: TaskPolicyDecision;
   }): ModelRoutingDecision {
     const decision = routeModel(this.deps.env, {
       agentType: args.agentType,
@@ -735,7 +810,8 @@ export class OrchestratorService {
       failureCount: args.failureCount,
       escalation: args.escalation,
       priorTier: args.priorTier,
-      reason: args.reason
+      reason: args.reason,
+      policy: args.policy
     });
     this.recordEvent({
       taskId: args.taskId,
@@ -775,6 +851,7 @@ export class OrchestratorService {
       description: string;
       filesInScope?: string[];
       failureCount?: number;
+      policy?: TaskPolicyDecision;
     };
   }): Promise<{ result: AgentResult; task: AgentTask; routing: ModelRoutingDecision }> {
     let currentRouting = args.routing;
@@ -792,7 +869,8 @@ export class OrchestratorService {
         failureCount: (args.routeInput.failureCount ?? 0) + 1,
         escalation: true,
         priorTier: currentRouting.tier,
-        reason: result.status === "TIMEOUT" ? "timeout" : result.blockReason ?? `agent_returned_${result.status}`
+        reason: result.status === "TIMEOUT" ? "timeout" : result.blockReason ?? `agent_returned_${result.status}`,
+        policy: args.routeInput.policy
       });
       currentTask = { ...args.task, model: currentRouting.model };
       result = await args.executor.execute(currentTask);
@@ -805,7 +883,8 @@ export class OrchestratorService {
       agentType: args.routeInput.agentType,
       phase: args.routeInput.phase,
       taskTier: args.routeInput.tier,
-      filesInScope: args.routeInput.filesInScope
+      filesInScope: args.routeInput.filesInScope,
+      policy: args.routeInput.policy
     });
     this.recordEvent({
       taskId: args.taskId,
@@ -832,7 +911,7 @@ export class OrchestratorService {
     return Array.from(seen).sort();
   }
 
-  private requireQmdEvidenceForPlanner(args: {
+  private assessQmdEvidenceForPlanner(args: {
     taskId: string;
     projectId: string;
     transcriptStage: "planner:spec" | "planner:execution_plan";
@@ -846,21 +925,34 @@ export class OrchestratorService {
     plannerResult: AgentResult;
     plannerModel: string;
     observedQmdTools: string[];
-  }): void {
-    if (!this.deps.env.QMD_MCP_URL) return;
+  }): { status: "not_required" | "used" | "degraded"; failureCategory?: string } {
+    if (!this.deps.env.QMD_MCP_URL) return { status: "not_required" };
     const qmdContext = args.parsed.planningContext.qmdContext ?? null;
     const qmdEvidenceStatus = qmdContext?.status ?? "missing";
     const hasEvidence =
       qmdContext?.status === "used" &&
       ((qmdContext.queries?.length ?? 0) > 0 || (qmdContext.documents?.length ?? 0) > 0);
-    if (hasEvidence) return;
+    if (hasEvidence) return { status: "used" };
+
+    const hasFallbackEvidence =
+      qmdContext?.status === "fallback" &&
+      ((qmdContext.queries?.length ?? 0) > 0 ||
+        (qmdContext.documents?.length ?? 0) > 0 ||
+        args.observedQmdTools.length > 0) &&
+      typeof qmdContext.fallbackReason === "string" &&
+      qmdContext.fallbackReason.trim().length > 0;
+    if (hasFallbackEvidence) {
+      return { status: "degraded", failureCategory: "qmd_degraded" };
+    }
 
     const currentTask = this.requireTask(args.taskId);
+    const failureCategory =
+      args.observedQmdTools.length > 0 ? "qmd_unavailable" : "planner_ignored_qmd";
     this.pauseForIntervention({
       taskId: args.taskId,
       projectId: args.projectId,
       fromStage: currentTask.state,
-      failureCategory: "planner_missing_qmd_context",
+      failureCategory,
       failureReason: "planner output missing required QMD knowledgebase evidence",
       forensics: {
         agent: "planner",
@@ -955,8 +1047,10 @@ export class OrchestratorService {
         phase: requestedPhase,
         tier,
         description,
-        failureCount: attempt
+        failureCount: attempt,
+        policy: this.policyForTask(taskId, description)
       });
+      const plannerPolicy = this.policyForTask(taskId, description);
       const plannerEnvelope = buildPlannerDispatchEnvelope({
         taskId,
         description,
@@ -969,7 +1063,7 @@ export class OrchestratorService {
         steeringPrompt: plannerSteering.prompt,
         lessons: plannerLessons.block || undefined,
         budgetSeconds: this.budgetForTier(tier, "planner"),
-        environment: this.agentEnvironment(),
+        environment: this.agentEnvironment({ agentType: "planner", phase: requestedPhase, policy: plannerPolicy }),
         skillFiles: this.skills.skillsForAgent("planner")
       });
       let plannerTask: AgentTask = { ...plannerEnvelope.task, workspace: plannerWorkspace };
@@ -1001,7 +1095,8 @@ export class OrchestratorService {
           phase: requestedPhase,
           tier,
           description,
-          failureCount: attempt
+          failureCount: attempt,
+          policy: plannerPolicy
         }
       });
       plannerTask = plannerExecution.task;
@@ -1087,7 +1182,7 @@ export class OrchestratorService {
 
       const observedQmdTools = this.observedQmdTools(plannerResult);
       const parsed = parsePlannerStructuredOutput(taskId, plannerResult.output, requestedPhase, worktreePath);
-      this.requireQmdEvidenceForPlanner({
+      const qmdAssessment = this.assessQmdEvidenceForPlanner({
         taskId,
         projectId,
         transcriptStage,
@@ -1116,7 +1211,8 @@ export class OrchestratorService {
         transcript_id: transcriptId,
         transcript_stage: transcriptStage,
         planningContext: parsed.planningContext,
-        qmd_tools_observed: observedQmdTools
+        qmd_tools_observed: observedQmdTools,
+        qmd_evidence_assessment: qmdAssessment
       };
       if (parsed.phase === "spec" || parsed.phase === "combined") {
         plannedPayload.specArtifacts = parsed.specArtifacts;
@@ -1128,7 +1224,7 @@ export class OrchestratorService {
         projectId,
         agent: "planner",
         type: "planned",
-        status: plannerFallback ? "done_with_concerns" : "done",
+        status: plannerFallback || qmdAssessment.status === "degraded" ? "done_with_concerns" : "done",
         payload: plannedPayload,
         budgetSeconds: this.budgetForTier(tier, "planner"),
         elapsedSeconds: plannerResult.metrics.elapsedSeconds,
@@ -1331,6 +1427,33 @@ export class OrchestratorService {
     if (task.state !== "awaiting_plan_approval") {
       throw new Error(`Cannot approve plan: task is in state '${task.state}'`);
     }
+    let planSubtasks = task.planSubtasks;
+    const contract = this.buildExecutionContract(task.planSubtasks, task.tier, task.planningContext);
+    if (contract.invalidSubtasks.length > 0) {
+      throw new Error("Cannot approve plan: execution plan is missing required behavior, scope, or verification evidence");
+    }
+    if (contract.repairs.some((repair) => repair.status === "available")) {
+      const repair = repairPlanSubtasks(task.planSubtasks, task.tier, task.planningContext);
+      if (repair.after.invalidSubtasks.length > 0) {
+        throw new Error("Cannot approve plan: execution plan is missing required behavior, scope, or verification evidence");
+      }
+      planSubtasks = repair.repairedSubtasks;
+      this.recordEvent({
+        taskId,
+        projectId: task.projectId,
+        agent: "orchestrator",
+        type: "plan_contract_repaired",
+        status: "done_with_concerns",
+        payload: {
+          repair_reason: "approval_repair_before_execution",
+          repairs: repair.repairs,
+          before: repair.before,
+          after: repair.after,
+          planSubtasks
+        },
+        budgetSeconds: 60
+      });
+    }
 
     this.recordEvent({
       taskId,
@@ -1353,7 +1476,7 @@ export class OrchestratorService {
     try {
       await this.executeAndReview(
         taskId, task.projectId, task.description, task.tier,
-        task.planSubtasks, 0, worktreePath, branch
+        planSubtasks, 0, worktreePath, branch
       );
     } catch (err) {
       if (err instanceof StageFailedError) {
@@ -1363,6 +1486,49 @@ export class OrchestratorService {
       throw err;
     }
 
+    return this.requireTask(taskId);
+  }
+
+  repairPlanContract(taskId: string): PipelineTask {
+    const task = this.requireTask(taskId);
+    if (task.state !== "awaiting_intervention") {
+      throw new Error(`Cannot repair plan contract: task is in state '${task.state}', expected 'awaiting_intervention'`);
+    }
+    const latestFailure = [...this.deps.db.listEvents(taskId)]
+      .reverse()
+      .find((event) => event.type === "failure_analysis");
+    const category = latestFailure?.payload?.failure_category;
+    if (category !== "planner_contract_incomplete" && category !== "planner_contract_invalid") {
+      throw new Error(`Cannot repair plan contract: latest failure is '${category ?? "unknown"}'`);
+    }
+
+    const repair = repairPlanSubtasks(task.planSubtasks, task.tier, task.planningContext);
+    if (repair.repairs.length === 0) {
+      throw new Error("Cannot repair plan contract: no deterministic repairs are available");
+    }
+    if (repair.after.invalidSubtasks.length > 0) {
+      throw new Error("Cannot repair plan contract: unrepaired required fields remain");
+    }
+
+    this.recordEvent({
+      taskId,
+      projectId: task.projectId,
+      agent: "orchestrator",
+      type: "plan_contract_repaired",
+      status: "done_with_concerns",
+      payload: {
+        repair_reason: "operator_repair_from_intervention",
+        repairs: repair.repairs,
+        before: repair.before,
+        after: repair.after,
+        planSubtasks: repair.repairedSubtasks
+      },
+      budgetSeconds: 60
+    });
+    this.transition(taskId, task.projectId, "awaiting_intervention", "awaiting_plan_approval", {
+      planSubtasks: repair.repairedSubtasks,
+      planningContext: task.planningContext ?? emptyPlanningContext()
+    });
     return this.requireTask(taskId);
   }
 
@@ -1480,6 +1646,7 @@ export class OrchestratorService {
       const docSteering = this.steeringForDispatch(taskId);
       const baseDocPrompt = buildDocPrompt(task.description, task.planSubtasks);
       const docWorkspace = this.requireTaskWorkspace(taskId);
+      const docPolicy = this.policyForTask(taskId, task.description);
       {
         const docRouting = this.routeModelForDispatch({
           taskId,
@@ -1489,7 +1656,8 @@ export class OrchestratorService {
           tier: task.tier,
           description: task.description,
           filesInScope: task.planSubtasks.flatMap((subtask) => subtask.filesInScope),
-          failureCount: task.iteration
+          failureCount: task.iteration,
+          policy: docPolicy
         });
         const docEnvelope = buildAgentDispatchEnvelope({
           id: `${taskId}-doc`,
@@ -1498,7 +1666,7 @@ export class OrchestratorService {
           basePrompt: baseDocPrompt,
           steeringPrompt: docSteering.prompt,
           budgetSeconds: this.budgetForTier(task.tier, "doc"),
-          environment: this.agentEnvironment(),
+          environment: this.agentEnvironment({ agentType: "doc", phase: "documentation", policy: docPolicy }),
           skillFiles: this.skills.skillsForAgent("doc"),
           metadata: { taskId, description: task.description },
           model: docRouting.model,
@@ -1518,7 +1686,8 @@ export class OrchestratorService {
             tier: task.tier,
             description: task.description,
             filesInScope: task.planSubtasks.flatMap((subtask) => subtask.filesInScope),
-            failureCount: task.iteration
+            failureCount: task.iteration,
+            policy: docPolicy
           }
         });
         const routedDocTask = docExecution.task;
@@ -2659,55 +2828,12 @@ export class OrchestratorService {
     return { variantId };
   }
 
-  private buildExecutionContract(planSubtasks: PlanSubtask[], tier: Tier): {
-    wipLimit: 1;
-    tier: Tier;
-    validationHierarchy: string[];
-    subtasks: Array<{
-      id: string;
-      sequence: number;
-      behavior: string;
-      filesInScope: string[];
-      verificationCommands: string[];
-      testCriteria: string[];
-      completionEvidence: string[];
-    }>;
-    invalidSubtasks: Array<{ id: string; missing: string[] }>;
-    valid: boolean;
-  } {
-    const validationHierarchy = [
-      "static_or_unit_checks",
-      "affected_behavior_tests",
-      ...(tier === "THOROUGH" ? ["runtime_or_end_to_end_verification"] : [])
-    ];
-    const subtasks = planSubtasks.map((subtask) => ({
-      id: subtask.id,
-      sequence: subtask.sequence,
-      behavior: subtask.behavior,
-      filesInScope: subtask.filesInScope,
-      verificationCommands: subtask.verificationCommands,
-      testCriteria: subtask.testCriteria,
-      completionEvidence: subtask.completionEvidence
-    }));
-    const invalidSubtasks = planSubtasks.map((subtask) => {
-      const missing: string[] = [];
-      const provided = subtask.contractProvided;
-      if (!subtask.behavior?.trim() || provided?.behavior === false) missing.push("behavior");
-      if (subtask.filesInScope.length === 0 || provided?.filesInScope === false) missing.push("filesInScope");
-      if (subtask.verificationCommands.length === 0 || provided?.verificationCommands === false) missing.push("verificationCommands");
-      if (subtask.testCriteria.length === 0 || provided?.testCriteria === false) missing.push("testCriteria");
-      if (subtask.completionEvidence.length === 0 || provided?.completionEvidence === false) missing.push("completionEvidence");
-      return { id: subtask.id, missing };
-    }).filter((row) => row.missing.length > 0);
-
-    return {
-      wipLimit: 1,
-      tier,
-      validationHierarchy,
-      subtasks,
-      invalidSubtasks,
-      valid: invalidSubtasks.length === 0
-    };
+  private buildExecutionContract(
+    planSubtasks: PlanSubtask[],
+    tier: Tier,
+    planningContext?: PipelineTask["planningContext"]
+  ): ExecutionContract {
+    return buildPlanExecutionContract(planSubtasks, tier, planningContext);
   }
 
   private recordTaskExitCheck(input: {
@@ -2787,14 +2913,35 @@ export class OrchestratorService {
       tool_stats: ToolStats | null;
     } | null = null;
     const artifactValidationStatuses: Array<"ok" | "mismatch" | "unavailable"> = [];
-    const contract = this.buildExecutionContract(planSubtasks, tier);
+    let contract = this.buildExecutionContract(planSubtasks, tier, this.requireTask(taskId).planningContext);
+    if (!contract.valid && contract.repairs.some((repair) => repair.status === "available") && contract.invalidSubtasks.length === 0) {
+      const currentTask = this.requireTask(taskId);
+      const repair = repairPlanSubtasks(planSubtasks, tier, currentTask.planningContext);
+      planSubtasks = repair.repairedSubtasks;
+      this.recordEvent({
+        taskId,
+        projectId,
+        agent: "orchestrator",
+        type: "plan_contract_repaired",
+        status: "done_with_concerns",
+        payload: {
+          repair_reason: "auto_repair_before_execution",
+          repairs: repair.repairs,
+          before: repair.before,
+          after: repair.after,
+          planSubtasks
+        },
+        budgetSeconds: 60
+      });
+      contract = this.buildExecutionContract(planSubtasks, tier, this.requireTask(taskId).planningContext);
+    }
     this.recordEvent({
       taskId,
       projectId,
       agent: "orchestrator",
       type: "execution_contract",
-      status: contract.valid ? "done" : "done_with_concerns",
-      payload: contract,
+      status: contract.status === "valid" ? "done" : "done_with_concerns",
+      payload: contract as unknown as Record<string, unknown>,
       budgetSeconds: 60
     });
     if (!contract.valid && tier !== "EXPRESS") {
@@ -2802,10 +2949,11 @@ export class OrchestratorService {
         taskId,
         projectId,
         fromStage: this.requireTask(taskId).state,
-        failureCategory: "planner_contract_incomplete",
+        failureCategory: "planner_contract_invalid",
         failureReason: "execution plan is missing required behavior, scope, or verification evidence",
         forensics: {
           invalid_subtasks: contract.invalidSubtasks,
+          repairs: contract.repairs,
           tier
         }
       });
@@ -2827,6 +2975,7 @@ export class OrchestratorService {
       const reportedArtifactsForPreReview = new Set<string>();
 
       for (const subtask of subtasksForIteration) {
+        const taskPolicy = this.policyForTask(taskId, description);
         const subtaskAgentType = subtask.agentType ?? "coder";
         const subtaskDispatch = await this.selectPersonaForDispatch(subtaskAgentType, { description, tier, projectId });
         const subtaskPersonaId = subtaskDispatch.selection.variantId;
@@ -2858,7 +3007,8 @@ export class OrchestratorService {
           tier,
           description: `${description}\n\n${subtask.description}`,
           filesInScope: subtask.filesInScope,
-          failureCount: iteration
+          failureCount: iteration,
+          policy: taskPolicy
         });
         const coderEnvelope = buildAgentDispatchEnvelope({
           id: subtask.id,
@@ -2867,7 +3017,7 @@ export class OrchestratorService {
           basePrompt: baseCoderPrompt,
           steeringPrompt: coderSteering.prompt,
           budgetSeconds: this.budgetForTier(tier, "coder"),
-          environment: this.agentEnvironment(),
+          environment: this.agentEnvironment({ agentType: subtaskAgentType, phase: "implementation", policy: taskPolicy }),
           skillFiles: this.skills.skillsForAgent(subtaskAgentType),
           metadata: { taskId, subtask, description },
           model: coderRouting.model,
@@ -2904,7 +3054,8 @@ export class OrchestratorService {
             tier,
             description: `${description}\n\n${subtask.description}`,
             filesInScope: subtask.filesInScope,
-            failureCount: iteration
+            failureCount: iteration,
+            policy: taskPolicy
           }
         });
         const routedLiveTask = coderExecution.task;
@@ -3088,6 +3239,7 @@ export class OrchestratorService {
       const reviewerSteering = this.steeringForDispatch(taskId);
       const baseReviewerPrompt = buildReviewerPrompt(description, planSubtasks);
       const reviewerWorkspace = this.requireTaskWorkspace(taskId);
+      const reviewerPolicy = this.policyForTask(taskId, description);
       const reviewerRouting = this.routeModelForDispatch({
         taskId,
         projectId,
@@ -3096,7 +3248,8 @@ export class OrchestratorService {
         tier,
         description,
         filesInScope: planSubtasks.flatMap((subtask) => subtask.filesInScope),
-        failureCount: iteration
+        failureCount: iteration,
+        policy: reviewerPolicy
       });
       const reviewerEnvelope = buildAgentDispatchEnvelope({
         id: `${taskId}-review-${iteration}`,
@@ -3105,7 +3258,7 @@ export class OrchestratorService {
         basePrompt: baseReviewerPrompt,
         steeringPrompt: reviewerSteering.prompt,
         budgetSeconds: this.budgetForTier(tier, "reviewer"),
-        environment: this.agentEnvironment(),
+        environment: this.agentEnvironment({ agentType: "reviewer", phase: "review", policy: reviewerPolicy }),
         skillFiles: this.skills.skillsForAgent("reviewer"),
         metadata: { taskId, iteration, description },
         model: reviewerRouting.model,
@@ -3125,7 +3278,8 @@ export class OrchestratorService {
           tier,
           description,
           filesInScope: planSubtasks.flatMap((subtask) => subtask.filesInScope),
-          failureCount: iteration
+          failureCount: iteration,
+          policy: reviewerPolicy
         }
       });
       const routedReviewerTask = reviewerExecution.task;
@@ -3795,18 +3949,36 @@ export class OrchestratorService {
 
   /**
    * Build the environment passed to agent executors. Currently exposes
-   * QMD_MCP_URL when configured so agents can query the knowledge base
-   * (planner for scoping, coder/reviewer/doc/doc-review for grounding
-   * implementation and documentation against indexed architecture docs).
+   * QMD_MCP_URL only when configured and allowed by the task policy. Planner
+   * gets QMD for scoping; doc/doc-review get it only for documentation or
+   * architecture-grounding policies. Coder/reviewer do not receive QMD by
+   * default.
    * Secrets like GITHUB_TOKEN are deliberately never forwarded — privileged
    * operations run through dedicated helpers in src/privileged/.
    */
-  private agentEnvironment(): Record<string, string> {
+  private agentEnvironment(args?: {
+    agentType: AgentType;
+    phase?: ModelRoutingInput["phase"];
+    policy?: TaskPolicyDecision;
+  }): Record<string, string> {
     const env: Record<string, string> = {};
-    if (this.deps.env.QMD_MCP_URL) {
+    if (this.deps.env.QMD_MCP_URL && this.shouldExposeQmd(args)) {
       env.QMD_MCP_URL = this.deps.env.QMD_MCP_URL;
     }
     return env;
+  }
+
+  private shouldExposeQmd(args?: {
+    agentType: AgentType;
+    phase?: ModelRoutingInput["phase"];
+    policy?: TaskPolicyDecision;
+  }): boolean {
+    if (!args) return false;
+    if (args.agentType === "planner") return args.policy?.toolPolicy.qmd !== "none";
+    if (args.agentType === "doc" || args.agentType === "doc-review") {
+      return args.policy?.toolPolicy.qmd === "planner_and_doc";
+    }
+    return false;
   }
 
   private budgetForTier(tier: PipelineTask["tier"], step: "planner" | "coder" | "reviewer" | "doc"): number {
@@ -4118,6 +4290,13 @@ export class OrchestratorService {
     }
     return task;
   }
+
+  private withPlanContract(task: PipelineTask): PipelineTask {
+    return {
+      ...task,
+      planContract: buildPlanContract(task.planSubtasks, task.tier, task.planningContext)
+    };
+  }
 }
 
 function buildCoderPrompt(description: string, subtask: PlanSubtask, iteration: number): string {
@@ -4221,4 +4400,50 @@ function normalizeToolStats(
     search_count: Number(stats.searchCount ?? stats.search_count ?? 0),
     iterations: Number(stats.iterations ?? 0)
   };
+}
+
+function policyFromEventPayload(payload: Record<string, unknown>): TaskPolicyDecision | null {
+  const sources = payload.sources;
+  const assessment = payload.assessment;
+  const requiredGates = payload.required_gates;
+  const toolPolicy = payload.tool_policy;
+  const retryPolicy = payload.retry_policy;
+  if (
+    !isRecord(sources) ||
+    !isRecord(assessment) ||
+    !isRecord(requiredGates) ||
+    !isRecord(toolPolicy) ||
+    !isRecord(retryPolicy)
+  ) {
+    return null;
+  }
+
+  const taskType = typeof payload.task_type === "string" ? payload.task_type : null;
+  const riskLevel = typeof payload.risk_level === "string" ? payload.risk_level : null;
+  const budgetClass = typeof payload.budget_class === "string" ? payload.budget_class : null;
+  const tier = typeof payload.tier === "string" ? payload.tier : null;
+  const modelFloor = typeof payload.model_floor === "string" ? payload.model_floor : null;
+  if (!taskType || !riskLevel || !budgetClass || !tier || !modelFloor) return null;
+
+  return {
+    taskType: taskType as TaskPolicyDecision["taskType"],
+    riskLevel: riskLevel as TaskPolicyDecision["riskLevel"],
+    sensitiveAreas: Array.isArray(payload.sensitive_areas)
+      ? payload.sensitive_areas as TaskPolicyDecision["sensitiveAreas"]
+      : [],
+    confidence: typeof payload.confidence === "number" ? payload.confidence : 0,
+    signals: Array.isArray(payload.signals) ? payload.signals.filter((s): s is string => typeof s === "string") : [],
+    budgetClass: budgetClass as TaskPolicyDecision["budgetClass"],
+    tier: tier as TaskPolicyDecision["tier"],
+    modelFloor: modelFloor as TaskPolicyDecision["modelFloor"],
+    requiredGates: requiredGates as TaskPolicyDecision["requiredGates"],
+    toolPolicy: toolPolicy as TaskPolicyDecision["toolPolicy"],
+    retryPolicy: retryPolicy as TaskPolicyDecision["retryPolicy"],
+    assessment: assessment as unknown as TaskPolicyDecision["assessment"],
+    sources: sources as TaskPolicyDecision["sources"]
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

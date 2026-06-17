@@ -80,11 +80,25 @@ export function createApprovalRoutes(service: OrchestratorService, events: LiveE
     try {
       const task = await service.approvePlan(ctx.req.param("id"));
       events.publish({ type: "task.updated", data: task });
-      return ctx.json(task);
+      return ctx.json(service.getTask(task.id) ?? task);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.startsWith("Cannot approve plan:")) {
         return ctx.json({ error: "invalid_state", message: msg }, 409);
+      }
+      throw err;
+    }
+  });
+
+  app.post("/:id/repair-plan-contract", async (ctx) => {
+    try {
+      const task = service.repairPlanContract(ctx.req.param("id"));
+      events.publish({ type: "task.updated", data: task });
+      return ctx.json(service.getTask(task.id) ?? task);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Cannot repair plan contract:")) {
+        return ctx.json({ error: "repair_unavailable", message: msg }, 409);
       }
       throw err;
     }

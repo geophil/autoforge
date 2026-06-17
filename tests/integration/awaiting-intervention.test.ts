@@ -38,7 +38,7 @@ describe("awaiting_intervention: planner failures surface with forensics", () =>
     const events = db.listEvents(task.id);
     const failure = events.find((e) => e.type === "failure_analysis");
     expect(failure).toBeDefined();
-    expect(failure!.payload.failure_category).toBe("planner_missing_qmd_context");
+    expect(failure!.payload.failure_category).toBe("planner_ignored_qmd");
     expect(failure!.payload.qmd_required).toBe(true);
     expect(failure!.payload.qmd_evidence_status).toBe("missing");
   });
@@ -83,6 +83,56 @@ describe("awaiting_intervention: planner failures surface with forensics", () =>
 
     const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
     expect(task.state).toBe("awaiting_spec_approval");
+  });
+
+  test("planner fallback QMD evidence proceeds with concerns when attempt is auditable", async () => {
+    const { service, db } = createTestService(
+      {
+        planner: async () => ({
+          status: "DONE",
+          artifacts: [],
+          output: {
+            discovery: {
+              intent: "Plan feature",
+              constraints: [],
+              assumptions: [],
+              decisions: [],
+              nonGoals: [],
+              openQuestions: []
+            },
+            spec: {
+              problem: "Need behavior",
+              desiredBehavior: ["Do the thing"],
+              acceptanceCriteria: ["Works"],
+              verification: ["Tests"],
+              risks: []
+            },
+            planningContext: {
+              qmdContext: {
+                status: "fallback",
+                phase: "spec",
+                queries: ["task orchestration"],
+                documents: [],
+                fallbackReason: "QMD query timed out after status succeeded"
+              }
+            }
+          },
+          metrics: { elapsedSeconds: 0.3 }
+        })
+      },
+      { QMD_MCP_URL: "http://localhost:8181/mcp" }
+    );
+
+    const task = await service.submitTask("autoforge", "Add a STANDARD-tier feature");
+    expect(task.state).toBe("awaiting_spec_approval");
+
+    const planned = db.listEvents(task.id).find((e) => e.type === "planned");
+    expect(planned?.status).toBe("done_with_concerns");
+    expect(planned?.payload.qmd_evidence_assessment).toEqual({
+      status: "degraded",
+      failureCategory: "qmd_degraded"
+    });
+    expect(service.getTask(task.id)?.planContract?.status).toBe("degraded");
   });
 
   test("execution-plan phase also enforces QMD evidence when configured", async () => {
@@ -155,7 +205,7 @@ describe("awaiting_intervention: planner failures surface with forensics", () =>
     const events = db.listEvents(created.id);
     const failure = events.find((e) => e.type === "failure_analysis");
     expect(failure).toBeDefined();
-    expect(failure!.payload.failure_category).toBe("planner_missing_qmd_context");
+    expect(failure!.payload.failure_category).toBe("planner_ignored_qmd");
     expect(failure!.payload.requested_phase).toBe("execution_plan");
   });
 
